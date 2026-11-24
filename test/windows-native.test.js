@@ -5,11 +5,39 @@
 // keeps its cross-platform meaning.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import {
   FIXTURE, SIGINT_FIXTURE, alivePidsAmong, ask, conhostBaseline, createSession,
   forceKill, handleKinds, isPidAlive, pidsOf, rawHex, screenHas, send, sendLine,
   until, untilTrue,
 } from './helpers/native.mjs';
+
+const execFileAsync = promisify(execFile);
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const PROVIDER_PROBE = fileURLToPath(new URL('./fixtures/conpty-dll-probe.mjs', import.meta.url));
+
+// Runs the provider probe in its own process and returns its exit code plus the
+// decoded PROBE events. Out-of-process is required: the bundled-DLL path never
+// releases its conout worker, so running it in-process would hang the suite.
+async function probeProvider(provider) {
+  let code = 0;
+  let stdout = '';
+  try {
+    const result = await execFileAsync(process.execPath, [PROVIDER_PROBE, provider], { cwd: REPO_ROOT, timeout: 90000 });
+    stdout = result.stdout;
+  } catch (error) {
+    code = typeof error.code === 'number' ? error.code : 1;
+    stdout = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+  }
+  const events = {};
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = line.match(/^PROBE (\w+) (\{.*\})$/);
+    if (match) events[match[1]] = JSON.parse(match[2]);
+  }
+  return { code, events, stdout };
+}
 
 const windows = process.platform === 'win32';
 const skip = windows ? false : 'native ConPTY scenario: Windows only';
@@ -587,5 +615,100 @@ test('WIN-20 recovers after an unexpected child process exit', opts, async () =>
   } finally {
     await victim.session.close();
     await survivor.session.close();
+  }
+});
+
+test('lifecycle states and child pid are observable through a real ConPTY session', opts, async () => {
+  const { session, child } = createSession();
+  try {
+    // 'spawned' means a pid exists, not that the application can take input.
+    assert.equal(session.state, 'spawned');
+    assert.equal(session.pid, child.pid, 'the session must expose the real child pid');
+    assert.ok(session.pid > 0);
+    assert.ok(await isPidAlive(session.pid), 'the exposed pid must exist in the OS process table');
+
+    const ready = await until(session, screenHas('FIXTURE READY'), { label: 'fixture banner' });
+    assert.equal(ready.state, 'operational', 'first rendered output must make the session operational');
+    assert.equal(ready.pid, child.pid, 'every observation must carry the pid');
+    assert.equal(ready.running, true);
+
+    await sendLine(session, 'exit 5');
+    const exited = await until(session, s => !s.running, { label: 'child exit' });
+    assert.equal(exited.state, 'exited', 'a dead child must be distinguishable from a live one');
+    assert.equal(exited.exit.exitCode, 5);
+    assert.equal(exited.pid, child.pid, 'the pid must survive exit so a caller can verify identity');
+  } finally {
+    await session.close();
+  }
+
+  assert.equal(session.state, 'released');
+  // The final screen stays readable after release, so a caller can still
+  // inspect what the application showed without keeping the session open.
+  const final = await session.observe();
+  assert.equal(final.state, 'released');
+  assert.equal(final.running, false);
+  assert.equal(final.pid, child.pid);
+  assert.ok(final.screen.includes('FIXTURE READY'), 'the last rendered screen must survive close()');
+  await assert.rejects(session.resize(session.owner, 40, 10), /Resize denied/);
+});
+
+test('ConPTY provider comparison: bundled DLL path works but never releases its worker', { skip, timeout: 240000 }, async () => {
+  const os = await probeProvider('os');
+  const dll = await probeProvider('dll');
+
+  // Both providers are functionally usable on this architecture: the bundled
+  // ARM64 conpty.dll and OpenConsole.exe really do load and drive a session.
+  for (const [name, { events }] of [['os', os], ['dll', dll]]) {
+    assert.equal(events.spawned?.arch, process.arch, `${name}: probe ran on an unexpected architecture`);
+    assert.ok(events.spawned?.pid > 0, `${name}: expected a child pid`);
+    assert.equal(events.ready?.ok, true, `${name}: child never became operational through the pseudoconsole`);
+    assert.equal(events.ready?.state, 'operational');
+    assert.equal(events.roundTrip?.echoed, true, `${name}: interactive round trip failed`);
+    assert.equal(events.closed?.state, 'released');
+  }
+
+  // The difference that decides the default: only OS ConPTY lets the host exit.
+  assert.equal(os.code, 0, `OS ConPTY must drain and exit 0, got ${os.code}; output:\n${os.stdout}`);
+  assert.equal(os.events.didNotDrain, undefined, 'OS ConPTY must not report an undisposed worker');
+  assert.ok(os.events.exit.ms < 12000, `OS ConPTY drain took ${os.events.exit?.ms}ms`);
+
+  assert.equal(dll.code, 98, `bundled-DLL path is expected to report it never drains, got ${dll.code}; output:\n${dll.stdout}`);
+  assert.ok(dll.events.didNotDrain, 'bundled-DLL path must report the undisposed conout worker');
+  assert.equal(dll.events.didNotDrain.messagePorts, 1, 'exactly one conout worker survives close() on the DLL path');
+});
+
+test('an asynchronous ConPTY input-socket failure cannot crash the host', opts, async () => {
+  // Regression test for a host-killing defect found by the stress harness.
+  // node-pty attaches an 'error' listener to its ConPTY output socket but not to
+  // the input socket, so an asynchronous write failure there -- EAGAIN once the
+  // input pipe is full, EINVAL once the child is gone -- surfaces as an unhandled
+  // 'error' event that terminates the whole runtime and every concurrent session
+  // with it. Reproduced by driving ~1.25M writes through a resize loop.
+  const { session } = createSession();
+  const other = createSession();
+  try {
+    await until(session, screenHas('FIXTURE READY'), { label: 'fixture banner' });
+    await until(other.session, screenHas('FIXTURE READY'), { label: 'bystander banner' });
+
+    const socket = session.pty._agent?.inSocket;
+    assert.ok(socket, 'expected to reach the ConPTY input socket');
+    assert.equal(socket.listenerCount('error') >= 1, true, 'Session must guard the input socket');
+
+    const before = (await session.observe()).writeErrors;
+    socket.emit('error', Object.assign(new Error('write EAGAIN'), { code: 'EAGAIN', syscall: 'write' }));
+
+    const after = await session.observe();
+    assert.equal(after.writeErrors, before + 1, 'the failure must be recorded, not thrown');
+    assert.equal(after.running, true, 'a failed write must not tear down the session');
+
+    // The session stays usable and the concurrent one is untouched.
+    const echoed = await ask(session, 'echo STILL-USABLE', 'ECHO:STILL-USABLE');
+    assert.match(echoed.screen, /ECHO:STILL-USABLE/);
+    const otherEcho = await ask(other.session, 'echo OTHER-OK', 'ECHO:OTHER-OK');
+    assert.match(otherEcho.screen, /ECHO:OTHER-OK/);
+    assert.equal((await other.session.observe()).writeErrors, 0);
+  } finally {
+    await session.close();
+    await other.session.close();
   }
 });

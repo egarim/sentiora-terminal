@@ -7,13 +7,53 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # windows-latest is x64 and windows-11-arm is ARM64; keeping both makes
+        # the two architectures independently visible instead of assuming the
+        # x64 result speaks for ARM64.
+        os: [ubuntu-latest, windows-latest, windows-11-arm, macos-latest]
+        node: [22, 24]
     runs-on: ${{ matrix.os }}
+    # A hanging native test must fail the job instead of running to the six hour
+    # account limit: before the session teardown fix, the Windows job hung for
+    # 3h40m before it was cancelled.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - run: npm install
-      - run: npm test
-      - run: node --check src/server.js
+          node-version: ${{ matrix.node }}
+
+      - name: Record runtime
+        run: node -p "'node '+process.version+' arch='+process.arch+' platform='+process.platform+' abi='+process.versions.modules"
+
+      # npm ci refuses to run unless package-lock.json matches package.json, so a
+      # dependency drift fails the build instead of silently testing something else.
+      - run: npm ci
+
+      # node-pty publishes its prebuilds as mode 644. macOS is the only platform
+      # that executes prebuilds/darwin-*/spawn-helper (posix_spawnp), so without
+      # the executable bit every spawn there fails with "posix_spawnp failed."
+      - name: Restore native executable permissions
+        run: node scripts/fix-native-permissions.mjs
+
+      # Fails the job if any native binary belongs to a different architecture
+      # than the runtime, so an emulated x64 image can never be reported as ARM64.
+      - name: Verify native binary architecture
+        run: node scripts/report-native-arch.mjs
+
+      - name: Syntax check
+        run: |
+          node --check src/server.js
+          node --check src/session.js
+
+      # Mocked and native suites run as separate steps so a native-only failure
+      # on one platform is obvious instead of hiding inside a single "npm test".
+      - name: Mocked unit tests
+        run: npm run test:unit
+
+      - name: Native PTY tests
+        run: npm run test:native
+
+      - name: Diagnostics after failure
+        if: failure()
+        run: node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform,osRelease:require('os').release(),cpus:require('os').cpus().length},null,2)"

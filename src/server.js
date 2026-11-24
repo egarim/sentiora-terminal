@@ -5,14 +5,20 @@ import {Session,dimensions} from './session.js';
 const {Terminal}=xterm;
 const sessions=new Map();
 const keys={Enter:'\r',Escape:'\x1b',Tab:'\t',Backspace:'\x7f',Up:'\x1b[A',Down:'\x1b[B',Right:'\x1b[C',Left:'\x1b[D',CtrlC:'\x03'};
+// node-pty's bundled-DLL ConPTY path is exposed so both providers can be
+// compared, but it is NOT recommended and is not the default: measured over 30
+// sessions it leaks one worker thread and ~6MB per session and leaves the host
+// process unable to exit. See docs/validation/conpty-provider-comparison.md.
+const conptyDllDefault=process.env.SENTIORA_CONPTY_DLL==='1';
 async function dispatch(method,p={}){
-  if(method==='initialize')return {protocolVersion:1,platform:process.platform,arch:process.arch};
+  if(method==='initialize')return {protocolVersion:1,platform:process.platform,arch:process.arch,conptyDll:conptyDllDefault};
   if(method==='terminal.create'){
     if(sessions.size>=16)throw Error('Session limit');
-    const {command,args=[],cwd=process.cwd(),cols=120,rows=40}=p;dimensions(cols,rows);
+    const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll}=p;dimensions(cols,rows);
     if(typeof command!=='string'||!command||!Array.isArray(args)||args.some(a=>typeof a!=='string'))throw Error('Invalid command');
+    if(conptyDll!==undefined&&typeof conptyDll!=='boolean')throw Error('Invalid conptyDll');
     const terminal=new Terminal({cols,rows,scrollback:2000,allowProposedApi:true});
-    let child;try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:process.env});}catch(e){terminal.dispose();throw e;}
+    let child;try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:process.env,useConptyDll:conptyDll??conptyDllDefault});}catch(e){terminal.dispose();throw e;}
     const s=new Session(child,terminal);sessions.set(s.id,s);return {...await s.observe(),owner:s.owner};
   }
   if(method==='terminal.list')return Promise.all([...sessions.values()].map(s=>s.observe()));
