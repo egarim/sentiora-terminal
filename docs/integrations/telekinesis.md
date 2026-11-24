@@ -1,0 +1,288 @@
+# Telekinesis integration — proposed contract
+
+**Status: PROPOSED. Nothing in this document is implemented.** There is no Sentiora adapter in
+Telekinesis and no Telekinesis-specific code in Sentiora. This is a contract for
+[telekinesis#67](https://github.com/egarim/telekinesis/issues/67), derived from the actual
+Telekinesis console tier on `origin/main` at `57bfa79` and from measured Sentiora behaviour.
+
+Everything asserted about Sentiora below is backed by
+[`../validation/windows-native-validation.md`](../validation/windows-native-validation.md) or
+[`../validation/conpty-provider-comparison.md`](../validation/conpty-provider-comparison.md).
+Where a claim comes from reading source rather than from an experiment, it says so.
+
+## 1. Why an adapter, and why out of process
+
+Telekinesis already has a console tier: `IConsoleSession` plus the `console_*` MCP tools, backed
+by `UnixPtyConsoleSession` on Linux/macOS and `ConPtyConsoleSession` on Windows. The Windows
+backend is **off by default** behind `TELEKINESIS_CONPTY=1` because of
+[telekinesis#49](https://github.com/egarim/telekinesis/issues/49): on Windows 11 ARM64 build
+26200 the child never binds to the pseudoconsole and renders to the *parent* console instead,
+which corrupts the MCP stdio stream.
+
+Sentiora was tested against exactly that failure mode on exactly that OS build and architecture,
+and **does not reproduce it**:
+
+| #49 symptom | Sentiora, measured |
+| --- | --- |
+| child never binds to the pseudoconsole | child reports `isTTY` **true** on stdin and stdout (WIN-01) |
+| child produces zero bytes into the pipe | real PowerShell and cmd.exe produce output, including stateful interactive sessions (WIN-02, WIN-03) |
+| child renders to the parent console | a child deliberately printing a forged JSON-RPC response and hostile binary puts **zero** bytes on the host's stdout (WIN-15) |
+
+So an out-of-process Sentiora backend would give Telekinesis a working Windows console tier
+without waiting on #49, and — because it is a separate process with its own stdio — a child that
+misbehaves cannot corrupt Telekinesis's MCP stream. That isolation is measured, not assumed.
+
+**The existing Telekinesis backend is not replaced.** Per #67, both must coexist so they can be
+compared experimentally. The adapter is opt-in, selected the same way as the existing Windows
+gate.
+
+## 2. Surface being mapped
+
+Telekinesis (`src/Telekinesis.Abstractions/ConsoleSession.cs`, `docs/CONSOLE.md`):
+
+```csharp
+public interface IConsoleSession : IDisposable
+{
+    string Shell { get; }
+    bool IsAlive { get; }
+    void Write(string text);     // "\r" for Enter, "\x03" for Ctrl-C
+    void Resize(int cols, int rows);
+}
+```
+
+Tools: `console_open`, `console_write`, `console_read`, `console_resize`, `console_close`,
+`console_list`. Session ids are `con1`, `con2`, …; `console_resize` clamps cols/rows to 2–1000.
+
+Sentiora: newline-delimited JSON-RPC 2.0 over stdio — `initialize`, `terminal.create`,
+`terminal.list`, `terminal.observe`, `terminal.type`, `terminal.key`, `terminal.wait`,
+`terminal.resize`, `terminal.close`.
+
+## 3. Operation mapping
+
+| Telekinesis | Sentiora | Notes |
+| --- | --- | --- |
+| `console_open(shell, cols, rows)` | `terminal.create {command, args, cols, rows}` | Sentiora splits command and argv; Telekinesis takes one `shell` string. The adapter must split it, or pass `cmd.exe /c <shell>`. |
+| `console_write(sessionId, text, sendEnter)` | `terminal.type {sessionId, owner, revision, text}` | Append `\r` when `sendEnter`. **Requires a fresh `revision`** — see §5. |
+| `console_read(sessionId, lines)` | `terminal.observe {sessionId}` → `screen` | Both are rendered-screen snapshots, so this maps cleanly. `lines` must be applied adapter-side. |
+| `console_resize(sessionId, cols, rows)` | `terminal.resize {sessionId, owner, cols, rows}` | **Range mismatch** — see §7. |
+| `console_close(sessionId)` | `terminal.close {sessionId, owner}` | Requires the owner token. |
+| `console_list()` | `terminal.list {}` | Returns full observations, not summaries. |
+| `IConsoleSession.IsAlive` | `observe().running`, or `state` | `state` distinguishes `exited` from `released`, which `running` alone does not. |
+| `IConsoleSession.Shell` | *(not exposed)* | Sentiora does not echo the command back. The adapter must remember what it asked for. |
+| raw-output callback (constructor) | *(no equivalent)* | **Semantic mismatch** — see §4. |
+| Ctrl-C | `terminal.key {key:"CtrlC"}` or `terminal.type {text:"\x03"}` | Same byte; mode-dependent outcome — see §6. |
+
+`terminal.create` returns `{sessionId, owner, pid, state, revision, running, exit, cols, rows,
+cursor, screen, writeErrors, idleMilliseconds}`.
+
+## 4. The one mapping that does not work: push vs pull
+
+`IConsoleSession` implementations **push raw output bytes** to a callback from a background
+reader. Sentiora has no push channel and never exposes raw bytes — it exposes the **rendered
+screen** after the emulator has applied escape sequences. That is the entire point of the design.
+
+Consequences for an adapter:
+
+- A faithful raw-byte stream **cannot** be reconstructed. Screen diffs are lossy: they cannot
+  recover scrollback that left the viewport, byte-level framing, or escape sequences that produced
+  no visible change.
+- The adapter can synthesise an approximation by running a background
+  `terminal.wait {afterRevision, timeoutMs}` loop per session and diffing consecutive screens.
+- **Recommendation:** the Sentiora backend should declare the raw-output callback unsupported and
+  have Telekinesis consume `console_read` (a screen snapshot) instead — which is already how
+  `console_read` is documented ("a snapshot, not a stream"). Anything in Telekinesis that depends
+  on raw incremental bytes needs identifying before this backend is enabled.
+
+## 5. Revision and ownership: the adapter's job, not the caller's
+
+Sentiora rejects a write whose `revision` does not match the current one (`Stale observation`) or
+whose `owner` does not match (`Input ownership required`). Telekinesis's `Write(text)` has neither
+concept. The adapter must own both:
+
+- Hold the `owner` token from `terminal.create` for the session's lifetime. It is a bearer
+  credential: anyone holding it can type into that session. Keep it out of logs.
+- Before each write, `terminal.observe` for a fresh `revision`, then retry on `Stale observation`.
+  Measured: two of the first server-level test runs failed with `Stale observation` before a retry
+  loop was added, so this is not theoretical.
+- `input()` **bumps the revision itself**, so a subsequent `terminal.wait` must be armed with the
+  revision returned by the *write*, not the one read before it. Waiting on the pre-write revision
+  returns immediately, before the child has replied.
+
+Because the adapter is the single owner, Telekinesis-level concurrency must serialise writes per
+session; Sentiora will not arbitrate between two Telekinesis callers.
+
+## 6. Cancellation, waiting and Ctrl+C
+
+**Waiting for an observable condition** is `observe` → `wait(afterRevision, timeoutMs)` → re-check.
+`timeoutMs` is clamped to 30000 ms server-side. Readiness must be an observable condition such as
+a prompt string on screen — **not a sleep**, and not the `spawned` state, which only means a
+process exists.
+
+**Cancellation has no protocol primitive.** There is no request-id cancellation, so an in-flight
+`terminal.wait` cannot be aborted; it completes or times out. An adapter that needs responsive
+cancellation must use short timeouts (≈250 ms) and poll, accepting that cancellation granularity
+equals the timeout.
+
+**Ctrl+C is three different things**, depending on the child's console mode when byte `0x03`
+arrives — all measured:
+
+| Child state | Outcome |
+| --- | --- |
+| raw mode enabled | delivered as data byte `0x03`; the child keeps running |
+| cooked mode with a `SIGINT` handler | real `CTRL_C_EVENT` → handler runs → exit code 130 |
+| cooked mode, no handler | the console terminates it → `-1073741510` = `0xC000013A` `STATUS_CONTROL_C_EXIT` |
+
+The third row is a trap: `terminal.create` returns **before** the child has configured its console
+mode, so Ctrl+C sent too early kills the process instead of interrupting it. Telekinesis's docs
+already say to send `"\x03"` for Ctrl-C; the adapter must additionally wait for an observable
+readiness marker before allowing it, or document that an early Ctrl+C is fatal.
+
+Ctrl+C is delivered to the targeted session only: a concurrent session was verified to keep
+running and keep answering input (WIN-17).
+
+**Exit detection is not instant.** Between a child dying and `running:false` becoming observable,
+20 cancellations measured a median of **1025 ms** (min 1014, max 1038), consistent with node-pty's
+1000 ms flush interval. Telekinesis must not treat `IsAlive` as immediate.
+
+## 7. Compatibility constraints, with numbers
+
+These are hard limits measured on Windows ARM64; an adapter must be designed around them.
+
+| Constraint | Value | Consequence |
+| --- | --- | --- |
+| Concurrent session cap | **16** per host (`Session limit` error) | `console_open` must fail cleanly past 16, or the adapter must pool multiple Sentiora hosts |
+| Session ceiling per host process | **~495 create/close cycles**, then `Invalid pty handle`; degradation observed from ~363 | The adapter must **recycle the Sentiora host process** on a session counter. Do not treat a Sentiora host as immortal. |
+| Leaked descriptors | **1 fd and ~1.75 Win32 handles per session**, never reclaimed | The mechanism behind the ceiling above |
+| Dimension range | cols **2–300**, rows **2–150** | **Telekinesis clamps to 2–1000.** A `console_resize` to 500 cols would be rejected as `Invalid dimensions`. The adapter must clamp to Sentiora's range and report the applied size. |
+| Input size | ≤ 65536 characters per `terminal.type` | Large pastes must be chunked, and chunking interacts with coalescing (§8) |
+| `close()` latency | median **9 ms** | Cheap; safe to close eagerly |
+| Host shutdown | ~**5.1 s** after stdin closes, with active sessions reaped and exit code 0 | Shutdown must allow ≥6 s before force-killing |
+| Resize propagation | child sees the new geometry ~**170 ms** later | Do not assert on child-side size immediately after resize |
+| Startup to first output | median **91 ms**, p95 103 ms (100 sessions) | Fast enough that a readiness poll, not a sleep, is the right pattern |
+
+## 8. Input framing
+
+Do not assume one `console_write` equals one child input event. Measured: consecutive writes can be
+**coalesced** into a single chunk by ConPTY (Escape followed by Backspace arrived as one `1b7f`),
+and a single large write can be **split**. An adapter that maps Telekinesis writes to expected
+child-side events must compare the ordered byte stream, not count writes.
+
+## 9. Runtime discovery, startup and shutdown
+
+Proposed, all adapter-side:
+
+1. **Discovery.** Resolve the runtime from `SENTIORA_TERMINAL_CMD` (an explicit command line), else
+   `sentiora-terminal` on `PATH`, else a configured absolute path to `src/server.js` plus a Node
+   executable. Fail with a clear error rather than silently falling back to the native backend —
+   #67 requires both to be comparable, so which one is active must be unambiguous.
+2. **Startup.** Spawn the runtime with **piped** stdio and no shared console. Then handshake:
+
+   ```json
+   {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+   {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"platform":"win32","arch":"arm64","conptyDll":false}}
+   ```
+
+   Verify `protocolVersion` before use. `platform`, `arch` and `conptyDll` should be recorded in
+   the startup log so a run is attributable to a specific configuration.
+3. **Transport.** Newline-delimited JSON-RPC 2.0. Read stdout **line by line** and parse every
+   line. This was adversarially verified: a child printing a byte-perfect forged JSON-RPC response
+   plus hostile binary (embedded newlines, braces, `ESC`, `0x7f`, invalid UTF-8) produced **zero**
+   non-conforming lines on the host's stdout (WIN-15). The adapter should still treat a
+   non-parsing line as a fatal transport error rather than skipping it silently.
+4. **Shutdown.** Close the runtime's stdin. The server reaps all sessions and exits — measured at
+   5079 ms with 5 active sessions, exit code 0, no surviving children. Allow ≥6 s, then
+   force-kill the process tree.
+5. **Crash handling.** If the runtime dies, every session id becomes invalid. Surface
+   `Unknown session` as "backend lost" and re-create sessions rather than retrying blindly.
+
+## 10. Error mapping
+
+Sentiora reports errors as JSON-RPC `error` with `code: -32000` and a message. Proposed mapping:
+
+| Sentiora message | Meaning | Telekinesis mapping |
+| --- | --- | --- |
+| `Stale observation` | revision mismatch | retry with a fresh observation (bounded) |
+| `Input ownership required` | wrong owner token | programming error — fail loudly |
+| `Session not running` | child exited or session closed | `IsAlive == false`; stop writing |
+| `Unknown session` | bad id, or backend restarted | backend-lost path (§9.5) |
+| `Unknown key` | key name not in the map | argument error |
+| `Invalid dimensions` | outside cols 2–300 / rows 2–150 | clamp instead (§7) |
+| `Invalid command` | empty/non-string command or non-string argv | argument error |
+| `Invalid conptyDll` | provider flag not boolean | argument error |
+| `Resize denied` | wrong owner, or session closed/exited | as above |
+| `Session limit` | 16 concurrent sessions | backpressure or pool hosts |
+| `Invalid wait` | bad `afterRevision`/`timeoutMs` | argument error |
+
+The message strings are the only machine-readable discriminator today, since every error shares
+code `-32000`. That is brittle. **Recommendation:** add distinct JSON-RPC error codes before an
+adapter depends on them.
+
+## 11. Security and secret-handling audit (required by #67)
+
+Three findings, all from reading `src/server.js` and from measurement:
+
+1. **Environment inheritance is not controllable.** The server spawns children with
+   `env: process.env`, so **every child inherits the Sentiora host's full environment**, including
+   any credential in it. The protocol offers no way to pass a scoped environment. An adapter must
+   therefore ensure the *host process* itself is started with a minimal environment — anything in
+   it is visible to every session.
+2. **Observations are unredacted.** `screen` is returned verbatim. A child that echoes a password,
+   a token or an API key puts it into an observation. Telekinesis audit-logs mutating calls and
+   `console_read` results, so this is a direct secret-leakage path into logs. Redaction must live
+   in the adapter or in Telekinesis's logging layer; Sentiora does none.
+3. **The owner token is a bearer credential.** It is returned by `terminal.create` and is the only
+   thing standing between a caller and typing into that session. It must not be logged, and it
+   should not cross a trust boundary — which is another reason the adapter, not Telekinesis
+   callers, should hold it.
+
+Also relevant: Sentiora's own README states that terminal output is **untrusted data, not
+instructions**. An adapter must not let screen content be interpreted as commands, which matters
+because Telekinesis feeds screens to a model.
+
+## 12. Proposed shape
+
+Smallest contract that satisfies #67 — an opt-in backend behind the existing
+`TelekinesisConsoleSession` abstraction, no change to the public console API:
+
+```csharp
+// PROPOSED — not implemented.
+internal sealed class SentioraConsoleSession : IConsoleSession
+{
+    // One shared host per backend instance; sessions multiplex over one stdio pipe.
+    // Recycled after N create/close cycles because the host leaks one fd per session
+    // and stops accepting new ones at roughly 500 (see §7).
+    public string Shell { get; }          // remembered locally; Sentiora does not echo it
+    public bool IsAlive => _state is "spawned" or "operational";
+    public void Write(string text);       // observe -> type -> retry on "Stale observation"
+    public void Resize(int cols, int rows); // clamped to 2..300 / 2..150
+    public void Dispose();                // terminal.close with the owner token
+}
+```
+
+Deliberately excluded from the smallest contract: the raw-output callback (§4), a Sentiora-side
+redaction policy (§11), and host pooling past the 16-session cap (§7). Each is a separate decision.
+
+## 13. What must be true before this is built
+
+- [ ] Confirm `macos-latest` and `windows-11-arm` CI results for the current Sentiora commit —
+      #67 says to prototype "only after native CI is verified".
+- [ ] Decide the raw-output-callback question (§4); it is the only true semantic mismatch.
+- [ ] Decide where redaction lives (§11.2).
+- [ ] Confirm the 16-session cap and the ~495-session ceiling are acceptable, or add host pooling
+      and recycling.
+- [ ] Add distinct JSON-RPC error codes (§10) so mapping is not string matching.
+- [ ] Re-test [telekinesis#49](https://github.com/egarim/telekinesis/issues/49) against
+      node-pty's ConPTY sequence as a working reference on the same OS build. node-pty drains the
+      conout pipe on a **separate thread** specifically to avoid `ClosePseudoConsole` deadlocks,
+      and #49 notes this build EOFs the output pipe if the parent closes its output-write copy —
+      both are concrete leads. This is independent of whether the adapter is ever built.
+
+## 14. Licensing and dependency boundaries
+
+Sentiora is a separate repository and a separate process. An adapter creates **no build-time
+dependency** from Telekinesis on Sentiora: the coupling is a JSON-RPC contract over stdio plus a
+discovered executable. Telekinesis must keep working with Sentiora entirely absent, which is what
+makes the two backends comparable as #67 requires.
+
+Sentiora likewise gains no dependency on Telekinesis. Both remain independently usable, and
+neither requires Vivarium, Creatura or Custodia at runtime.

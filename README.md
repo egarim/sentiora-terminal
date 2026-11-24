@@ -61,13 +61,19 @@ The runtime is deliberately model-agnostic. Sentiora supplies perception and act
 
 ### Target platforms
 
-| Platform | Backend | Target architectures |
-| --- | --- | --- |
-| Linux | Unix PTY | x64, ARM64 |
-| macOS | Unix PTY | Intel, Apple Silicon |
-| Windows | ConPTY | x64, ARM64 |
+| Platform | Backend | Architectures | Verification status |
+| --- | --- | --- | --- |
+| Windows | ConPTY | ARM64 | **Verified on physical hardware** — 20 native integration scenarios, 37 tests, Node 22 and 24. See [Windows native validation](docs/validation/windows-native-validation.md). |
+| Windows | ConPTY | x64 | **Verified in CI only** (`windows-latest`). No physical-machine x64 run. |
+| Linux | Unix PTY | x64 | **Partially verified in CI** — mocked suite plus one cross-platform native PTY test. |
+| Linux | Unix PTY | ARM64 | Not verified. |
+| macOS | Unix PTY | Apple Silicon, Intel | **Not verified.** Blocked on a CI result for the `spawn-helper` permissions fix; see [provider comparison §7.2](docs/validation/conpty-provider-comparison.md#72-the-macos-failure--root-cause). |
 
-These are targets, not a verified compatibility matrix. Native dependency packaging and real interactive tests must pass before a platform is declared supported.
+These are targets plus whatever has actually been measured, not a blanket compatibility claim.
+Native dependency packaging and real interactive tests must pass before a platform is declared
+supported. CI now verifies that every native binary's architecture matches the runtime
+(`scripts/report-native-arch.mjs`), so an x64 image running under emulation can never be reported
+as ARM64.
 
 ## Developer experience
 
@@ -82,19 +88,39 @@ await session.PressKeyAsync("Enter");
 var next = await session.WaitForChangeAsync(screen.Revision);
 ```
 
-A session should expose structured observations such as:
+A session exposes structured observations. This is the actual current shape returned by
+`terminal.observe`:
 
 ```json
 {
   "sessionId": "example",
+  "pid": 41072,
+  "state": "operational",
   "revision": 12,
-  "visibleText": "Select an option:\n> Continue\n  Cancel",
+  "running": true,
+  "exit": null,
+  "cols": 120,
+  "rows": 40,
   "cursor": { "x": 2, "y": 1 },
-  "running": true
+  "writeErrors": 0,
+  "screen": "Select an option:\n> Continue\n  Cancel",
+  "idleMilliseconds": 84
 }
 ```
 
-The agent can choose an action based on this observation. Revision checks and exclusive input ownership help prevent accidental actions against a changed screen.
+`state` is one of `spawned` (a child process exists but nothing has rendered yet), `operational`
+(the emulator has rendered output), `exited` (the child is gone, resources still held) or
+`released` (`terminal.close` completed). **`spawned` is not readiness** — whether an application is
+ready to accept input is only knowable from a condition the caller defines, such as a prompt
+appearing on screen, reached with `terminal.wait` rather than a sleep.
+
+`pid` is the real child process id, stable across observations and after exit, so a caller can
+verify process identity independently. `writeErrors` counts asynchronous writes to the terminal
+input that failed; a non-zero value means some input was lost.
+
+Revision checks and exclusive input ownership help prevent accidental actions against a changed
+screen. Note that a successful write **advances the revision itself**, so a `terminal.wait` must be
+armed with the revision returned by the write, not the one read before it.
 
 ### Initial protocol surface
 
@@ -111,6 +137,14 @@ The agent can choose an action based on this observation. Revision checks and ex
 | terminal.close | End a session |
 
 The protocol is provisional until the implementation and contract tests land.
+
+`terminal.create` accepts `{command, args, cwd, cols, rows, conptyDll}` and returns the first
+observation plus the `owner` token for that session. `conptyDll` selects node-pty's bundled
+`conpty.dll` instead of the OS ConPTY and defaults to `false`; the host-wide default can be set
+with `SENTIORA_CONPTY_DLL=1`, and `initialize` reports the effective value. The bundled provider is
+**exposed for comparison, not recommended**: measured over 30 sessions it leaks a worker thread,
+about 8 Win32 handles and ~6.5 MB per session, and leaves the host process unable to exit. See the
+[provider comparison](docs/validation/conpty-provider-comparison.md).
 
 ## The Creatura ecosystem
 
@@ -178,15 +212,65 @@ Sentiora is not intended to bypass authentication, permission gates, subscriptio
 
 ## Getting started
 
-The initial JavaScript ESM runtime and CI configuration are now in this repository. Native platform validation is pending; SDKs are not yet published.
+The JavaScript ESM runtime, native Windows validation and CI configuration are in this
+repository. SDKs are not yet published.
 
 ```bash
-npm install
-npm test
-npm start
+npm ci                 # reproducible install from package-lock.json
+npm run fix:native-permissions   # macOS only: restores node-pty's spawn-helper executable bit
+npm run test:unit      # mocked tests, no native dependency
+npm run test:native    # real PTY tests (ConPTY on Windows)
+npm test               # both
+npm start              # JSON-RPC server over stdio
 ```
 
-The server communicates over newline-delimited JSON-RPC on stdio. See [CI results](https://github.com/egarim/sentiora-terminal/actions) for validation progress.
+On macOS the permissions step is **required**: node-pty 1.1.0 publishes
+`prebuilds/darwin-*/spawn-helper` as mode 644, and macOS `posix_spawnp`s it, so without the
+executable bit every spawn fails with `posix_spawnp failed.` CI runs it automatically. Linux uses
+`forkpty` and Windows uses ConPTY, so neither needs it.
+
+The server communicates over newline-delimited JSON-RPC on stdio. See
+[CI results](https://github.com/egarim/sentiora-terminal/actions) for current status.
+
+### Benchmarks and stress harnesses
+
+These are long-running and are **not** part of `npm test`:
+
+```bash
+npm run bench:conpty -- os  30 90000    # OS ConPTY provider, 30 trials
+npm run bench:conpty -- dll 30 90000    # bundled-DLL provider, 30 trials
+npm run stress                          # 100 sequential + 10 concurrent + cancellation,
+                                        # termination, resize, input and shutdown phases
+node test/bench/fd-exhaustion.mjs 1200  # finds the per-host session ceiling
+```
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Windows native validation](docs/validation/windows-native-validation.md) | The 20 native ConPTY scenarios, the session-teardown hang and its fix, ARM64 verification, Ctrl+C semantics, measurement pitfalls. |
+| [ConPTY provider comparison](docs/validation/conpty-provider-comparison.md) | OS ConPTY vs bundled `conpty.dll`, lifecycle states, the host-crash defect, long-running reliability, the ~500-session ceiling, CI and the macOS root cause. |
+| [Telekinesis integration](docs/integrations/telekinesis.md) | **Proposed** contract for using Sentiora as an optional Telekinesis console backend. Not implemented. |
+
+### Ecosystem
+
+Sentiora Terminal is independently usable and has **no runtime dependency** on any other project
+in the ecosystem. The relationships below are documentation-level only.
+
+| Repository | Relationship | Status |
+| --- | --- | --- |
+| [Creatura](https://github.com/egarim/creatura) | Artificial cognition; would consume Sentiora through a World adapter | Proposed — [creatura#101](https://github.com/egarim/creatura/issues/101), [#107](https://github.com/egarim/creatura/issues/107) |
+| [Telekinesis](https://github.com/egarim/telekinesis) | Perception and interaction; Sentiora as an optional console backend | Proposed — [telekinesis#67](https://github.com/egarim/telekinesis/issues/67) |
+| [Sentiora Browser](https://github.com/egarim/sentiora-browser) | Sibling sensorimotor surface for the browser | Separate project |
+| [Vivarium](https://github.com/egarim/vivarium) | Agent habitat and supervision | Supervisory context, not a dependency |
+| [Custodia](https://github.com/egarim/custodia) | Credential management and authorization | No integration |
+| [Unisono](https://github.com/egarim/unisono) | MCP host; a future Sentiora MCP surface would follow its patterns | No integration |
+
+Milestones for this repository are tracked in [#1](https://github.com/egarim/sentiora-terminal/issues/1)
+(native runtime), [#2](https://github.com/egarim/sentiora-terminal/issues/2) (protocol and
+lifecycle), [#3](https://github.com/egarim/sentiora-terminal/issues/3) (C# SDK),
+[#4](https://github.com/egarim/sentiora-terminal/issues/4) (MCP, Python, takeover) and
+[#5](https://github.com/egarim/sentiora-terminal/issues/5) (Telekinesis interoperability).
 
 ## Contributing
 

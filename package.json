@@ -8,7 +8,12 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/*.test.js"
+    "fix:native-permissions": "node scripts/fix-native-permissions.mjs",
+    "test": "node --test --test-timeout=180000 test/*.test.js",
+    "test:unit": "node --test --test-timeout=60000 test/session.test.js",
+    "test:native": "node --test --test-timeout=180000 test/native.test.js test/windows-native.test.js test/windows-server.test.js",
+    "bench:conpty": "node test/bench/conpty-provider-bench.mjs",
+    "stress": "node test/bench/lifecycle-stress.mjs"
   },
   "dependencies": {
     "node-pty": "^1.1.0",

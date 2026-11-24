@@ -4,10 +4,13 @@
 // JSON-RPC on stdio, real child processes on the other side.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { FIXTURE, rawHex } from './helpers/native.mjs';
+
+const execFileAsync = promisify(execFile);
 
 const windows = process.platform === 'win32';
 const skip = windows ? false : 'native ConPTY scenario: Windows only';
@@ -75,6 +78,18 @@ function startServer() {
         const timer = setTimeout(resolve, 30000);
         child.once('exit', () => { clearTimeout(timer); resolve(); });
       });
+    },
+    // Needed for sessions created with conptyDll:true, whose undisposed conout
+    // worker means the server can never exit on its own.
+    async forceStop() {
+      child.stdin.end();
+      await new Promise(resolve => {
+        const timer = setTimeout(resolve, 5000);
+        child.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+      if (child.exitCode === null) {
+        try { await execFileAsync('taskkill', ['/F', '/T', '/PID', String(child.pid)]); } catch { /* already gone */ }
+      }
     },
   };
 }
@@ -235,6 +250,59 @@ test('server shuts its sessions down and exits when stdin closes', opts, async (
   }
 });
 
+test('lifecycle state, child pid and provider default are exposed over the protocol', opts, async () => {
+  const server = startServer();
+  try {
+    const init = await server.call('initialize', {});
+    assert.equal(init.conptyDll, false, 'the bundled-DLL provider must not be the default');
+
+    const created = await server.call('terminal.create', {
+      command: process.execPath, args: [FIXTURE], cols: 80, rows: 24,
+    });
+    const { sessionId, owner } = created;
+    assert.ok(Number.isInteger(created.pid) && created.pid > 0, `create must expose the child pid, got ${created.pid}`);
+    assert.ok(['spawned', 'operational'].includes(created.state), `unexpected initial state ${created.state}`);
+
+    const ready = await waitForScreen(server, sessionId, 'FIXTURE READY');
+    assert.equal(ready.state, 'operational', 'a spawned process is not the same as an operational terminal');
+    assert.equal(ready.pid, created.pid, 'the pid must be stable across observations');
+
+    await armed(server, 'terminal.type', sessionId, owner, { text: 'exit 9\r' });
+    const exited = await waitForState(server, sessionId, 'exited');
+    assert.equal(exited.exit.exitCode, 9);
+    assert.equal(exited.pid, created.pid, 'the pid must survive exit so a caller can verify identity');
+
+    assert.equal(await server.call('terminal.close', { sessionId, owner }), true);
+    assert.deepEqual(await server.call('terminal.list', {}), []);
+
+    const badProvider = await server.request('terminal.create', {
+      command: process.execPath, args: [FIXTURE], conptyDll: 'yes',
+    });
+    assert.match(badProvider.error.message, /Invalid conptyDll/);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('the bundled-DLL ConPTY provider can be selected over the protocol', opts, async () => {
+  const server = startServer();
+  try {
+    const created = await server.call('terminal.create', {
+      command: process.execPath, args: [FIXTURE], cols: 80, rows: 24, conptyDll: true,
+    });
+    const ready = await waitForScreen(server, created.sessionId, 'FIXTURE READY');
+    assert.equal(ready.state, 'operational', 'the bundled ARM64 conpty.dll must drive a real session');
+    await armed(server, 'terminal.type', created.sessionId, created.owner, { text: 'echo DLL-PROVIDER-OK\r' });
+    const echoed = await waitForScreen(server, created.sessionId, 'ECHO:DLL-PROVIDER-OK');
+    assert.match(echoed.screen, /ECHO:DLL-PROVIDER-OK/);
+    assert.equal(await server.call('terminal.close', { sessionId: created.sessionId, owner: created.owner }), true);
+  } finally {
+    // The DLL provider leaves an undisposed conout worker inside the server, so
+    // the server can never exit on its own. Kill it rather than orphan it.
+    await server.forceStop();
+  }
+});
+
 // The revision guard means every write must be armed with a fresh observation,
 // and any output landing in between makes that write stale. Retrying is what a
 // real agent has to do, so the tests do the same.
@@ -256,6 +324,16 @@ async function waitForScreen(server, sessionId, marker, timeout = 20000) {
     const observed = await server.call('terminal.observe', { sessionId });
     if (observed.screen.includes(marker)) return observed;
     if (Date.now() > deadline) throw new Error(`screen never contained ${marker}; last:\n${observed.screen}`);
+    await server.call('terminal.wait', { sessionId, afterRevision: observed.revision, timeoutMs: 250 });
+  }
+}
+
+async function waitForState(server, sessionId, state, timeout = 20000) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const observed = await server.call('terminal.observe', { sessionId });
+    if (observed.state === state) return observed;
+    if (Date.now() > deadline) throw new Error(`session never reached state ${state}; last was ${observed.state}`);
     await server.call('terminal.wait', { sessionId, afterRevision: observed.revision, timeoutMs: 250 });
   }
 }
