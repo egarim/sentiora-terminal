@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The bridge binds to loopback only and authenticates with a per-launch
+         bearer token, so a CSP that forbids remote origins costs nothing. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
+    <meta name="color-scheme" content="dark light" />
+    <title>Sentiora Living Terminal</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>The Sentiora Living Terminal UI requires JavaScript.</noscript>
+    <script type="module" src="/ui/main.tsx"></script>
+  </body>
+</html>
