@@ -1,9 +1,15 @@
-# Telekinesis integration — proposed contract
+# Telekinesis integration — contract
 
-**Status: PROPOSED. Nothing in this document is implemented.** There is no Sentiora adapter in
-Telekinesis and no Telekinesis-specific code in Sentiora. This is a contract for
-[telekinesis#67](https://github.com/egarim/telekinesis/issues/67), derived from the actual
-Telekinesis console tier on `origin/main` at `57bfa79` and from measured Sentiora behaviour.
+**Status: implemented on the Telekinesis side, open as
+[telekinesis#70](https://github.com/egarim/telekinesis/pull/70).** This document was written as a
+proposal; the adapter described here has since been built as `Telekinesis.Sentiora` and that PR
+should be read as the authoritative implementation. **Sentiora itself still contains no
+Telekinesis-specific code** and does not need any — the coupling is this JSON-RPC contract plus a
+discovered executable, so Sentiora remains independently usable.
+
+The contract was derived from the actual Telekinesis console tier on `origin/main` at `57bfa79` and
+from measured Sentiora behaviour. Where telekinesis#70 diverges from or corrects this document, the
+implementation wins; two such corrections are noted inline in §10 and §11.
 
 Everything asserted about Sentiora below is backed by
 [`../validation/windows-native-validation.md`](../validation/windows-native-validation.md) or
@@ -202,7 +208,8 @@ Sentiora reports errors as JSON-RPC `error` with `code: -32000` and a message. P
 | Sentiora message | Meaning | Telekinesis mapping |
 | --- | --- | --- |
 | `Stale observation` | revision mismatch | retry with a fresh observation (bounded) |
-| `Input ownership required` | wrong owner token | programming error — fail loudly |
+| `Input ownership required` | wrong owner token on `terminal.type` / `terminal.key` | programming error — fail loudly |
+| `Ownership required` | wrong owner token on `terminal.close` — **a different string for the same failure**, thrown at `src/server.js`'s close branch rather than in `Session.input` | map to the same case as `Input ownership required` |
 | `Session not running` | child exited or session closed | `IsAlive == false`; stop writing |
 | `Unknown session` | bad id, or backend restarted | backend-lost path (§9.5) |
 | `Unknown key` | key name not in the map | argument error |
@@ -226,10 +233,17 @@ Three findings, all from reading `src/server.js` and from measurement:
    any credential in it. The protocol offers no way to pass a scoped environment. An adapter must
    therefore ensure the *host process* itself is started with a minimal environment — anything in
    it is visible to every session.
-2. **Observations are unredacted.** `screen` is returned verbatim. A child that echoes a password,
-   a token or an API key puts it into an observation. Telekinesis audit-logs mutating calls and
-   `console_read` results, so this is a direct secret-leakage path into logs. Redaction must live
-   in the adapter or in Telekinesis's logging layer; Sentiora does none.
+2. **Observations are unredacted, and typed input is audit-logged verbatim.** `screen` is
+   returned verbatim, so a child that echoes a password, token or API key puts it into an
+   observation. Checked against `ConsoleTools.cs` at telekinesis `57bfa79`: `AuditLog.Append` is
+   called for `console_open` (the shell command line), `console_write` (**the verbatim text
+   typed**), `console_resize` and `console_close` — but **not** for `console_read`. So the sharper
+   leakage path is not screen capture but write logging: an agent that types a password into a
+   prompt has it recorded verbatim in the audit log, and a `console_open` command line carrying an
+   inline secret is recorded too. Redaction must live in the adapter or in Telekinesis's logging
+   layer; Sentiora does none.
+   *(An earlier revision of this document claimed `console_read` results were audit-logged. That
+   was wrong and is corrected here — `console_read` is not a mutating call and is not audited.)*
 3. **The owner token is a bearer credential.** It is returned by `terminal.create` and is the only
    thing standing between a caller and typing into that session. It must not be logged, and it
    should not cross a trust boundary — which is another reason the adapter, not Telekinesis
