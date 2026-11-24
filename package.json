@@ -1,0 +1,17 @@
+{
+  "name": "sentiora-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "@xterm/headless": "^5.5.0"
+  }
+}
