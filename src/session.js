@@ -41,5 +41,8 @@ export class Session {
     if(owner!==this.owner||this.closed||this.exit)throw Error('Resize denied');
     dimensions(cols,rows);this.pty.resize(cols,rows);this.terminal.resize(cols,rows);this.changed();return this.observe();
   }
-  async close(){if(this.closed)return;this.closed=true;try{if(!this.exit)this.pty.kill();}finally{this.changed();await this.pending;for(const s of this.subscriptions)s.dispose();this.terminal.dispose();}}
+  // kill() is required even after a natural exit: on Windows node-pty only
+  // disposes its ConPTY conout worker thread from kill(), and a live worker
+  // keeps the host event loop alive forever.
+  async close(){if(this.closed)return;this.closed=true;try{this.pty.kill();}catch{}finally{this.changed();await this.pending;for(const s of this.subscriptions)s.dispose();this.terminal.dispose();}}
 }
