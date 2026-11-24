@@ -110,6 +110,43 @@ on this ARM64 machine. The macOS failure is separate and out of scope here; its 
 unavailable because the run was still in progress. The suite had therefore never been green
 on Windows, and CI was burning runner hours up to the 6 h job limit.
 
+### 2.1 CI confirmation after the fix
+
+Run [`45460762032`](https://github.com/egarim/sentiora-terminal/actions/runs/45460762032) on
+`fix/windows-native-validation`, pull request #6:
+
+```
+✓ test (windows-latest) in 1m20s   <- was still running after 1h51m on main
+✓ test (ubuntu-latest)  in 10s
+X test (macos-latest)   in 10s     <- pre-existing, see below
+```
+
+**The Windows job now completes in 1 m 20 s instead of never finishing.** That is independent,
+x64, GitHub-hosted confirmation of the §4 fix, on a different machine and architecture from the
+one used for every other measurement in this report.
+
+The macOS job fails identically to `main` (same step, ~9–10 s), in the **pre-existing**
+`test/native.test.js`:
+
+```
+not ok 1 - real PTY redraw, input and exit
+  failureType: 'testCodeFailure'
+  error: 'posix_spawnp failed.'
+```
+
+This is not a regression from this change:
+
+- `posix_spawnp failed.` is raised by `pty.spawn()`, which happens before any `close()`; the
+  only source change here is inside `close()`.
+- `node-pty` `^1.0.0` and `^1.1.0` resolve to the **same** 1.1.0 tarball, so the darwin native
+  binary is byte-identical either way.
+- All 24 new tests report `ok ... # SKIP native ConPTY scenario: Windows only`, and the run
+  summary is `# fail 1` — the single pre-existing failure, unchanged.
+
+Note that the exact `main` log line could not be diffed directly: GitHub only exposes job logs
+once the whole run completes, and the `main` run is **still blocked by the Windows hang this PR
+fixes**. Fixing Windows is therefore a prerequisite for triaging macOS.
+
 ## 3. Root cause of the hang
 
 `src/session.js` guarded the kill:
@@ -533,9 +570,12 @@ immediately if the parent closes its output-write copy.
 
 ## 12. Remaining work
 
-- [ ] Re-run this suite on x64 Windows and confirm the same results natively.
+- [ ] Re-run this suite on x64 Windows natively. CI has now confirmed x64 passes
+      (`windows-latest` ✓ 1 m 20 s), but the per-scenario evidence in §8 is ARM64-only.
 - [ ] Re-run on Node 22 (the CI-pinned version).
-- [ ] Triage the macOS CI failure.
+- [ ] Triage the macOS `posix_spawnp failed.` in `test/native.test.js`. Now unblocked, since
+      its logs were only inaccessible while the Windows job hung. The usual cause on macOS is
+      `prebuilds/darwin-arm64/spawn-helper` missing its executable bit or a valid signature.
 - [ ] Evaluate `useConptyDll: true` for the fd leak and the 5 s tail.
 - [ ] Drive a real full-screen TUI for WIN-18 rather than the fixture.
 - [ ] Extend the matrix to Linux and macOS ARM64 so the platform table in the README can be
@@ -554,7 +594,8 @@ had exited normally, which on Windows left node-pty's ConPTY conout worker threa
 the host process **unexitable**. This affected every normal command execution, hung `npm test`
 indefinitely, and was independently reproducing on GitHub's Windows runner for 1 h 51 m. The fix
 is one line, is safe on Unix by inspection of `UnixTerminal.kill()`, and takes the suite from
-never completing to 28/28 in ~50 s across three consecutive runs.
+never completing to 28/28 in ~50 s across four consecutive runs. CI independently confirms it on
+x64: `windows-latest` went from still-running-after-1h51m to **passing in 1 m 20 s**.
 
 Two real defects remain, both in node-pty rather than Sentiora, both measured and documented
 rather than assumed away: a ~5 s shutdown tail from a helper that crashes on already-exited
