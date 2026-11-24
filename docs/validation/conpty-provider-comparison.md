@@ -574,11 +574,33 @@ It was deliberately **not** wired as a `postinstall` lifecycle script: auto-exec
 local macOS developer must run `npm run fix:native-permissions` once after installing; this is
 documented in the README.
 
-**macOS is not claimed as supported by this document.** No macOS execution was performed locally —
-this machine is Windows ARM64. The root cause is established from the published tarball and the
-source, and the fix is verified only by CI. Whether it turns `macos-latest` green is recorded as
-**BLOCKED on CI results** at the time of writing and must be confirmed from the run for this
-commit before any macOS support claim is made.
+**Confirmed by CI.** No macOS execution was possible locally — this machine is Windows ARM64 — so
+the fix was verified through GitHub Actions on the commit that contains it, run
+[`45479968125`](https://github.com/egarim/sentiora-terminal/actions/runs/45479968125):
+
+```
+✓ test (macos-latest, 22)       in 9s
+✓ test (macos-latest, 24)       in 17s
+```
+
+Both macOS jobs pass, where they previously failed in ~10 s with `posix_spawnp failed.`. That
+closes the diagnosis: the cause was the missing executable bit, and restoring it is sufficient.
+`macos-latest` is Apple Silicon, so this validates macOS **ARM64**; Intel is not covered and would
+need `macos-15-intel`.
+
+The same run validated the rest of the matrix, all 8 jobs green:
+
+```
+✓ test (ubuntu-latest, 22)    in 11s     ✓ test (windows-latest, 22)     in 1m27s
+✓ test (ubuntu-latest, 24)    in 18s     ✓ test (windows-latest, 24)     in 1m37s
+✓ test (macos-latest, 22)     in 9s      ✓ test (windows-11-arm, 22)     in 1m52s
+✓ test (macos-latest, 24)     in 17s     ✓ test (windows-11-arm, 24)     in 1m43s
+```
+
+Two things this establishes independently of the local machine: `windows-11-arm` is a working
+runner label and the suite passes on **GitHub-hosted Windows ARM64**, not only on this physical
+Surface; and Node 22 and Node 24 both pass on all four platforms, matching the local Node 22 /
+Node 24 result in §6.
 
 ## 8. Known limitations
 
@@ -597,8 +619,11 @@ commit before any macOS support claim is made.
 7. **No source-compilation path tested** — no MSVC on this machine. Only the vendored ARM64
    prebuild route is validated.
 8. **PowerShell 5.1 only**; no `pwsh` installed, so PowerShell 7 behaviour is untested.
-9. **Windows ARM64 is validated on physical hardware; Windows x64 only via CI.** Linux and macOS
-   ARM64 have no local coverage at all.
+9. **Only Windows ARM64 has physical-machine coverage.** Windows x64, Linux x64 and macOS ARM64
+   are verified by CI alone; macOS Intel and Linux ARM64 have no coverage at all. The
+   per-scenario evidence in §6 and the stress results in §5 are Windows ARM64 measurements and
+   should not be assumed to hold elsewhere — in particular the descriptor leak and the
+   ~500-session ceiling are ConPTY-specific and untested against Unix PTY.
 10. **`useConptyDll:true` is exposed but not recommended** and is not covered by the long-running
     stress phases, since it cannot shut down.
 11. **Environment inheritance is not controllable through the protocol.** `src/server.js` spawns
@@ -622,14 +647,17 @@ commit before any macOS support claim is made.
    configurable threshold and reports a clear error, rather than letting the host reach the
    `Invalid pty handle` state. Not implemented here to keep the change reviewable.
 5. **Add `timeout-minutes` to any future workflow** — already done for this one.
-6. **Do not claim macOS support** until a CI run for this commit shows `macos-latest` green.
-7. **Re-run the full matrix on x64 Windows and on Linux/macOS ARM64** before extending any
-   compatibility claim beyond Windows ARM64 + CI x64.
+6. **Extend the matrix to the two uncovered architectures** — `macos-15-intel` and
+   `ubuntu-24.04-arm` — before claiming Intel macOS or Linux ARM64 support. macOS ARM64, Windows
+   x64 and Windows ARM64 are now CI-verified and can be claimed.
 
 ## 10. Remaining work
 
-- [ ] Confirm `macos-latest` turns green with the permissions fix, from the CI run for this commit.
-- [ ] Confirm `windows-11-arm` queues and passes on GitHub-hosted ARM64 runners.
+- [x] Confirm `macos-latest` turns green with the permissions fix — **done**, run 45479968125,
+      macOS 22 in 9 s and macOS 24 in 17 s.
+- [x] Confirm `windows-11-arm` queues and passes on GitHub-hosted ARM64 runners — **done**, same
+      run, 1 m 52 s (Node 22) and 1 m 43 s (Node 24).
+- [ ] Extend the matrix to `macos-15-intel` and `ubuntu-24.04-arm`.
 - [ ] Upstream the four node-pty issues and track them.
 - [ ] Add a session-count guard to `src/server.js`.
 - [ ] Decide whether the ~500-session ceiling warrants a host-recycling supervisor in Sentiora
@@ -656,7 +684,8 @@ Lifecycle semantics are now explicit — `spawned`, `operational`, `exited`, `re
 pretence that Sentiora can know when an *application* is ready — and the child pid is exposed so a
 caller can verify process identity independently. Builds are reproducible via a committed lockfile
 and `npm ci`, CI can no longer hang silently, and the macOS failure is root-caused to a mode-644
-`spawn-helper` in node-pty's published tarball.
+`spawn-helper` in node-pty's published tarball and **fixed**: `macos-latest` now passes.
 
-37/37 tests pass on both Node 22.23.5 and Node 24.18.1, ARM64, with every native binary verified
-ARM64 by its container header.
+37/37 tests pass locally on both Node 22.23.5 and Node 24.18.1, ARM64, with every native binary
+verified ARM64 by its container header — and all 8 CI matrix jobs pass, covering ubuntu,
+windows x64, windows ARM64 and macOS ARM64 against Node 22 and Node 24.

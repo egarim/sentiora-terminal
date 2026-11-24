@@ -264,8 +264,10 @@ redaction policy (§11), and host pooling past the 16-session cap (§7). Each is
 
 ## 13. What must be true before this is built
 
-- [ ] Confirm `macos-latest` and `windows-11-arm` CI results for the current Sentiora commit —
-      #67 says to prototype "only after native CI is verified".
+- [x] Confirm `macos-latest` and `windows-11-arm` CI results for the current Sentiora commit —
+      **done**, run [`45479968125`](https://github.com/egarim/sentiora-terminal/actions/runs/45479968125):
+      all 8 matrix jobs green (ubuntu, windows x64, windows ARM64, macOS ARM64 × Node 22 and 24).
+      #67's precondition "only after native CI is verified" is satisfied.
 - [ ] Decide the raw-output-callback question (§4); it is the only true semantic mismatch.
 - [ ] Decide where redaction lives (§11.2).
 - [ ] Confirm the 16-session cap and the ~495-session ceiling are acceptable, or add host pooling

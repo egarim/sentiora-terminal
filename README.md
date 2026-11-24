@@ -63,15 +63,15 @@ The runtime is deliberately model-agnostic. Sentiora supplies perception and act
 
 | Platform | Backend | Architectures | Verification status |
 | --- | --- | --- | --- |
-| Windows | ConPTY | ARM64 | **Verified on physical hardware** — 20 native integration scenarios, 37 tests, Node 22 and 24. See [Windows native validation](docs/validation/windows-native-validation.md). |
-| Windows | ConPTY | x64 | **Verified in CI only** (`windows-latest`). No physical-machine x64 run. |
-| Linux | Unix PTY | x64 | **Partially verified in CI** — mocked suite plus one cross-platform native PTY test. |
+| Windows | ConPTY | ARM64 | **Verified twice** — physical Snapdragon X hardware (20 native scenarios, 37 tests, Node 22 and 24) and GitHub-hosted `windows-11-arm`. See [Windows native validation](docs/validation/windows-native-validation.md). |
+| Windows | ConPTY | x64 | **Verified in CI** (`windows-latest`, Node 22 and 24). No physical-machine x64 run. |
+| Linux | Unix PTY | x64 | **Verified in CI** — mocked suite plus one cross-platform native PTY test. |
+| macOS | Unix PTY | Apple Silicon | **Verified in CI** (`macos-latest`, Node 22 and 24) after the `spawn-helper` permissions fix. |
 | Linux | Unix PTY | ARM64 | Not verified. |
-| macOS | Unix PTY | Apple Silicon, Intel | **Not verified.** Blocked on a CI result for the `spawn-helper` permissions fix; see [provider comparison §7.2](docs/validation/conpty-provider-comparison.md#72-the-macos-failure--root-cause). |
+| macOS | Unix PTY | Intel | Not verified — `macos-latest` is Apple Silicon; Intel needs `macos-15-intel`. |
 
 These are targets plus whatever has actually been measured, not a blanket compatibility claim.
-Native dependency packaging and real interactive tests must pass before a platform is declared
-supported. CI now verifies that every native binary's architecture matches the runtime
+CI verifies that every native binary's architecture matches the runtime
 (`scripts/report-native-arch.mjs`), so an x64 image running under emulation can never be reported
 as ARM64.
 
