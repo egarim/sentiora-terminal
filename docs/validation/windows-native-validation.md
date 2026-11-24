@@ -382,10 +382,28 @@ one run hung. Recorded here because it explains the final method.
 
 Final method, used by WIN-14 and WIN-19: warmed-up baseline (`conhostBaseline`), one batched
 pid check for all children (`alivePidsAmong`, a single `tasklist` instead of one per pid), a
-quiet 10 s settle with no subprocess spawning, then **one** measurement, tolerating at most
-one host and logging the exact count. Observed across the four runs: `1, 1, 0, 0`. The strict,
-artifact-free guarantees are that every child pid Sentiora spawned is gone and that
-`MessagePort` returns to 0.
+quiet 10 s settle with no subprocess spawning, then **one** measurement.
+
+Even that proved too fragile to assert on. With no change to the code under test, the leftover
+count was observed at `0, 1, 1, 0, 8, 1, 1, 11, 0, 0, 1, 0` across successive full-suite runs on
+this machine — a live desktop, where any console subprocess spawned by anything is handed a
+conhost. A `<= 1` tolerance passed four times and then failed at 8. **The assertion was removed,
+not loosened**: a bound that tracks machine activity is not a test. The count is still measured
+and logged as `informational` so the raw numbers stay in the transcript.
+
+What WIN-14 and WIN-19 do assert is precisely attributable and was stable in every run:
+
+- every child pid Sentiora spawned is gone, matched by exact pid (`alivePidsAmong`);
+- `MessagePort` returns to **0** — no ConPTY conout worker survives `close()`;
+- the conin-socket leak is exactly 1 per session (`Socket 31 → 51` over 20 sessions, identical
+  in all seven measured runs);
+- WIN-14 additionally keeps the check that **at least one conhost appears per open session**.
+  That direction is monotonic — unrelated console churn can only add hosts — so it is stable,
+  and it is the positive evidence that ConPTY really is creating console hosts here.
+
+The claim that session hosts are *reaped* rests on the dedicated probes above (0 leftovers at
++8 s, +10 s and +15 s, with every leftover positively identified as having a foreign parent),
+not on an in-suite global count.
 
 ## 6. Changes made
 
@@ -440,8 +458,12 @@ headless buffer exposes SGR attributes, so colour assertions check real renderin
 
 ## 8. Result matrix
 
-Four consecutive full runs after the fix, the last on the exact committed tree: **28/28 pass**
-each (`duration_ms` 51318 / 50760 / 50561 / 49996). Durations below are from the second run.
+Final state: **three consecutive full runs, 28/28 pass each** (`duration_ms` 55864 / 55006 /
+52954), on the exact committed tree. Four earlier runs also passed 28/28 (51318 / 50760 / 50561
+/ 49996). Two further runs failed 27/28, and in **both** cases the only failure was the
+global-conhost assertion that §5.9 explains and that has since been removed; no scenario ever
+failed for a reason connected to the code under test. Durations below are from one
+representative run and vary by roughly ±10% between runs.
 
 | ID | Scenario | Result | ms | Evidence |
 | --- | --- | --- | --- | --- |
@@ -458,12 +480,12 @@ each (`duration_ms` 51318 / 50760 / 50561 / 49996). Durations below are from the
 | WIN-11 | Stale revision rejected | **PASS** | 208 | `Stale observation`; text never reaches the pty; current revision still accepted |
 | WIN-12 | Unauthorised owner rejected | **PASS** | 153 | `Input ownership required` for a wrong and an undefined owner; revision unchanged |
 | WIN-13 | Process exit status | **PASS** | 5157 | fixture exit 0 / 3 / 42 reported exactly; `cmd /c exit 7` → 7; input after exit → `Session not running` |
-| WIN-14 | Cleanup, no orphaned processes | **PASS** | 13771 | 3 sessions → 3 new `conhost.exe`; after close all child pids gone and hosts reaped (logged: 0 or 1, §5.9) |
+| WIN-14 | Cleanup, no orphaned processes | **PASS** | 13771 | 3 sessions → ≥3 new `conhost.exe` (monotonic, so stable); after close **every child pid gone by exact match**; host count logged not asserted (§5.9) |
 | WIN-15 | JSON-RPC stdout not corrupted | **PASS** | 5411 | child prints a forged JSON-RPC response + hostile binary; **every** stdout line still valid JSON-RPC 2.0, no forged id, no `"INJECTED"` (§5.3) |
 | WIN-16 | Wait operations and timeouts | **PASS** | 618 | quiescent wait returns in ≥350 ms and <5 s with a stable revision; write-armed wait wakes on output; `-1`, `-1`, `NaN` all rejected |
 | WIN-17 | Ctrl+C targets the right process | **PASS** | 2429 | `GOT-SIGINT` + exit 130 in the target; concurrent bystander still running and still answering; cooked child with no handler → `0xC000013A` (§5.5) |
 | WIN-18 | Full-screen application | **PASS** | 326 | `buffer.active.type` `normal` → `alternate` → `normal`; box glyphs survive; primary screen content restored intact |
-| WIN-19 | Repeated create/close, leaks | **PASS** | 16469 | 20 cycles; `MessagePort → 0`; all child pids gone; no sustained rss growth; **+20 conin sockets = 1 per session** (upstream, §5.2) |
+| WIN-19 | Repeated create/close, leaks | **PASS** | 16469 | 20 cycles; **all 20 child pids gone by exact match**; `MessagePort → 0`; no sustained rss growth; **+20 conin sockets = exactly 1 per session**, identical in all 7 measured runs (upstream, §5.2) |
 | WIN-20 | Recovery after unexpected exit | **PASS** | 1739 | child killed externally with `taskkill /F /T`; session reports `running:false` with exit info; input rejected; a concurrent session still works; a new session can be created; double `close()` safe |
 
 Additional non-scenario coverage in the same suites:
@@ -488,7 +510,7 @@ npm test                          # HANGS on Windows: first test passes, no summ
 git checkout fix/windows-native-validation
 npm install
 node --check src/server.js
-npm test                          # 28/28 pass, ~50 s on this machine
+npm test                          # 28/28 pass, ~55 s on this machine
 node --test test/windows-native.test.js    # WIN-01..WIN-14, WIN-16..WIN-20
 node --test test/windows-server.test.js    # WIN-15 + protocol end-to-end
 node --test --test-name-pattern="WIN-19" test/windows-native.test.js   # single scenario
@@ -594,7 +616,7 @@ had exited normally, which on Windows left node-pty's ConPTY conout worker threa
 the host process **unexitable**. This affected every normal command execution, hung `npm test`
 indefinitely, and was independently reproducing on GitHub's Windows runner for 1 h 51 m. The fix
 is one line, is safe on Unix by inspection of `UnixTerminal.kill()`, and takes the suite from
-never completing to 28/28 in ~50 s across four consecutive runs. CI independently confirms it on
+never completing to 28/28 in ~55 s, three consecutive clean runs on the final tree. CI independently confirms it on
 x64: `windows-latest` went from still-running-after-1h51m to **passing in 1 m 20 s**.
 
 Two real defects remain, both in node-pty rather than Sentiora, both measured and documented
