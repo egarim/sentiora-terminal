@@ -1,4 +1,8 @@
 import { randomUUID } from 'node:crypto';
+// Upper bound on how long close() waits for the emulator write chain to settle.
+// Normally the chain is already resolved and this timer is cleared immediately;
+// it only elapses when a write callback never fires.
+const CLOSE_GRACE_MS = 2000;
 export function dimensions(cols,rows) {
   if (!Number.isInteger(cols)||!Number.isInteger(rows)||cols<2||cols>300||rows<2||rows>150) throw Error('Invalid dimensions');
 }
@@ -15,7 +19,7 @@ export class Session {
     this.revision=0; this.pending=Promise.resolve(); this.exit=null; this.closed=false;
     this.lastActivity=Date.now(); this.waiters=new Set();
     this.writeErrors=0; this.lastWriteError=null;
-    this.renderErrors=0; this.lastRenderError=null;
+    this.renderErrors=0; this.lastRenderError=null; this.closeError=null;
     this.subscriptions=[
       // A rejected emulator write must not poison `pending`: observe(), input(),
       // wait(), resize() and close() all await it, so one bad chunk would make the
@@ -84,16 +88,24 @@ export class Session {
   // kill() is required even after a natural exit: on Windows node-pty only
   // disposes its ConPTY conout worker thread from kill(), and a live worker
   // keeps the host event loop alive forever.
-  // close() never throws. Its callers deregister on the assumption that cleanup
-  // completed, so a rejection here -- a poisoned write chain, a disposed handle --
-  // would abort that deregistration and strand the slot (issue #14).
+  // close() neither throws nor hangs. Its callers deregister on the assumption
+  // that cleanup completed, so a rejection here -- a poisoned write chain, a
+  // disposed handle -- would abort that deregistration and strand the slot
+  // (issue #14). A write chain that never settles strands it just as thoroughly
+  // by never returning, so the wait is bounded: an emulator that does not invoke
+  // its write callback must not be able to hang terminal.close forever. The first
+  // failure is recorded rather than thrown so the caller can report it.
   async close(){
     if(this.closed)return;
     this.closed=true;
-    try{this.pty.kill();}catch{}
+    try{this.pty.kill();}catch(error){this.noteCloseError(error);}
     this.state='released';this.changed();
-    try{await this.pending;}catch{}
-    for(const s of this.subscriptions){try{s.dispose();}catch{}}
-    try{this.terminal.dispose();}catch{}
+    let timer;
+    try{
+      await Promise.race([this.pending,new Promise(resolve=>{timer=setTimeout(resolve,CLOSE_GRACE_MS);})]);
+    }catch{}finally{clearTimeout(timer);}
+    for(const s of this.subscriptions){try{s.dispose();}catch(error){this.noteCloseError(error);}}
+    try{this.terminal.dispose();}catch(error){this.noteCloseError(error);}
   }
+  noteCloseError(error){if(!this.closeError)this.closeError=error?.message??String(error);}
 }

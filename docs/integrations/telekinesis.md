@@ -89,6 +89,17 @@ rolled back and its child killed, rather than leaving a session nobody can close
 loses the response therefore has no orphan to clean up, but it also has no session — it must issue
 a fresh `terminal.create` rather than retry `terminal.observe` against an id it never received.
 
+`terminal.close` **always answers `true`** once the session is deregistered, even if teardown
+itself failed: `Session.close()` absorbs a `kill()` that throws, a write chain that rejects or
+never settles (bounded at 2s), and an emulator that refuses to dispose. A teardown failure
+previously surfaced as a `-32000` error, so an adapter that mapped a close error to "session
+still alive" will now never see one. That is deliberate — the session is gone from the registry
+either way, and reporting failure invited callers to retry a close against an id the runtime no
+longer knows. A failed teardown is reported on the runtime's **stderr** as
+`sentiora: cleanup failed for session <id>: <reason>`. An adapter that must know whether the
+child actually died has to watch stderr or check the pid itself; the close result no longer
+carries that distinction.
+
 ## 4. The one mapping that does not work: push vs pull
 
 `IConsoleSession` implementations **push raw output bytes** to a callback from a background

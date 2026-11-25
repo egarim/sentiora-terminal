@@ -3,17 +3,45 @@
 // A create response carries the owner token, and without it no method can close
 // the session -- so a session registered before its response is confirmed
 // delivered is a slot burned for the life of the process. These tests provoke
-// exactly that: refused delivery, a failed spawn, a cleanup failure during close,
-// a broken stdout, and capacity exhaustion.
+// exactly that: refused delivery, delivery that fails asynchronously, a failed
+// spawn, a cleanup failure during close, a write chain that never settles, a
+// broken stdout, teardown racing an in-flight create, and capacity exhaustion.
 //
 // Every session here is real. src/server.js runs in a subprocess (see
 // test/fixtures/server-harness.mjs) with only its response sink scripted.
+//
+// Which of these actually catch a defect, and which do not.
+//
+// Catch the original #14 defect -- a session registered before its owner token
+// was delivered, and a close() that re-threw and so never deregistered:
+// ST14-01, ST14-04, ST14-07, ST14-08, ST14-09, plus the Session-level cases in
+// test/session.test.js. That defect was also reproduced directly against
+// origin/main's create/close logic; see the commit message for the output.
+//
+// Catch defects in the deferred-commit redesign itself. Verified by running this
+// file against revision 8b8163d, which had the redesign but not these fixes:
+// ST14-10 failed (1 session registered, expected 0), ST14-12 failed (24 creates
+// accepted against a limit of 16) and ST14-13 timed out at 60s (close() hung).
+//
+// ST14-11 is a guard, not a caught regression, and is labelled as one: awaiting
+// delivery confirmation opens a window where a create is spawned but not yet in
+// the registry, so a concurrent shutdown can miss it. Revision 8b8163d did not
+// await the sink, so it passes there; the test exists to keep the new design
+// honest about its own window.
+//
+// Contract locks -- these also pass against unfixed code, and are kept because
+// issue #14 explicitly asks for duplicate-request and capacity-recovery coverage
+// rather than because they discriminate: ST14-02, ST14-03, ST14-05, ST14-06.
+//
+// None of these can be run literally against origin/main: the harness imports
+// handleRequest/dispatch/respond/shutdown, which that revision does not export.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startRegistry, rpcLine, untilGone, reap } from './helpers/registry.mjs';
 import { FIXTURE } from './helpers/native.mjs';
+import { SESSION_LIMIT } from '../src/server.js';
 
 const opts = { timeout: 180000 };
 const SERVER = fileURLToPath(new URL('../src/server.js', import.meta.url));
@@ -26,6 +54,52 @@ async function registry(t) {
   const api = startRegistry();
   t.after(async () => { await api.stop(); });
   return api;
+}
+
+// The real stdio transport as a separate process: no harness, no scripted sink.
+// Used where the transport itself is the thing under test.
+function startRuntime() {
+  const child = spawn(process.execPath, [SERVER], { cwd: REPO, stdio: ['pipe', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk; });
+
+  const responses = [];
+  const idle = [];
+  let buffered = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    buffered += chunk;
+    let newline;
+    while ((newline = buffered.indexOf('\n')) !== -1) {
+      const line = buffered.slice(0, newline);
+      buffered = buffered.slice(newline + 1);
+      if (!line.trim()) continue;
+      responses.push(JSON.parse(line));
+      for (const wake of idle.splice(0)) wake();
+    }
+  });
+
+  return {
+    child,
+    responses,
+    get stderr() { return stderr; },
+    write(line) { child.stdin.write(`${line}\n`); },
+    async wait(id, timeout = 30000) {
+      const deadline = Date.now() + timeout;
+      for (;;) {
+        const found = responses.find(r => r.id === id);
+        if (found) return found;
+        if (Date.now() > deadline) throw new Error(`no response for id ${id}; stderr:\n${stderr}`);
+        await Promise.race([new Promise(r => idle.push(r)), new Promise(r => setTimeout(r, 100))]);
+      }
+    },
+    async exited(timeout = 45000) {
+      await new Promise(resolve => {
+        const timer = setTimeout(resolve, timeout);
+        child.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+    },
+  };
 }
 
 test('ST14-01 an undeliverable create response rolls the session back', opts, async t => {
@@ -217,55 +291,121 @@ test('ST14-08 a rolled-back deferred create kills its child', opts, async t => {
 });
 
 test('ST14-09 the server survives a broken stdout and still reaps its children', opts, async () => {
-  // The real stdio transport this time: no harness, no scripted sink. Breaking
-  // the response pipe while the server runs is what turns an undeliverable
-  // response into an unhandled 'error' event on process.stdout if nothing listens.
-  const server = spawn(process.execPath, [SERVER], { cwd: REPO, stdio: ['pipe', 'pipe', 'pipe'] });
-  let stderr = '';
-  server.stderr.on('data', chunk => { stderr += chunk; });
-
-  const responses = [];
-  const idle = [];
-  let buffered = '';
-  server.stdout.setEncoding('utf8');
-  server.stdout.on('data', chunk => {
-    buffered += chunk;
-    let newline;
-    while ((newline = buffered.indexOf('\n')) !== -1) {
-      const line = buffered.slice(0, newline);
-      buffered = buffered.slice(newline + 1);
-      if (!line.trim()) continue;
-      responses.push(JSON.parse(line));
-      for (const wake of idle.splice(0)) wake();
-    }
-  });
-
-  const wait = async id => {
-    const deadline = Date.now() + 30000;
-    for (;;) {
-      const found = responses.find(r => r.id === id);
-      if (found) return found;
-      if (Date.now() > deadline) throw new Error(`no response for id ${id}; stderr:\n${stderr}`);
-      await Promise.race([new Promise(r => idle.push(r)), new Promise(r => setTimeout(r, 100))]);
-    }
-  };
-
-  server.stdin.write(`${rpcLine(1, 'terminal.create', spawnFixture())}\n`);
-  const created = await wait(1);
+  // Breaking the response pipe while the server runs is what turns an
+  // undeliverable response into an unhandled 'error' event on process.stdout if
+  // nothing listens, killing the host and every session with it.
+  const server = startRuntime();
+  server.write(rpcLine(1, 'terminal.create', spawnFixture()));
+  const created = await server.wait(1);
   assert.ok(created.result?.pid, `create failed: ${JSON.stringify(created.error)}`);
   const childPid = created.result.pid;
 
-  server.stdout.destroy();
-  server.stdin.write(`${rpcLine(2, 'terminal.create', spawnFixture())}\n`);
+  server.child.stdout.destroy();
+  server.write(rpcLine(2, 'terminal.create', spawnFixture()));
   await new Promise(resolve => setTimeout(resolve, 1500));
-  assert.equal(server.exitCode, null, `server died on a broken stdout:\n${stderr}`);
+  assert.equal(server.child.exitCode, null, `server died on a broken stdout:\n${server.stderr}`);
 
-  server.stdin.end();
-  await new Promise(resolve => {
-    const timer = setTimeout(resolve, 45000);
-    server.once('exit', () => { clearTimeout(timer); resolve(); });
-  });
-  assert.notEqual(server.exitCode, null, `server never exited after stdin closed:\n${stderr}`);
-  assert.ok(!/Unhandled|ERR_STREAM|throw er/.test(stderr), `server stderr shows an unhandled failure:\n${stderr}`);
+  server.child.stdin.end();
+  await server.exited();
+  assert.notEqual(server.child.exitCode, null, `server never exited after stdin closed:\n${server.stderr}`);
+  assert.ok(!/Unhandled|ERR_STREAM|throw er/.test(server.stderr), `server stderr shows an unhandled failure:\n${server.stderr}`);
   await untilGone(childPid);
+});
+
+test('ST14-10 a write that fails asynchronously still rolls the create back', opts, async t => {
+  // The sharpest form of the defect: write() accepts the bytes and returns true,
+  // and the EPIPE only surfaces through the callback afterwards. A synchronous
+  // delivery check has already committed by then, so the session is registered
+  // with an owner token that went nowhere. This drives the production respond()
+  // against exactly that stream.
+  const api = await registry(t);
+  const { sent, sessions } = await api.brokenPipeRpc(rpcLine(1, 'terminal.create', spawnFixture()));
+
+  assert.equal(sent.length, 1, 'the response must have been attempted');
+  const result = sent[0].result;
+  assert.ok(result?.owner, `expected a create result, got ${JSON.stringify(sent[0])}`);
+  assert.equal(sessions, 0, 'a write that failed asynchronously must not leave the session registered');
+  assert.equal((await api.state()).sessions, 0);
+  await untilGone(result.pid);
+});
+
+test('ST14-11 shutdown during an in-flight create reaps the child', opts, async t => {
+  // A create that has spawned and observed but not yet committed is in neither the
+  // registry nor any snapshot of it, so a shutdown that only drains the registry
+  // misses the child entirely -- and on Windows a live ConPTY worker then keeps the
+  // host process from ever exiting.
+  const api = await registry(t);
+  const line = rpcLine(1, 'terminal.create', spawnFixture());
+  await api.startSlowRpc('inflight', line, 2500);
+  // Let the create spawn and reach the point where it awaits the delivery verdict.
+  await new Promise(resolve => setTimeout(resolve, 750));
+
+  await api.closeAll();
+  const { sent, sessions } = await api.awaitSlowRpc('inflight');
+
+  assert.equal(sessions, 0, 'the in-flight create must not be registered after shutdown');
+  assert.equal((await api.state()).sessions, 0);
+  const pid = sent[0]?.result?.pid;
+  assert.ok(pid > 0, `expected the create to have spawned a child, got ${JSON.stringify(sent[0])}`);
+  await untilGone(pid);
+});
+
+test('ST14-12 pipelined creates cannot exceed the session limit', opts, async () => {
+  // readline emits every complete line of one chunk synchronously, so a client
+  // that pipelines creates runs all of their handlers to the first await before
+  // any of them registers. A capacity check that reads only sessions.size lets
+  // every one through: measured at 24 sessions registered against a limit of 16
+  // when registration was deferred without also reserving capacity.
+  const limit = SESSION_LIMIT;
+  const burst = limit + 8;
+  const server = startRuntime();
+  try {
+    let payload = '';
+    for (let i = 0; i < burst; i += 1) {
+      payload += `${rpcLine(i, 'terminal.create', spawnFixture({ cols: 40, rows: 10 }))}\n`;
+    }
+    server.child.stdin.write(payload); // one write, one chunk, `burst` concurrent handlers
+
+    const deadline = Date.now() + 90000;
+    while (server.responses.length < burst && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.equal(server.responses.length, burst, `only ${server.responses.length} of ${burst} creates were answered`);
+
+    const accepted = server.responses.filter(r => r.result);
+    const refused = server.responses.filter(r => r.error);
+    assert.ok(accepted.length <= limit, `${accepted.length} creates accepted against a limit of ${limit}`);
+    assert.equal(refused.length, burst - accepted.length);
+    assert.ok(refused.every(r => /Session limit/.test(r.error.message)), 'the refusals must be capacity refusals');
+
+    server.write(rpcLine(9999, 'terminal.list', {}));
+    const listed = await server.wait(9999);
+    assert.ok(listed.result.length <= limit, `terminal.list reports ${listed.result.length} sessions against a limit of ${limit}`);
+    assert.equal(listed.result.length, accepted.length, 'every accepted create must be registered exactly once');
+  } finally {
+    server.child.stdin.end();
+    await server.exited();
+  }
+});
+
+test('ST14-13 close settles when an emulator write never completes', opts, async t => {
+  // close() awaits the pending write chain. An emulator that accepts a write and
+  // never invokes its callback therefore hangs close(), which hangs abandon(),
+  // which hangs the caller's terminal.close and strands the slot -- the same
+  // outcome as the rejection case, reached without anything throwing.
+  const api = await registry(t);
+  const { result } = await api.create(spawnFixture());
+  assert.equal((await api.state()).sessions, 1);
+
+  const hung = await api.hangWrites(result.sessionId);
+  assert.equal(hung.error, undefined, `hangWrites failed: ${hung.error}`);
+
+  const started = Date.now();
+  const closed = await api.close(result.sessionId, result.owner);
+  const elapsed = Date.now() - started;
+
+  assert.equal(closed.result, true, 'close must still succeed');
+  assert.equal(closed.sessions, 0, 'a non-terminating write chain must not strand the slot');
+  assert.ok(elapsed < 20000, `close took ${elapsed}ms; it must be bounded rather than hang`);
+  await untilGone(result.pid);
 });

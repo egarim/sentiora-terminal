@@ -107,7 +107,17 @@ export function startRegistry() {
     async commit(token) { return send('commit', { token }); },
     async rollback(token) { return send('rollback', { token }); },
     async sabotage(sessionId, what) { return send('sabotage', { sessionId, ...what }); },
+    async hangWrites(sessionId) { return send('hangWrites', { sessionId }); },
     async closeAll() { return send('closeAll', {}); },
+    // Runs the production respond() against a stdout that accepts the write and
+    // then fails it through the callback, the way EPIPE actually arrives.
+    async brokenPipeRpc(line) {
+      const reply = await send('brokenPipeRpc', { line });
+      if (reply.error) throw new Error(`harness brokenPipeRpc failed: ${reply.error}`);
+      return reply;
+    },
+    async startSlowRpc(key, line, delayMs) { return send('startSlowRpc', { key, line, delayMs }); },
+    async awaitSlowRpc(key) { return send('awaitSlowRpc', { key }); },
   };
   return api;
 }
