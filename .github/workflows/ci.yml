@@ -66,7 +66,21 @@ jobs:
       # Separate step for the same reason as above: fault injection drives the real
       # runtime over stdio and kills servers and children outright, so a failure
       # here must not be ambiguous with a server-suite failure.
+      #
+      # SENTIORA_FAULT_FILL=0 skips the two fill-to-limit tests (FI-09, FI-10).
+      # They are not flaky in the ordinary sense: repeatedly filling the registry to
+      # its 16-session cap and draining it kills the host with
+      # STATUS_ACCESS_VIOLATION (exit 3221225477) on windows-latest with node 22, at
+      # a rate high enough to gate every PR. That is issue #21 -- a node-pty ConPTY
+      # defect that reproduces on unmodified main -- and it needs no external kill;
+      # plain fill-and-drain is enough. They remain in the suite, runnable locally or
+      # with SENTIORA_FAULT_FILL=1, and removing this variable is the acceptance test
+      # for a fix to #21. Capacity is still covered in CI by ST14-05 and ST14-12 in
+      # the server suite, which fill to the limit once rather than repeatedly and
+      # pass on all four platforms.
       - name: Fault injection tests
+        env:
+          SENTIORA_FAULT_FILL: '0'
         run: npm run test:fault
 
       - name: Diagnostics after failure
