@@ -79,7 +79,15 @@ Sentiora: newline-delimited JSON-RPC 2.0 over stdio — `initialize`, `terminal.
 | Ctrl-C | `terminal.key {key:"CtrlC"}` or `terminal.type {text:"\x03"}` | Same byte; mode-dependent outcome — see §6. |
 
 `terminal.create` returns `{sessionId, owner, pid, state, revision, running, exit, cols, rows,
-cursor, screen, writeErrors, idleMilliseconds}`.
+cursor, screen, writeErrors, renderErrors, idleMilliseconds}`.
+
+The `owner` token travels **only** in that create response — `terminal.list` and
+`terminal.observe` deliberately omit it — so an adapter must persist it the moment it arrives and
+cannot recover it later. Correspondingly, the runtime registers a session only once its create
+response has been accepted by the transport: a create whose response could not be delivered is
+rolled back and its child killed, rather than leaving a session nobody can close. An adapter that
+loses the response therefore has no orphan to clean up, but it also has no session — it must issue
+a fresh `terminal.create` rather than retry `terminal.observe` against an id it never received.
 
 ## 4. The one mapping that does not work: push vs pull
 

@@ -15,8 +15,17 @@ export class Session {
     this.revision=0; this.pending=Promise.resolve(); this.exit=null; this.closed=false;
     this.lastActivity=Date.now(); this.waiters=new Set();
     this.writeErrors=0; this.lastWriteError=null;
+    this.renderErrors=0; this.lastRenderError=null;
     this.subscriptions=[
-      pty.onData(data=>{if(!this.closed) this.pending=this.pending.then(()=>new Promise(resolve=>terminal.write(data,resolve))).then(()=>{if(this.state==='spawned')this.state='operational';this.changed();})}),
+      // A rejected emulator write must not poison `pending`: observe(), input(),
+      // wait(), resize() and close() all await it, so one bad chunk would make the
+      // session permanently unobservable and -- because close() awaits it too --
+      // unclosable, stranding its registry slot (issue #14). The failure is counted
+      // rather than swallowed so a caller can see that output was dropped.
+      pty.onData(data=>{if(!this.closed) this.pending=this.pending
+        .then(()=>new Promise(resolve=>terminal.write(data,resolve)))
+        .then(()=>{if(this.state==='spawned')this.state='operational';},error=>{this.renderErrors++;this.lastRenderError={code:error?.code??null,message:error?.message??String(error)};})
+        .then(()=>this.changed())}),
       pty.onExit(exit=>{this.exit=exit;if(this.state!=='released')this.state='exited';this.changed();}),
       terminal.onData(data=>{if(!this.closed&&!this.exit)pty.write(data);})
     ];
@@ -48,7 +57,7 @@ export class Session {
   async observe(){
     await this.pending;
     const t=this.terminal,b=t.buffer.active;
-    return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,cols:t.cols,rows:t.rows,writeErrors:this.writeErrors,cursor:{x:b.cursorX,y:b.cursorY},screen:Array.from({length:t.rows},(_,i)=>b.getLine(b.baseY+i)?.translateToString(true)??'').join('\n'),idleMilliseconds:Date.now()-this.lastActivity};
+    return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,cols:t.cols,rows:t.rows,writeErrors:this.writeErrors,renderErrors:this.renderErrors,cursor:{x:b.cursorX,y:b.cursorY},screen:Array.from({length:t.rows},(_,i)=>b.getLine(b.baseY+i)?.translateToString(true)??'').join('\n'),idleMilliseconds:Date.now()-this.lastActivity};
   }
   async input({owner,revision,text}){
     await this.pending;
@@ -75,5 +84,16 @@ export class Session {
   // kill() is required even after a natural exit: on Windows node-pty only
   // disposes its ConPTY conout worker thread from kill(), and a live worker
   // keeps the host event loop alive forever.
-  async close(){if(this.closed)return;this.closed=true;try{this.pty.kill();}catch{}finally{this.state='released';this.changed();await this.pending;for(const s of this.subscriptions)s.dispose();this.terminal.dispose();}}
+  // close() never throws. Its callers deregister on the assumption that cleanup
+  // completed, so a rejection here -- a poisoned write chain, a disposed handle --
+  // would abort that deregistration and strand the slot (issue #14).
+  async close(){
+    if(this.closed)return;
+    this.closed=true;
+    try{this.pty.kill();}catch{}
+    this.state='released';this.changed();
+    try{await this.pending;}catch{}
+    for(const s of this.subscriptions){try{s.dispose();}catch{}}
+    try{this.terminal.dispose();}catch{}
+  }
 }
