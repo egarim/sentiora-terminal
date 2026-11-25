@@ -26,7 +26,7 @@
 //     already carries the #14 fix, so it guards that fix rather than proving it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startRuntime, expectGone, untilGone, reap, rpcLine } from './helpers/runtime.mjs';
+import { startRuntime, expectGone, collectSurvivors, untilGone, reap, rpcLine } from './helpers/runtime.mjs';
 import { FIXTURE } from './helpers/native.mjs';
 
 const opts = { timeout: 180000 };
@@ -146,14 +146,21 @@ test('FI-02 an abrupt stdin teardown reaps every open session', opts, async () =
     assert.equal((await server.list()).length, 3);
   } finally {
     // destroy(), not end(): the client vanished rather than hanging up politely.
+    // Teardown runs to completion BEFORE any assertion. If the shutdown path
+    // regresses -- the very thing this test exists to report -- an early assert
+    // would leave a live server holding three live PTY children, which keeps this
+    // file's process alive and turns a fast failure into a job-level hang.
     server.destroyStdin();
-    const info = await server.exited();
+    const info = await server.exited(20000);
+    if (!info) server.killHard();
+    await server.exited(10000);
+    const { survivors, invalid } = await collectSurvivors(pids, 20000);
+
     assert.ok(info, `server never exited after stdin was destroyed:\n${server.stderr}`);
+    assert.deepEqual(invalid, [], `unusable pids would make the leak check vacuous: ${JSON.stringify(invalid)}`);
+    assert.deepEqual(survivors, [], 'a vanished client must not leave its shells running');
     assert.ok(!/Unhandled|ERR_STREAM|throw er/.test(server.stderr), `unhandled failure on teardown:\n${server.stderr}`);
     assert.ok(!CLEANUP_FAILURE.test(server.stderr), `teardown reported a cleanup failure:\n${server.stderr}`);
-    // expectGone reaps survivors before returning them, so a failure here cannot
-    // leak a live PTY into the tests that follow.
-    assert.deepEqual(await expectGone(pids), [], 'a vanished client must not leave its shells running');
   }
 });
 
@@ -178,12 +185,19 @@ test('FI-03 a lost response pipe does not kill the host or strand open sessions'
     // null while the server is still running, which is the assertion here.
     assert.equal(await server.exited(1500), null, `server died when its stdout broke:\n${server.stderr}`);
   } finally {
+    // Same ordering rule as FI-02: guarantee the host and its children are gone
+    // before asserting anything about them.
     server.endStdin();
-    const info = await server.exited();
+    const info = await server.exited(20000);
+    if (!info) server.killHard();
+    await server.exited(10000);
+    const { survivors, invalid } = await collectSurvivors(pids, 20000);
+
     assert.ok(info, `server never exited:\n${server.stderr}`);
+    assert.deepEqual(invalid, [], `unusable pids would make the leak check vacuous: ${JSON.stringify(invalid)}`);
+    assert.deepEqual(survivors, [], 'sessions opened before the pipe broke must still be reaped');
     assert.ok(!/Unhandled|ERR_STREAM|throw er/.test(server.stderr), `unhandled failure:\n${server.stderr}`);
     assert.ok(!CLEANUP_FAILURE.test(server.stderr), `teardown reported a cleanup failure:\n${server.stderr}`);
-    assert.deepEqual(await expectGone(pids), [], 'sessions opened before the pipe broke must still be reaped');
   }
 });
 
@@ -257,18 +271,24 @@ test('FI-05 killing the runtime outright leaves no orphaned shells', opts, async
       + `(${process.platform}, exit ${JSON.stringify(info)})`);
     assert.deepEqual(survivors, [], `killing the runtime orphaned shell pids ${survivors.join(', ')}`);
   } finally {
-    reap(await untilGone(pids, 0));
     if (!server.hasExited) { server.killHard(); await server.exited(10000); }
+    await collectSurvivors(pids, 0);
   }
 });
 
-test('FI-06 a restarted runtime rejects the previous one\'s credentials', opts, async () => {
-  // Scope, stated honestly: a fresh process has a fresh registry and ids are
+test('FI-06 a restarted runtime rejects the previous one\'s session ids', opts, async () => {
+  // Scope, stated honestly. A fresh process has a fresh registry and ids are
   // random, so "no session survives a restart" is true by construction and no
-  // change to src/ could falsify it. What IS falsifiable -- and what an agent
-  // actually depends on -- is that the new runtime refuses the stale session id and
-  // the stale owner token on every session method rather than honouring them, that
-  // the refusals register nothing, and that it is usable afterwards.
+  // change to src/ could falsify it; this is not really a restart test. What it
+  // does pin is that a new runtime answers Unknown session for an id it never
+  // issued, on all five session methods, and registers nothing while refusing.
+  //
+  // The stale owner token is sent along with each request but is never compared:
+  // dispatch looks the session up before it checks ownership, so the id fails
+  // first. That ordering is the correct one and worth keeping -- answering a
+  // wrong-token caller with an ownership error would confirm that the session
+  // exists. This test therefore does NOT prove anything about token validation
+  // across a restart; FI-08 covers tokens against live sessions.
   const first = startRuntime();
   let stalePid = null;
   let stale = null;
@@ -284,7 +304,7 @@ test('FI-06 a restarted runtime rejects the previous one\'s credentials', opts, 
     // instead of failing in seconds.
     first.killHard();
     await first.exited();
-    if (stalePid !== null) reap(await untilGone([stalePid], 20000));
+    if (stalePid !== null) await collectSurvivors([stalePid], 20000);
   }
 
   const second = startRuntime();
@@ -355,8 +375,10 @@ test('FI-07 duplicate and racing requests leave the registry consistent', opts, 
     assert.deepEqual(await server.list(), []);
     assert.deepEqual(await expectGone(pids), [], 'racing closes must not leak a child');
   } finally {
-    reap(await untilGone(pids, 0));
+    // Stop the server first: a live host holds live children, so reaping before
+    // stopping would race the runtime's own teardown.
     await server.stop();
+    await collectSurvivors(pids, 20000);
   }
 });
 
@@ -423,8 +445,77 @@ test('FI-08 ownership is enforced on every gated method and no token is intercha
     assert.deepEqual(await expectGone(pids), []);
     assert.ok(!CLEANUP_FAILURE.test(server.stderr), `ownership abuse caused a cleanup failure:\n${server.stderr}`);
   } finally {
-    reap(await untilGone(pids, 0));
+    // Stop the server first: a live host holds live children, so reaping before
+    // stopping would race the runtime's own teardown.
     await server.stop();
+    await collectSurvivors(pids, 20000);
+  }
+});
+
+test('FI-10 rejected creates do not consume session capacity', opts, async () => {
+  // terminal.list cannot see a session that sits in the in-flight set and was never
+  // committed, so "the registry is empty after a rejected create" does not prove no
+  // slot was burned. The only way to observe it is to fill the registry and require
+  // the full count back. That is exactly issue #14's failure mode -- a malformed
+  // create silently costing a slot in a long-lived runtime -- and it is the variant
+  // FI-09 cannot see, because FI-09 never sends an invalid create.
+  const server = startRuntime();
+  const pids = [];
+  const fill = async () => {
+    const opened = [];
+    for (;;) {
+      const response = await server.request('terminal.create', spawnFixture({ cols: 40, rows: 10 }));
+      if (response.response.error) {
+        assert.match(response.response.error.message, /Session limit/,
+          `create failed for a reason other than capacity: ${JSON.stringify(response.response.error)}`);
+        return opened;
+      }
+      opened.push(response.response.result);
+      pids.push(response.response.result.pid);
+    }
+  };
+  const drain = async opened => {
+    for (const entry of opened) {
+      assert.equal((await server.close(entry.sessionId, entry.owner)).result, true);
+    }
+    assert.deepEqual(await server.list(), []);
+  };
+
+  try {
+    // Establish this runtime's capacity before anything has been rejected.
+    const baseline = await fill();
+    const capacity = baseline.length;
+    assert.ok(capacity > 1, `only ${capacity} slot(s) available; capacity cannot be measured`);
+    await drain(baseline);
+
+    const invalid = [
+      { command: '', args: [] },
+      { command: process.execPath, args: 'not-an-array' },
+      { command: process.execPath, args: [1, 2] },
+      { command: process.execPath, args: [FIXTURE], cols: 1, rows: 1 },
+      { command: process.execPath, args: [FIXTURE], cols: 5000, rows: 10 },
+      { command: process.execPath, args: [FIXTURE], conptyDll: 'yes' },
+      { args: [FIXTURE] },
+    ];
+    for (const params of invalid) {
+      const response = await server.request('terminal.create', params);
+      assert.ok(response.response.error, `an invalid create was accepted: ${JSON.stringify(params)}`);
+    }
+    assert.deepEqual(await server.list(), [], 'a rejected create must not register a session');
+
+    // The real assertion: capacity is undiminished. A create that reserved a slot
+    // and then threw during validation would show up here and nowhere else.
+    const after = await fill();
+    assert.equal(after.length, capacity,
+      `${invalid.length} rejected creates consumed ${capacity - after.length} slot(s): `
+      + 'a create that reserves capacity must release it when validation or spawn fails');
+    await drain(after);
+    assert.ok(!CLEANUP_FAILURE.test(server.stderr), `a rejected create caused a cleanup failure:\n${server.stderr}`);
+  } finally {
+    await server.stop();
+    const { survivors, invalid: unusable } = await collectSurvivors(pids, 20000);
+    assert.deepEqual(unusable, [], `unusable pids would make the leak check vacuous: ${JSON.stringify(unusable)}`);
+    assert.deepEqual(survivors, [], `rejected creates leaked child processes: ${survivors.join(', ')}`);
   }
 });
 
@@ -506,13 +597,26 @@ test('FI-09 session capacity survives repeated fault storms', opts, async () => 
       `after three fault storms the runtime offers ${reopened.length} slots instead of ${capacity}`);
     await server.waitScreen(reopened[0].sessionId, 'FIXTURE READY');
     assert.ok(!CLEANUP_FAILURE.test(server.stderr), `a fault storm caused a cleanup failure:\n${server.stderr}`);
+
+    // Close the last round while the server is still alive and check the children
+    // with a short budget. Doing it after server.stop() would measure the
+    // runtime's own shutdown sweep rather than close(): stop() reaps both the
+    // registry and the in-flight set, so a close that stopped killing children
+    // would be papered over by the teardown that follows it.
+    const reopenedPids = reopened.map(entry => entry.pid);
+    for (const entry of reopened) {
+      assert.equal((await server.close(entry.sessionId, entry.owner)).result, true);
+    }
+    assert.deepEqual(await server.list(), [], 'the final round did not return its slots');
+    const notKilled = await untilGone(reopenedPids, 5000);
+    assert.deepEqual(notKilled, [],
+      `terminal.close returned true but these children were still alive 5s later: ${notKilled.join(', ')}`);
   } finally {
     await server.stop();
-    // Measure BEFORE reaping: reaping first would make the leak assertion
-    // unfalsifiable, since it could then only fail if a process survived
-    // TerminateProcess for the whole budget.
-    const leaked = await untilGone(everyPid, 15000);
-    reap(leaked);
-    assert.deepEqual(leaked, [], `a fault storm leaked child processes: ${leaked.join(', ')}`);
+    // Backstop over every pid the test ever saw, after the host is stopped so the
+    // measurement is not racing the runtime's own teardown.
+    const { survivors, invalid } = await collectSurvivors(everyPid, 15000);
+    assert.deepEqual(invalid, [], `unusable pids would make the leak check vacuous: ${JSON.stringify(invalid)}`);
+    assert.deepEqual(survivors, [], `a fault storm leaked child processes: ${survivors.join(', ')}`);
   }
 });

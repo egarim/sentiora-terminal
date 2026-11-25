@@ -8,8 +8,10 @@
 // ptyHandles` in src/win/conpty.cc, which has no mutex -- the child-exit callback
 // thread runs remove_pty_baton (std::remove_if) while the main thread runs
 // emplace_back, which can reallocate the vector out from under the other thread.
-// node-pty is deliberately pinned at the current stable release, so this measures
-// and documents the exposure rather than fixing it.
+// node-pty is held at 1.1.0 by the lockfile (package.json declares ^1.1.0, so a
+// lock refresh could admit 1.2.x), and project policy is not to adopt
+// 1.2.0-beta.18 until it is the stable latest. So this measures and documents the
+// exposure rather than fixing it.
 //
 // Usage: node test/bench/conpty-external-kill.mjs [rounds] [killFraction]
 //   rounds        create/close rounds per host process (default 8)
@@ -118,6 +120,10 @@ for (let round = 0; round < ROUNDS; round += 1) {
     const response = await request('terminal.close', { sessionId: entry.sessionId, owner: entry.owner });
     if (response.hostDied) { failure = { round, stage: 'close', ...exitInfo }; break; }
     if (response.timedOut) { failure = { round, stage: 'close', timedOut: true }; break; }
+    // Recorded but not fatal, so the bench keeps measuring after a close starts
+    // failing. Ignoring it would let a server that errors on every close report a
+    // full set of completed rounds.
+    if (response.error) failure = failure ?? { round, stage: 'close', error: response.error.message };
   }
   if (failure) break;
 
@@ -142,6 +148,14 @@ console.log(`RESULT ${JSON.stringify(result)}`);
 if (!exitInfo) {
   child.stdin.end();
   await new Promise(resolve => { const t = setTimeout(resolve, 20000); child.once('exit', () => { clearTimeout(t); resolve(); }); });
+}
+if (!exitInfo) {
+  // The host outlived a clean shutdown request. Kill it rather than leave it and
+  // its children behind, and record it: exiting 0 here would report a hung host as
+  // a completed run.
+  failure = failure ?? { stage: 'shutdown', detail: 'host still alive 20s after stdin was closed' };
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
+  await new Promise(resolve => { const t = setTimeout(resolve, 10000); child.once('exit', () => { clearTimeout(t); resolve(); }); });
 }
 // Non-zero on any incomplete round, on a recorded failure, or on a host that died
 // abnormally at any point -- including after the last round finished, which the

@@ -63,6 +63,24 @@ export async function expectGone(pids, timeout = 30000) {
   return survivors;
 }
 
+// For use inside `finally`, where throwing would mask the original failure and
+// skip the rest of the teardown. Invalid pids are reported separately rather than
+// either throwing or being silently counted as gone -- silently counting them is
+// what would let a leak check pass while asserting nothing.
+export async function collectSurvivors(pids, timeout = 30000) {
+  const list = Array.isArray(pids) ? pids : [pids];
+  const invalid = list.filter(pid => !Number.isInteger(pid) || pid <= 0);
+  const valid = list.filter(pid => Number.isInteger(pid) && pid > 0);
+  let survivors;
+  try {
+    survivors = await untilGone(valid, timeout);
+  } catch {
+    survivors = valid.filter(alive);
+  }
+  reap(survivors);
+  return { survivors, invalid };
+}
+
 export function startRuntime({ env } = {}) {
   const child = spawn(process.execPath, [SERVER], {
     cwd: REPO_ROOT,
