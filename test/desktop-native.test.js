@@ -36,6 +36,54 @@ async function ask(backend, sessionId, command, marker, { timeoutMs = 30000 } = 
 // command word in front of it.
 const outputLineEquals = (screen, marker) => screen.split('\n').some(line => line.trim() === marker);
 
+// Re-probes a command until the child itself reports the expected value.
+//
+// Needed because terminal.resize is eventually consistent (~170ms measured) while
+// the fixture reports process.stdout.columns only at the moment it is asked. A
+// single probe can therefore be answered with the pre-resize geometry, and the
+// screen then never changes again -- so waiting for that one answer to appear is
+// waiting for something that will never happen. Waiting for silence cannot
+// distinguish "converged" from "asked too early"; asking again can.
+async function askUntilReported(backend, sessionId, command, marker, { timeoutMs = 30000, intervalMs = 300 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let attempts = 0;
+  while (Date.now() < deadline) {
+    attempts += 1;
+    await backend.bridge.type(sessionId, `${command}\r`);
+    try {
+      const observation = await backend.bridge.waitUntil(
+        sessionId, entry => entry.screen.includes(marker),
+        { timeoutMs: intervalMs * 3, label: `${command} -> ${marker}` },
+      );
+      return { observation, attempts };
+    } catch (error) {
+      if (error.kind !== 'readiness-timeout') throw error;
+    }
+  }
+  const observed = await backend.bridge.observe(sessionId);
+  throw new Error(`${command} never reported ${marker} after ${attempts} attempts; last screen:\n${observed.screen}`);
+}
+
+// Returns the delivered frame carrying exactly `revision`, draining further if the
+// pump has not caught up yet.
+//
+// A frame and an observation only describe the same screen when their revisions
+// match, so this is the comparison the faithfulness assertions need. Comparing
+// "the last frame we happened to receive" against "the screen as of now" is a
+// race: on a real console a late ConPTY batch moves the revision between the two
+// reads, which is exactly the intermittent failure this replaces.
+async function frameAtRevision(subscription, collected, revision, { timeoutMs = 20000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const frame = collected.filter(entry => entry.revision === revision).pop();
+    if (frame) return frame;
+    if (Date.now() > deadline) {
+      throw new Error(`no delivered frame reached revision ${revision}; saw [${collected.map(entry => entry.revision).join(', ')}]`);
+    }
+    collected.push(...await drainUntilQuiet(subscription, { quietMs: 400, hardMs: 2000, kind: 'frame' }));
+  }
+}
+
 async function createFixture(backend, extraArgs = [], { cols = 90, rows = 25 } = {}) {
   const session = await backend.bridge.create({
     command: process.execPath, args: [FIXTURE, ...extraArgs], cols, rows, label: 'fixture',
@@ -177,15 +225,15 @@ test('U03 panes resize independently and each child sees its own size', opts, as
     assert.equal(rightAfter.rows, 24);
 
     // terminal.resize returns before the child knows (~170ms measured), so the
-    // child's own report is waited for rather than asserted immediately.
-    const leftSize = await ask(backend, left.sessionId, 'size', 'SIZE:120x40', { timeoutMs: 30000 });
-    assert.match(leftSize.screen, /SIZE:120x40/);
+    // child is asked repeatedly until it reports the new geometry itself.
+    const leftSize = await askUntilReported(backend, left.sessionId, 'size', 'SIZE:120x40');
+    assert.match(leftSize.observation.screen, /SIZE:120x40/);
 
     const resizedRight = await backend.bridge.resize(right.sessionId, 40, 10);
     assert.equal(resizedRight.cols, 40);
     assert.equal(resizedRight.rows, 10);
-    const rightSize = await ask(backend, right.sessionId, 'size', 'SIZE:40x10', { timeoutMs: 30000 });
-    assert.match(rightSize.screen, /SIZE:40x10/);
+    const rightSize = await askUntilReported(backend, right.sessionId, 'size', 'SIZE:40x10');
+    assert.match(rightSize.observation.screen, /SIZE:40x10/);
 
     const leftStill = await backend.bridge.observe(left.sessionId);
     assert.equal(leftStill.cols, 120, 'the first pane must keep its size');
@@ -235,9 +283,9 @@ test('U04 a late consumer reconnects to a live session with complete ordered out
       await ask(backend, session.sessionId, `echo AFTER-${i}`, `ECHO:AFTER-${i}`);
     }
 
-    // Both consumers drain to quiescence. Stopping each at a fixed frame count
-    // instead would compare two different points in the stream and prove nothing
-    // about convergence.
+    // Both consumers drain first, then the two are compared at one shared revision
+    // rather than at whichever frame each happened to receive last -- the latter
+    // compares two different points in the stream and proves nothing.
     const [firstFrames, lateFrames] = await Promise.all([
       drainUntilQuiet(first, { quietMs: 1200, hardMs: 25000 }),
       drainUntilQuiet(late, { quietMs: 1200, hardMs: 25000 }),
@@ -253,12 +301,15 @@ test('U04 a late consumer reconnects to a live session with complete ordered out
       assert.ok(frames.every(frame => Array.isArray(frame.lines) && frame.lines.length === 25));
     }
 
-    // Both consumers must converge on the same screen, and that screen must be the
-    // runtime's own: they are mirrors of one session, not two renderings of it.
+    // `echo` emits exactly one line and nothing after it, so once ECHO:AFTER-3 is
+    // on screen the child is silent by construction and this observation is a
+    // stable revision to compare both consumers against.
     const settled = await backend.bridge.observe(session.sessionId);
-    assert.deepEqual(firstFrames.at(-1).lines, lateFrames.at(-1).lines, 'the two consumers diverged');
-    assert.deepEqual(firstFrames.at(-1).lines, settled.screen.split('\n'), 'the consumers diverged from the runtime');
     assert.match(settled.screen, /AFTER-3/);
+    const firstFinal = await frameAtRevision(first, firstFrames, settled.revision);
+    const lateFinal = await frameAtRevision(late, lateFrames, settled.revision);
+    assert.deepEqual(firstFinal.lines, lateFinal.lines, 'the two consumers diverged at the same revision');
+    assert.deepEqual(firstFinal.lines, settled.screen.split('\n'), 'the consumers diverged from the runtime');
 
     first.detach();
     late.detach();
@@ -287,9 +338,12 @@ test('U11 a burst that fits the viewport loses no output', opts, async () => {
     // bridge must not care.
     await backend.bridge.type(session.sessionId, `bytes ${Buffer.from(`${payload}\r\n`, 'utf8').toString('hex')}\r`);
 
+    // BYTES-DONE is printed by the fixture *after* the whole payload, so it is the
+    // child's own end-of-burst signal. Waiting on the last payload line instead
+    // would sample the screen while the burst was still arriving.
     const settled = await backend.bridge.waitUntil(
-      session.sessionId, observation => observation.screen.includes(`BURSTLINE-${String(lines - 1).padStart(3, '0')}`),
-      { timeoutMs: 30000, label: 'the last burst line to be rendered' },
+      session.sessionId, observation => observation.screen.includes('BYTES-DONE'),
+      { timeoutMs: 30000, label: 'BYTES-DONE, which the fixture prints after the payload' },
     );
     for (let i = 0; i < lines; i += 1) {
       const marker = `BURSTLINE-${String(i).padStart(3, '0')}`;
@@ -372,14 +426,21 @@ test('U11 a burst far larger than the viewport stays ordered, bounded and faithf
       await backend.bridge.type(session.sessionId, `bytes ${Buffer.from(`${payload}\r\n`, 'utf8').toString('hex')}\r`);
     }
 
-    const last = `FLOOD-${String(total - 1).padStart(4, '0')}`;
-    const settled = await backend.bridge.waitUntil(
+    // The child signals the end of the flood itself. `echo` produces exactly one
+    // line and nothing after it, so once ECHO:FLOOD-END is on screen the session
+    // is silent by construction. Waiting for the last *payload* line instead is
+    // not a terminator: the fixture still prints BYTES-DONE after the payload, so
+    // the revision moves again afterwards -- which is what made this test
+    // intermittently fail on a "the session must have stopped changing" check.
+    await backend.bridge.type(session.sessionId, 'echo FLOOD-END\r');
+    await backend.bridge.waitUntil(
       session.sessionId,
-      observation => observation.screen.includes(last),
-      { timeoutMs: 45000, label: 'the flood to finish rendering' },
+      observation => observation.screen.includes('ECHO:FLOOD-END'),
+      { timeoutMs: 45000, label: 'the flood terminator the child itself prints' },
     );
 
-    // Drain until the stream goes quiet, so the last frame is the converged state.
+    // Drain whatever the slow consumer was handed. Convergence is established
+    // below by matching revisions, not by assuming the last frame drained is final.
     const frames = await drainUntilQuiet(subscription, { quietMs: 1000, hardMs: 20000 });
     assert.ok(frames.length > 0, 'the consumer must have received frames');
     assert.ok(frames.length < total, `a consumer this slow must not receive a frame per line: ${frames.length}`);
@@ -400,12 +461,14 @@ test('U11 a burst far larger than the viewport stays ordered, bounded and faithf
     // Every frame is a whole viewport, which is what makes coalescing safe.
     for (const frame of frames) assert.equal(frame.lines.length, rows);
 
-    // Faithful: once the stream has settled, what the consumer holds is
-    // byte-identical to the runtime's own rendering of the same session.
+    // Faithful, compared at a matching revision rather than at whatever the screen
+    // happened to show when the test looked. A frame and an observation only mean
+    // the same thing when they carry the same revision, so that is the comparison
+    // made -- and it needs no assumption that output has stopped.
     const fresh = await backend.bridge.observe(session.sessionId);
-    assert.deepEqual(frames.at(-1).lines, fresh.screen.split('\n'), 'the settled frame must mirror the runtime exactly');
-    assert.match(fresh.screen, new RegExp(last));
-    assert.equal(settled.revision, fresh.revision, 'the session must have stopped changing');
+    const matching = await frameAtRevision(subscription, frames, fresh.revision);
+    assert.deepEqual(matching.lines, fresh.screen.split('\n'), 'a frame must mirror the runtime exactly at its own revision');
+    assert.match(fresh.screen, /ECHO:FLOOD-END/, 'the child-signalled terminator must be on screen');
 
     // Recorded limitation, measured rather than assumed. Recovery is a heuristic
     // over a lossy channel: lines that scroll through the viewport between two

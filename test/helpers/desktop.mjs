@@ -103,29 +103,31 @@ export async function removeDirectory(dir) {
   await rm(dir, { recursive: true, force: true });
 }
 
-// Reads `count` frames from a subscription, failing rather than hanging if they
-// do not arrive. Frames are the unit the UI consumes, so tests assert on the same
-// object the UI receives.
-export async function readFrames(subscription, count, { timeoutMs = 10000, kind = 'frame' } = {}) {
-  const frames = [];
+const TIMEOUT = Symbol('frame-timeout');
+
+// Pulls frames from a subscription with an overall deadline. Returns whatever
+// arrived rather than throwing, so a caller can decide whether a shortfall is a
+// failure -- and so that "produce output while draining" loops can be written
+// without a helper that gives up on them.
+//
+// Racing next() against a timer is only safe because a subscription parks a
+// single shared waiter: a call that loses the race keeps ownership of the frame
+// it was waiting for, so nothing is forfeited by timing out and trying again.
+export async function collectFrames(subscription, { count = Infinity, timeoutMs = 20000, kind = 'frame', into = null } = {}) {
+  const frames = into ?? [];
   const deadline = Date.now() + timeoutMs;
   while (frames.length < count) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      throw new Error(`only ${frames.length} of ${count} '${kind}' frames arrived within ${timeoutMs}ms`);
-    }
+    if (remaining <= 0) break;
     const frame = await Promise.race([
       subscription.next(),
       new Promise(resolveRace => setTimeout(() => resolveRace(TIMEOUT), remaining)),
     ]);
-    if (frame === TIMEOUT) throw new Error(`only ${frames.length} of ${count} '${kind}' frames arrived within ${timeoutMs}ms`);
-    if (frame === null) throw new Error(`subscription closed after ${frames.length} of ${count} '${kind}' frames`);
-    if (frame.kind === kind) frames.push(frame);
+    if (frame === TIMEOUT || frame === null) break;
+    if (kind === null || frame.kind === kind) frames.push(frame);
   }
   return frames;
 }
-
-const TIMEOUT = Symbol('frame-timeout');
 
 // Drains a subscription until it has been quiet for `quietMs`, returning what was
 // delivered. Used where the point is the converged final state rather than a
@@ -139,9 +141,11 @@ export async function drainUntilQuiet(subscription, { quietMs = 800, hardMs = 20
     if (remaining <= 0) break;
     const frame = await Promise.race([
       subscription.next(),
-      new Promise(resolveWait => setTimeout(() => resolveWait(null), remaining)),
+      new Promise(resolveWait => setTimeout(() => resolveWait(TIMEOUT), remaining)),
     ]);
-    if (frame === null) break;
+    // TIMEOUT means the stream went quiet; null means it closed. Both end the
+    // drain, but they are different facts and must not be conflated by accident.
+    if (frame === TIMEOUT || frame === null) break;
     if (kind === null || frame.kind === kind) frames.push(frame);
   }
   return frames;

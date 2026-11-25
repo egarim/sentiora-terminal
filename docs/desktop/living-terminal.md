@@ -444,19 +444,22 @@ point: recovery is exact when the screen moves a line at a time and largely decl
 console jumps several rows between observations. Reporting only one of those numbers would be
 misleading.
 
-### Two scrollback defects the real-runtime tests caught
+### Three bridge defects the real-runtime tests caught
 
 Both were found by driving the real runtime, not the mock, and both are worth recording because they
 are the kind of thing a snapshot-based design hides.
 
 **1. A vacuous shift match swallowed the whole screen.** The recovery loop tried shifts `1..rows`.
-At `shift === rows` there are zero rows left to compare, so the match succeeds unconditionally and
-all `rows` lines of the previous screen get appended to history — on *every* frame. Against the mock
-runtime a small shift always matched first, so the bug was invisible; against a real console it fired
-constantly, because ConPTY's redraw of echoed input means no small shift matches. Measured: an 8-row
-viewport grew history by exactly 8 lines per command, with cumulative duplicates. Fixed by requiring
-at least two overlapping rows (one on a viewport smaller than four) and at least one non-blank row
-among them, so a match has to be evidence.
+At `shift === rows` there are zero rows left to compare, so the match succeeds for *any* pair of
+screens and all `rows` lines of the previous screen get appended to history — on every frame. Against
+the mock runtime a small shift always matched first, so the defect was invisible; against a real
+console it fired on essentially every frame, because ConPTY delivers output in batches roughly a
+second apart and the screen frequently advances by more than a full viewport between two
+observations. When that happens no genuine shift relationship exists at all, so shifts `1..rows-1`
+fail and the loop falls through to the vacuous one. Measured: an 8-row viewport grew history by
+exactly 8 lines per command, with cumulative duplicates. Fixed by requiring at least two overlapping
+rows (one on a viewport smaller than four) and at least one non-blank row among them, so a match has
+to be evidence.
 
 **2. Out-of-order observations rewound the revision.** The pump's `terminal.wait` and an explicit
 `observe()` are separate RPCs correlated by id, so a response issued first can land second. Applying
@@ -464,10 +467,64 @@ the older screen moved the revision backwards and re-ran the shift match against
 recovering the same lines twice. Fixed by dropping any observation older than what has already been
 applied. Caught by the U11 flood test and now pinned by a dedicated regression test.
 
-A third bug was found on the delivery side rather than the recovery side: a subscription's wake
-callback was not cleared after firing, so the next frame invoked it again, shifted a frame off the
-queue and handed it to an already-settled promise — silently dropping output. Also fixed, also only
-visible once a consumer and the pump interleaved under real timing.
+**3. A parked waiter could swallow the frame it was waiting for.** This one took two passes to fix
+properly. `next()` minted a fresh promise on every call and overwrote the subscriber's wake callback.
+A consumer that races `next()` against a deadline — which is what any consumer with a timeout does —
+leaves the losing promise registered as the wake callback. The next delivery then shifted a frame off
+the queue into that already-abandoned promise, and the frame vanished without reaching anyone.
+
+The first fix cleared the callback in `#deliver` before invoking it. That was necessary but **not
+sufficient**: `next()` could still overwrite a live waiter, and a `next()` call that found the queue
+non-empty returned without clearing a previously registered callback at all. The real fix is at the
+API level — a subscriber parks **one shared waiter**, and a repeat `next()` returns the same promise.
+An abandoned call therefore keeps ownership of its frame, and a consumer can time out and re-await
+without losing output. `test/desktop-bridge.test.js` pins this, and the test was verified to fail
+against the unfixed code rather than merely passing against the fixed one.
+
+All three defects were found by driving the real runtime, or by driving the mock under a consumer
+pattern the mock alone did not exercise. None were visible from reading the code.
+
+### Three intermittent test failures, and the primitive that caused them
+
+A first pass at this suite reported 108/108 from a single run. Re-running it showed that was **one
+green run out of four** — three different tests failed across three runs. All three were the same
+mistake in different clothes: *waiting for silence instead of waiting for a signal*.
+
+On a real console output arrives in batches roughly a second apart, so any test that samples the
+session, sees no change, and concludes the session has settled will be wrong often enough to be
+worthless.
+
+| Failure | Real cause | Fix |
+| --- | --- | --- |
+| `U11 … ordered, bounded and faithful` — `33 !== 34` on "the session must have stopped changing" | The test waited for the last *payload* line, but the fixture prints `BYTES-DONE` after the payload, so the revision moved once more | Wait for a terminator the child itself prints (`echo FLOOD-END` → `ECHO:FLOOD-END`), and compare frame to observation **at a matching revision** rather than asserting the revision stopped |
+| `U03 panes resize independently` — failed after ~35 s | `terminal.resize` returns before ConPTY applies it (~170 ms), and the fixture reports `process.stdout.columns` only when asked, so a single `size` probe was answered with the pre-resize geometry and the screen never changed again | Re-probe: ask again until the child itself reports the new geometry |
+| `frames arrive in strictly increasing revision order` — "only 2 of 3 frames arrived" | A test bug that also exposed a product bug. It wrote 12 lines, let them settle, then demanded 3 frames — but backpressure had legitimately coalesced the burst into fewer, and a quiet child produces no more, so the count could never be reached | Produce output *while* draining. The frame-loss defect (defect 3 above) was found in the same investigation and is now pinned by its own test |
+
+Two rules came out of this and are now applied throughout the native suite:
+
+1. **Wait for something the child signals**, never for the absence of change. The fixture's one-line
+   `echo` reply and its `BYTES-DONE` terminator exist for exactly this.
+2. **Compare a frame against an observation only at a matching revision.** `frameAtRevision()` drains
+   until a frame carrying the observed revision arrives, which removes any assumption that output has
+   stopped.
+
+### Stability evidence
+
+Eight consecutive runs on Windows 11 ARM64 build 26200, Node v24.18.1, after the fixes:
+
+| Run | Tests | Pass | Fail | Time |
+| --- | --- | --- | --- | --- |
+| desktop suites in isolation #1 | 72 | 72 | 0 | 74.0 s |
+| desktop suites in isolation #2 | 72 | 72 | 0 | 73.2 s |
+| desktop suites in isolation #3 | 72 | 72 | 0 | 72.7 s |
+| `npm test` #1 | 109 | 109 | 0 | 71.6 s |
+| `npm test` #2 | 109 | 109 | 0 | 73.5 s |
+| `npm test` #3 | 109 | 109 | 0 | 78.9 s |
+| `npm test` #4 | 109 | 109 | 0 | 73.4 s |
+| `npm test` #5 | 109 | 109 | 0 | 74.3 s |
+
+109 = the 37 pre-existing runtime tests plus 72 desktop tests, 0 skipped. The two new CI jobs have
+**never run on GitHub Actions** — this table is local evidence only and does not imply CI validation.
 
 ### Scrollback recovery on a real console is partial, and that is expected
 

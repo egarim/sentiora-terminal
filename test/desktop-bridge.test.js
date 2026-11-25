@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createFakeBackend, readFrames, drainUntilQuiet, until, assertNoOwner,
+  createFakeBackend, collectFrames, drainUntilQuiet, until, assertNoOwner,
 } from './helpers/desktop.mjs';
 import { classify, SentioraError } from '../apps/desktop/bridge/errors.js';
 import { clampDimensions, COLS, ROWS, STALE_RETRY_LIMIT } from '../apps/desktop/bridge/protocol.js';
@@ -67,7 +67,10 @@ test('an owner token never reaches a UI-facing payload', opts, async () => {
     const keyed = await backend.bridge.key(session.sessionId, 'Enter');
     const observed = await backend.bridge.observe(session.sessionId);
     const resized = await backend.bridge.resize(session.sessionId, 40, 10);
-    const frames = await readFrames(subscription, 2);
+    // Collected with a bound rather than a required count: this test is about what
+    // a payload contains, not about how many frames a settled burst produced.
+    const frames = await collectFrames(subscription, { count: 2, timeoutMs: 4000 });
+    assert.ok(frames.length >= 1, 'at least one frame must have been delivered');
     const listed = backend.bridge.sessions;
     subscription.detach();
 
@@ -169,20 +172,37 @@ test('frames arrive in strictly increasing revision order', opts, async () => {
   try {
     const session = await backend.bridge.create({ command: 'fake', cols: 60, rows: 20 });
     const subscription = backend.bridge.attach(session.sessionId);
-    for (let i = 0; i < 12; i += 1) {
+
+    // Drained *while* output is still being produced. Demanding a fixed frame
+    // count from a burst that has already settled is not a well-formed request:
+    // backpressure may have coalesced the whole burst into one frame, and once the
+    // child is quiet the pump emits nothing more, so the count could never be
+    // reached however long the test waited. That was a real defect in this test.
+    const frames = [];
+    const collecting = collectFrames(subscription, { count: 3, timeoutMs: 20000, into: frames });
+    let lastWritten = -1;
+    for (let i = 0; i < 30 && frames.length < 3; i += 1) {
       await backend.bridge.type(session.sessionId, `echo ORDER-${i}\r`);
+      lastWritten = i;
     }
-    const frames = await readFrames(subscription, 3);
+    await collecting;
     subscription.detach();
+
+    assert.ok(frames.length >= 3, `expected at least 3 frames from ${lastWritten + 1} writes, got ${frames.length}`);
     const revisions = frames.map(frame => frame.revision);
     for (let i = 1; i < revisions.length; i += 1) {
       assert.ok(revisions[i] > revisions[i - 1], `revisions must increase: ${revisions.join(', ')}`);
     }
+    assert.equal(new Set(revisions).size, revisions.length, 'a revision must not be delivered twice');
+
     // Ordering is the pump's guarantee. Completeness of the final screen is the
-    // runtime's, so it is checked with a fresh observation rather than assumed
-    // from whichever frame happened to arrive third.
-    const final = await backend.bridge.observe(session.sessionId);
-    assert.match(final.screen, /ORDER-11/, 'the final screen must contain the last echoed line');
+    // runtime's, so it is checked against a marker the child itself printed rather
+    // than assumed from whichever frame happened to arrive third.
+    const final = await backend.bridge.waitUntil(
+      session.sessionId, observation => observation.screen.includes(`ORDER-${lastWritten}`),
+      { timeoutMs: 15000, label: `the last echoed line ORDER-${lastWritten}` },
+    );
+    assert.match(final.screen, new RegExp(`ORDER-${lastWritten}`));
   } finally {
     await backend.shutdown();
   }
@@ -263,6 +283,55 @@ test('concurrent observations cannot rewind the revision or replay scrollback', 
   }
 });
 
+const PARK_TIMEOUT = Symbol('park-timeout');
+
+test('a parked next() waiter is not skipped by the frame it was waiting for', opts, async () => {
+  // Regression test for a real frame-loss defect. next() used to mint a fresh
+  // promise on every call and overwrite the subscriber's wake callback, so a
+  // consumer that raced next() against a deadline and lost would leave an
+  // abandoned waiter registered. The next delivery then shifted the frame into
+  // that already-abandoned promise and it vanished without ever reaching anyone.
+  // Any consumer with a timeout hits this, which is why it is asserted directly.
+  const backend = await createFakeBackend();
+  try {
+    const session = await backend.bridge.create({ command: 'fake', cols: 40, rows: 10 });
+    const subscription = backend.bridge.attach(session.sessionId);
+
+    // Nothing has been produced yet, so the queue is empty and next() must park.
+    const parked = subscription.next();
+    const raced = await Promise.race([
+      parked,
+      new Promise(resolve => setTimeout(() => resolve(PARK_TIMEOUT), 150)),
+    ]);
+    assert.equal(raced, PARK_TIMEOUT, 'the waiter should still be parked with nothing queued');
+
+    // The fix: a second call returns the *same* parked promise instead of
+    // superseding it, so the frame still has a live owner.
+    assert.equal(subscription.next(), parked, 'next() must park a single shared waiter per subscriber');
+
+    await backend.bridge.type(session.sessionId, 'echo PARKED\r');
+    const frame = await Promise.race([
+      parked,
+      new Promise(resolve => setTimeout(() => resolve(PARK_TIMEOUT), 15000)),
+    ]);
+    assert.notEqual(frame, PARK_TIMEOUT, 'the parked waiter was never woken: its frame was lost');
+    assert.equal(frame.kind, 'frame');
+    assert.equal(frame.sessionId, session.sessionId);
+
+    // The stream must still be usable afterwards, and detaching must resolve
+    // rather than leave a consumer hanging.
+    const rest = await collectFrames(subscription, { count: 5, timeoutMs: 5000 });
+    assert.ok(
+      [...rest, frame].some(entry => entry.lines.join('\n').includes('PARKED')),
+      'the echoed line must reach the consumer',
+    );
+    subscription.detach();
+    assert.equal(await subscription.next(), null, 'a detached subscription must report closure');
+  } finally {
+    await backend.shutdown();
+  }
+});
+
 test('a slow consumer gets coalesced snapshots flagged for resync', opts, async () => {
   // maxQueuedFrames 1 is the tightest setting: anything a consumer fails to drain
   // is replaced by the newest whole screen, and the frame says resync so the UI
@@ -274,21 +343,24 @@ test('a slow consumer gets coalesced snapshots flagged for resync', opts, async 
     for (let i = 0; i < 12; i += 1) await backend.bridge.type(session.sessionId, `echo BURSTY-${i}\r`);
     await until(() => subscription.coalesced > 0, { timeoutMs: 10000, label: 'the pump to coalesce frames' });
 
-    // Drained one frame at a time until the newest content shows up: coalescing
-    // must not lose the final state of the viewport, only the intermediate ones.
-    const deadline = Date.now() + 15000;
-    let latest = null;
-    let resyncSeen = false;
-    while (Date.now() < deadline) {
-      const [frame] = await readFrames(subscription, 1, { timeoutMs: deadline - Date.now() });
-      latest = frame;
-      if (frame.resync) resyncSeen = true;
-      if (frame.lines.join('\n').includes('BURSTY-11')) break;
-    }
+    // Wait for the child's own last output rather than for the stream to go
+    // quiet, then take whatever the bounded queue is holding. With a queue of one
+    // that is the newest whole screen by construction.
+    await backend.bridge.waitUntil(
+      session.sessionId, observation => observation.screen.includes('BURSTY-11'),
+      { timeoutMs: 15000, label: 'the last echoed line' },
+    );
+    const frames = await collectFrames(subscription, { count: 4, timeoutMs: 3000 });
     subscription.detach();
-    assert.ok(resyncSeen, 'a coalesced frame must be flagged resync');
+
+    assert.ok(frames.length > 0, 'the consumer must have received at least one frame');
+    assert.ok(frames.some(frame => frame.resync === true), 'a coalesced frame must be flagged resync');
     assert.ok(subscription.coalesced > 0, 'the subscription must count what it coalesced');
-    assert.match(latest.lines.join('\n'), /BURSTY-11/, 'coalescing whole screens must stay lossless for the viewport');
+    // Coalescing keeps the newest whole screen and drops the intermediates, so the
+    // last frame delivered must still agree exactly with what the runtime renders.
+    const fresh = await backend.bridge.observe(session.sessionId);
+    assert.deepEqual(frames.at(-1).lines, fresh.screen.split('\n'), 'coalescing must stay lossless for the viewport');
+    assert.match(fresh.screen, /BURSTY-11/);
   } finally {
     await backend.shutdown();
   }

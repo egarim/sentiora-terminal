@@ -273,13 +273,15 @@ export class SessionBridge extends EventEmitter {
     // the rendered viewport, not the bytes that produced it.
     //
     // The overlap has to be large enough to be evidence. shift === rows matches
-    // vacuously (there is nothing left to compare) and would swallow the entire
-    // screen into scrollback on every frame -- which is exactly what happens on a
-    // real console, because ConPTY redraws the echoed input so no small shift
-    // matches and the loop falls through to the vacuous one. Requiring at least
-    // MIN_OVERLAP compared rows, with at least one of them non-blank, is what
-    // makes a match mean something. Tiny viewports get a weaker requirement
-    // because there is nothing else available.
+    // vacuously -- nothing is left to compare, so it succeeds for ANY pair of
+    // screens -- and would append the whole viewport to history on every frame.
+    // Against a mock that moves one line at a time a small shift always matches
+    // first and the defect stays hidden. Against a real console it fires on every
+    // frame, because output arrives in batches roughly a second apart and the
+    // screen often advances by more than a full viewport between observations, so
+    // no genuine shift relationship exists and the loop falls through to the
+    // vacuous case. Requiring at least two overlapping rows (one below a four-row
+    // viewport), with at least one of them non-blank, makes a match mean something.
     const minOverlap = previous.length >= 4 ? 2 : 1;
     if (previous.length === next.length && previous.length > minOverlap && previous.join('\n') !== next.join('\n')) {
       for (let shift = 1; shift + minOverlap <= previous.length; shift += 1) {
@@ -373,7 +375,7 @@ export class SessionBridge extends EventEmitter {
       queue: [],
       coalesced: 0,
       drain: null,
-      waiter: null,
+      pending: null,
       closed: false,
     };
     record.subscribers.add(subscriber);
@@ -404,16 +406,32 @@ export class SessionBridge extends EventEmitter {
       get coalesced() { return subscriber.coalesced; },
       // Resolves the next frame, or null once detached. Async pull keeps the
       // consumer in control of its own rate instead of being pushed at.
+      //
+      // There is at most ONE parked waiter per subscriber, and a repeat call
+      // returns the same promise. That is what makes next() safe to race against
+      // a timeout: if every call minted a new promise and overwrote the wake
+      // callback, an abandoned waiter would keep ownership of it, the next
+      // delivery would shift a frame into an already-abandoned promise, and that
+      // frame would vanish without ever reaching a consumer. Callers must be able
+      // to time out and re-await without losing output.
       next() {
         if (subscriber.queue.length) return Promise.resolve(subscriber.queue.shift());
         if (subscriber.closed) return Promise.resolve(null);
-        return new Promise(resolve => { subscriber.drain = () => resolve(subscriber.queue.shift() ?? null); });
+        subscriber.pending ??= new Promise(resolve => {
+          subscriber.drain = () => {
+            subscriber.pending = null;
+            subscriber.drain = null;
+            resolve(subscriber.queue.shift() ?? null);
+          };
+        });
+        return subscriber.pending;
       },
       detach() {
         subscriber.closed = true;
         record.subscribers.delete(subscriber);
-        subscriber.drain?.();
+        const drain = subscriber.drain;
         subscriber.drain = null;
+        drain?.();
       },
     };
   }
