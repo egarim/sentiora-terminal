@@ -168,7 +168,9 @@ const ops = {
       poisoned.catch(() => {}); // handled here so Node does not report it before close() awaits it
       Object.defineProperty(s, 'pending', { get: () => poisoned, set() {}, configurable: true });
     }
-    if (breakDispose) s.terminal.dispose = () => { throw new Error('dispose failed'); };
+    // A two-line reason on purpose: the server flattens closeError so one failure
+    // stays one stderr line, and ST14-15 asserts that instead of assuming it.
+    if (breakDispose) s.terminal.dispose = () => { throw new Error('dispose failed\nwith a second line'); };
     return { state: s.state };
   },
 

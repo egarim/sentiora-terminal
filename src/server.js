@@ -129,8 +129,13 @@ export function respond(payload){
     let line;
     try{line=JSON.stringify(payload)+'\n';}catch{resolve(false);return;}
     if(closing||stdoutBroken||process.stdout.destroyed||process.stdout.writableEnded){resolve(false);return;}
-    const timer=setTimeout(()=>resolve(true),DELIVERY_GRACE_MS);
-    try{process.stdout.write(line,error=>{clearTimeout(timer);resolve(!error&&!stdoutBroken);});}
+    // Both verdicts consult the same facts. The timer checks the flag because the
+    // grace expiring says nothing about the transport; the callback ignores it
+    // because a write whose own bytes were accepted must not be failed by a
+    // *different* write's error -- that coupling is what round 1's finding N1 was
+    // about, and leaving it here would reintroduce it in weakened form.
+    const timer=setTimeout(()=>resolve(!stdoutBroken&&!process.stdout.destroyed),DELIVERY_GRACE_MS);
+    try{process.stdout.write(line,error=>{clearTimeout(timer);resolve(!error);});}
     catch{clearTimeout(timer);resolve(false);}
   });
 }
