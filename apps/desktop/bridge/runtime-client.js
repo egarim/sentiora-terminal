@@ -20,10 +20,13 @@ export class RuntimeClient extends EventEmitter {
   #fatal = null;
   #lifetimeSessions = 0;
 
-  // `env` is passed straight through to the runtime, and the runtime spawns
-  // every shell with env: process.env. Anything in here is therefore visible to
-  // every terminal session (telekinesis.md section 11.1). Callers that care
-  // should narrow it; the bridge never widens it silently.
+  // `env` is the environment of the runtime HOST process. Since issue #26 it is no
+  // longer also the environment of every session: the runtime now defaults a
+  // session to a small allowlist (PATH, HOME/USERPROFILE, TERM, LANG, TMP and the
+  // Windows essentials) and inherits nothing else unless the caller names it.
+  // createSession below opts this bridge in explicitly, because the desktop runs as
+  // the local user and its sessions are that user's own shells -- see the comment
+  // there for why that is not a privilege boundary being crossed.
   constructor({ command = process.execPath, args = [], cwd, env = process.env, name = 'host' } = {}) {
     super();
     this.command = command;
@@ -157,7 +160,15 @@ export class RuntimeClient extends EventEmitter {
   }
 
   async createSession(params) {
-    const result = await this.call('terminal.create', params);
+    // Opt in to the host environment explicitly. The runtime's default is now a
+    // small allowlist (issue #26), which is the right default for a remote or agent
+    // caller that must not read the host's secrets. This bridge is different: it
+    // runs as the local user, and its sessions ARE that user's shells, so narrowing
+    // them would silently drop the user's own variables with no security gain --
+    // there is no privilege boundary between the bridge and the session. An
+    // explicit `env` in params still wins, so a caller can narrow a single session.
+    const env = params?.env === undefined ? this.env : params.env;
+    const result = await this.call('terminal.create', { ...params, env });
     // Counted only on success: a rejected create leaked nothing.
     this.#lifetimeSessions += 1;
     return result;

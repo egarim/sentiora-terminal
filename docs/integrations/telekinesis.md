@@ -253,11 +253,21 @@ adapter depends on them.
 
 Three findings, all from reading `src/server.js` and from measurement:
 
-1. **Environment inheritance is not controllable.** The server spawns children with
-   `env: process.env`, so **every child inherits the Sentiora host's full environment**, including
-   any credential in it. The protocol offers no way to pass a scoped environment. An adapter must
-   therefore ensure the *host process* itself is started with a minimal environment — anything in
-   it is visible to every session.
+1. **Environment inheritance is now scoped (issue #26).** The server used to spawn children with
+   `env: process.env`, so **every child inherited the Sentiora host's full environment**, including
+   any credential in it, and the protocol offered no way to narrow it. It no longer does:
+   `terminal.create` accepts an optional `env` object of string values, and the default is a small
+   fixed allowlist rather than the host environment — `PATH`, `HOME`/`USERPROFILE`, `TERM`, `LANG`
+   and the temp/locale variables, plus on Windows the essentials without which a session spawns and
+   then cannot run anything (`SystemRoot`, `SystemDrive`, `windir`, `ComSpec`, `PATHEXT`, `TEMP`,
+   `TMP`, `HOMEDRIVE`, `HOMEPATH`, `USERNAME`). Nothing else is inherited unless the caller names
+   it. Windows names are matched case-insensitively, so a caller's `Path` and an inherited `PATH`
+   collapse to one variable rather than being emitted twice. An `env` that is not an object of
+   strings is rejected as `Invalid env`, and **the error never quotes a value or a name** — an
+   error that echoed the offending entry would leak the secret it was rejecting into a JSON-RPC
+   response and every log downstream of it. An adapter that needs a variable in a session must pass
+   it explicitly; it can no longer rely on the host's environment reaching the child, and an
+   adapter that *was* relying on that will see sessions lose those variables.
 2. **Observations are unredacted, and typed input is audit-logged verbatim.** `screen` is
    returned verbatim, so a child that echoes a password, token or API key puts it into an
    observation. Checked against `ConsoleTools.cs` at telekinesis `57bfa79`: `AuditLog.Append` is
