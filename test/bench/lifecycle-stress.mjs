@@ -35,6 +35,20 @@ if (!Number.isFinite(SCALE) || SCALE <= 0) {
   process.exit(64);
 }
 const n = value => Math.max(1, Math.round(value * SCALE));
+
+// A misspelled flag must not produce a silent, unasserted, exit-0 run. ASSERT is a
+// bare includes() check, so `--asert` printed a RESULT, evaluated nothing and
+// exited 0 -- indistinguishable from a passing assert run, in the one harness whose
+// entire purpose is to fail loudly.
+const KNOWN_FLAGS = new Set(['--assert']);
+const argvRest = process.argv.slice(2);
+const unknownFlags = argvRest.filter(a => a.startsWith('--') && !KNOWN_FLAGS.has(a));
+const positionals = argvRest.filter(a => !a.startsWith('--'));
+if (unknownFlags.length || positionals.length > 1) {
+  console.error(`unrecognised arguments: ${[...unknownFlags, ...positionals.slice(1)].join(' ') || '(none)'}`);
+  console.error(`usage: lifecycle-stress.mjs [scale] [--assert]   (known flags: ${[...KNOWN_FLAGS].join(', ')})`);
+  process.exit(64);
+}
 const t0 = Date.now();
 const elapsed = () => Date.now() - t0;
 
@@ -83,18 +97,17 @@ async function alivePids(pids) {
   }
   const wanted = pids;
   if (!wanted.length) return [];
-  try {
-    const { stdout } = await run('tasklist', ['/FO', 'CSV', '/NH']);
-    const live = new Set();
-    for (const line of stdout.split(/\r?\n/)) {
-      if (!line.includes('","')) continue;
-      const pid = Number(line.split('","')[1]?.replace(/"/g, ''));
-      if (Number.isInteger(pid)) live.add(pid);
-    }
-    return wanted.filter(pid => live.has(pid));
-  } catch {
-    return wanted;
-  }
+  // process.kill(pid, 0) delivers no signal and throws ESRCH once the process is
+  // gone. Portable, in-process and free.
+  //
+  // This replaces a `tasklist` shell-out whose catch returned EVERY pid. tasklist
+  // does not exist on POSIX, so on Linux and macOS the catch fired and all seven
+  // childrenSurviving checks reported every child as surviving -- seven false
+  // breaches on an otherwise clean run, which is worse than not measuring.
+  // EPERM means the process exists but is not ours, so it counts as alive.
+  return wanted.filter(pid => {
+    try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+  });
 }
 
 const stats = values => {
@@ -108,11 +121,18 @@ const stats = values => {
   };
 };
 
+// Every in-process create/close cycle goes through openSession, so counting here
+// is the only divisor that cannot drift out of step with what the phases actually
+// do. Phase G is deliberately excluded: its sessions belong to the server child
+// process and leak nothing in this one.
+let inProcessSessions = 0;
+
 function openSession({ args = [FIXTURE], cols = 80, rows = 24 } = {}) {
   const terminal = new xterm.Terminal({ cols, rows, scrollback: 2000, allowProposedApi: true });
   const child = pty.spawn(process.execPath, args, {
     name: 'xterm-256color', cols, rows, cwd: process.cwd(), env: process.env,
   });
+  inProcessSessions += 1;
   return { session: new Session(child, terminal), child, terminal };
 }
 
@@ -153,14 +173,15 @@ async function phaseSequential(count) {
   console.log(`\nPHASE A: ${count} sequential sessions`);
   const startup = [];
   const close = [];
-  const pids = [];
+  const spawned = [];
   let readyFailures = 0;
   let echoFailures = 0;
+  const closeErrors = [];
   const trail = [];
 
   for (let i = 0; i < count; i += 1) {
     const { session, child } = openSession({ cols: 60, rows: 16 });
-    pids.push(child.pid);
+    spawned.push({ pid: child.pid, session });
     const spawnAt = Date.now();
     try {
       await waitScreen(session, 'FIXTURE READY');
@@ -176,18 +197,53 @@ async function phaseSequential(count) {
       const closeAt = Date.now();
       await session.close();
       close.push(Date.now() - closeAt);
+      // close() absorbs cleanup failures by design so they cannot strand a slot,
+      // which means nothing else here would ever see one. Collect them: a close
+      // that failed is the leading explanation for a child that outlives it, and
+      // without this the two are indistinguishable in the report.
+      if (session.closeError) closeErrors.push({ session: i, pid: child.pid, error: session.closeError });
     }
     if (i % 10 === 0 || i === count - 1) {
       trail.push({ session: i, handles: handleKinds(), rssMb: memoryMb().rss });
     }
   }
 
+  // Only a child whose session never reported an exit can be an orphan. Windows
+  // recycles pids, and across 100 spawns in about a minute a reuse is likely: a pid
+  // that is alive but whose session already reported exit is somebody else's
+  // process, not a leaked shell. This is the false positive docs/validation/
+  // endurance.md predicts, and it was observed for real here -- the 8s and 38s
+  // checks each found exactly one survivor but with DIFFERENT pids, which cannot be
+  // the same child and cannot be a process coming back to life.
+  const exitedReported = spawned.filter(s => s.session.exit).length;
+  const candidates = spawned
+    .filter(s => !s.session.exit)
+    .map(s => s.pid)
+    .filter(p => Number.isInteger(p) && p > 0);
+  const unprobeable = spawned.length - exitedReported - candidates.length;
+
   await new Promise(resolve => setTimeout(resolve, 8000));
-  const survivors = await alivePids(pids);
+  const survivors = await alivePids(candidates);
+  // A survivor at 8s is not yet proof of a leak: Session.close() on Windows forks
+  // conpty_console_list_agent, which dies with "AttachConsole failed" for an
+  // already-exited child, so node-pty only resolves via a 5s timeout -- and a child
+  // mid-write when the pseudoconsole closes may take longer still. Waiting again
+  // separates "slow teardown" from "orphaned", which a single sample cannot. #24
+  // was filed on a single 8s sample and said so; this is what upgrades or retires it.
+  let lateSurvivors = survivors;
+  if (survivors.length) {
+    await new Promise(resolve => setTimeout(resolve, 30000));
+    lateSurvivors = await alivePids(candidates);
+  }
   return {
     sessions: count, readyFailures, echoFailures,
+    closeErrors: closeErrors.length, closeErrorDetail: closeErrors.slice(0, 5),
     startupMs: stats(startup), closeMs: stats(close),
     childrenSurviving: survivors.length, survivorPids: survivors.slice(0, 10),
+    // The definitive figure: 0 here with childrenSurviving > 0 means slow teardown,
+    // not a leak.
+    childrenSurvivingLate: lateSurvivors.length, survivorPidsLate: lateSurvivors.slice(0, 10),
+    exitedReported, orphanCandidates: candidates.length, unprobeablePids: unprobeable,
     trail,
   };
 }
@@ -462,6 +518,13 @@ async function phaseShutdownWithActiveSessions(sessions) {
 // pinned at the current stable release.
 const ASSERT = process.argv.includes('--assert');
 
+// Everything in this table is enforced by evaluateThresholds below, and every
+// check evaluateThresholds performs is listed here. The two were allowed to drift
+// apart once already -- `cancellationRate` and `exitDetectionRate` sat here, were
+// documented as limits and counted in the summary, but nothing ever read them. The
+// intent they expressed is enforced directly, by comparing each phase's success
+// count against that phase's own attempt count, which is strictly stronger than a
+// rate and cannot go stale against a changed phase size.
 const THRESHOLDS = {
   // Hard correctness limits -- no tolerance, any breach is a defect.
   childrenSurvivingPerPhase: 0,   // a surviving child is a leaked shell process
@@ -472,11 +535,17 @@ const THRESHOLDS = {
   childDisagreements: 0,          // runtime geometry differing from the child's own
   writeErrors: 0,                 // asynchronous writes lost
   wrongExitCode: 0,               // Ctrl+C reporting anything but 130/1
-  cancellationRate: 1,            // every Ctrl+C must actually reach the child
-  exitDetectionRate: 1,           // every external child death must be noticed
+  closeErrors: 0,                 // a close() that had to absorb a cleanup failure
+
+  // Phase G drives a real server child over stdio, so it has failure modes the
+  // in-process phases do not. Each is asserted; without these, a phase G in which
+  // initialize failed and no session was ever created would report
+  // childrenSurviving 0 and pass having measured nothing.
+  maxShutdownMs: 30000,           // stdin EOF to host exit; measured 5082ms
+  runtimeExitCode: 0,             // the host must exit cleanly, not 'TIMEOUT'
 
   // Per-session resource budgets. See the note above: these bound a known leak.
-  maxSocketLeakPerSession: 1.5,       // measured 1.0 on node-pty 1.1.0
+  maxSocketLeakPerSession: 1.5,       // measured 1.00 on node-pty 1.1.0
   maxWin32HandleLeakPerSession: 3,    // measured ~1.75 on node-pty 1.1.0
 
   // Absolute budgets that must not scale with session count at all.
@@ -494,15 +563,26 @@ const THRESHOLDS = {
 
 function evaluateThresholds(r) {
   const breaches = [];
+  const skip = [];
+  // A missing limit is a defect in this function, not a pass. `v < undefined` and
+  // `v > undefined` are both false, so a limit sourced from a phase that never ran
+  // used to sail through silently.
   const check = (name, value, limit, worse = (v, l) => v > l) => {
-    if (value === undefined || value === null || Number.isNaN(value)) return;
+    if (value === undefined || value === null || Number.isNaN(value)) { skip.push(name); return; }
+    if (limit === undefined || limit === null || Number.isNaN(limit)) {
+      breaches.push({ threshold: name, value, limit: 'missing -- the phase that supplies it did not report' });
+      return;
+    }
     if (worse(value, limit)) breaches.push({ threshold: name, value, limit });
   };
   const P = r.phases;
 
-  // Every phase, without exception, must leave nothing running.
-  for (const [name, phase] of Object.entries(P)) {
-    check(`${name}.childrenSurviving`, phase?.childrenSurviving, THRESHOLDS.childrenSurvivingPerPhase);
+  // Every phase, without exception, must leave nothing running. Where a phase
+  // re-checks after a longer settle, the late figure is the definitive one: a pid
+  // alive at 8s and gone at 38s is a slow teardown, not an orphan.
+  for (const [name, ph] of Object.entries(P)) {
+    const surviving = ph?.childrenSurvivingLate ?? ph?.childrenSurviving;
+    check(`${name}.childrenSurviving`, surviving, THRESHOLDS.childrenSurvivingPerPhase);
   }
 
   check('A.readyFailures', P.A_sequential?.readyFailures, THRESHOLDS.readyFailures);
@@ -529,15 +609,39 @@ function evaluateThresholds(r) {
   check('F.failures', P.F_input?.failures, THRESHOLDS.inputFailures);
   check('F.roundTripMs.p95', P.F_input?.roundTripMs?.p95, THRESHOLDS.maxInputRoundTripP95Ms);
 
+  // Phase G drives a real server child over stdio, so it can fail in ways the
+  // in-process phases cannot -- and all of them used to go unasserted. The only
+  // field read before was childrenSurviving, which a phase that never managed to
+  // create a single session also satisfies.
+  const G = P.G_shutdownWithActiveSessions;
+  check('G.sessionsCreated', G?.sessionsCreated, n(5), (v, l) => v < l);
+  check('G.protocolErrors', G?.errors?.length, 0);
+  // exitCode is the string 'TIMEOUT' when the host never exited inside 60s, which
+  // no numeric comparison would catch.
+  check('G.runtimeExitCode', G?.exitCode, THRESHOLDS.runtimeExitCode,
+    (v, l) => v !== l);
+  check('G.shutdownMs', G?.shutdownMs, THRESHOLDS.maxShutdownMs);
+  check('G.childrenSurviving', G?.childrenSurviving, THRESHOLDS.childrenSurvivingPerPhase);
+
+  // A close that had to absorb a cleanup failure is reported by Session.close()
+  // rather than thrown, so it is invisible to every other check here. Phase A
+  // collects them; a non-zero count means a child may have been left in an
+  // undefined state, which is the leading candidate for the #24 survivor.
+  check('A.closeErrors', P.A_sequential?.closeErrors, THRESHOLDS.closeErrors);
+
   // Resource growth is measured baseline -> final, after the 10s settle, so it
   // reflects what the process is still holding rather than what it peaked at.
   const { baseline: base, final } = r;
   if (base && final) {
-    const sessionsCreated = (P.A_sequential?.sessions ?? 0)
-      + (P.B_concurrent?.sessions ?? 0)
-      + (P.C_cancellation?.attempts ?? 0)
-      + (P.D_unexpectedExit?.attempts ?? 0)
-      + (P.G_shutdownWithActiveSessions?.sessionsCreated ?? 0);
+    // Counted at the source rather than reconstructed from phase totals. The
+    // reconstruction was wrong in both directions: it omitted the replacement
+    // session phase D spawns per attempt and the single session each of phases E
+    // and F uses (22 cycles at scale 1), and it added phase G's 5 sessions, which
+    // live in the SERVER child process and leak nothing here. That gave 155
+    // against a true 172, publishing 1.11/1.94 per session where the real rates
+    // are 1.00/1.75 -- and enforcing a limit ~11% stricter than the reasoning that
+    // chose it.
+    const sessionsCreated = inProcessSessions;
     const socketGrowth = (final.handles?.Socket ?? 0) - (base.handles?.Socket ?? 0);
     const portGrowth = (final.handles?.MessagePort ?? 0) - (base.handles?.MessagePort ?? 0);
     const rssGrowthMb = Number((final.memoryMb.rss - base.memoryMb.rss).toFixed(1));
@@ -557,39 +661,83 @@ function evaluateThresholds(r) {
       r.thresholdInputs = { sessionsCreated, socketGrowth, messagePortGrowth: portGrowth, rssGrowthMb, win32: 'unavailable' };
     }
   }
-  return breaches;
+  return { breaches, skipped: skip };
 }
 
 // ---------------------------------------------------------------- driver
 console.log(`lifecycle stress: node ${process.version} ${process.arch} scale=${SCALE}`);
-report.baseline = await snapshot('baseline');
 
-report.phases.A_sequential = await phaseSequential(n(100));
-report.peakAfterA = await snapshot('after A');
+// Each phase is isolated. An abort inside one used to propagate out of the driver
+// and skip evaluateThresholds entirely, so the run ended with an unstructured stack
+// instead of a BREACH line -- and the thresholds that phase existed to enforce
+// (B.becameReady, E.writeErrors) could not breach in exactly the failure modes they
+// name. A failed phase is now recorded, the rest still run, and the failure itself
+// becomes a breach so it cannot read as a pass.
+const phaseErrors = [];
+async function phase(name, fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    const detail = String(error?.message ?? error);
+    phaseErrors.push({ phase: name, error: detail });
+    console.error(`PHASE ${name} ABORTED: ${detail}`);
+    return { aborted: true, error: detail };
+  }
+}
+async function snap(label) {
+  try {
+    return await snapshot(label);
+  } catch (error) {
+    phaseErrors.push({ phase: `snapshot:${label}`, error: String(error?.message ?? error) });
+    return null;
+  }
+}
 
-report.phases.B_concurrent = await phaseConcurrent(n(10));
-report.peakAfterB = await snapshot('after B');
+try {
+  report.baseline = await snap('baseline');
 
-report.phases.C_cancellation = await phaseCancellation(n(20));
-report.phases.D_unexpectedExit = await phaseUnexpectedExit(n(20));
-report.peakAfterD = await snapshot('after D');
+  report.phases.A_sequential = await phase('A_sequential', () => phaseSequential(n(100)));
+  report.peakAfterA = await snap('after A');
 
-report.phases.E_resize = await phaseResize(n(25));
-report.phases.F_input = await phaseInput(n(200));
-report.peakAfterF = await snapshot('after F');
+  report.phases.B_concurrent = await phase('B_concurrent', () => phaseConcurrent(n(10)));
+  report.peakAfterB = await snap('after B');
 
-report.phases.G_shutdownWithActiveSessions = await phaseShutdownWithActiveSessions(n(5));
+  report.phases.C_cancellation = await phase('C_cancellation', () => phaseCancellation(n(20)));
+  report.phases.D_unexpectedExit = await phase('D_unexpectedExit', () => phaseUnexpectedExit(n(20)));
+  report.peakAfterD = await snap('after D');
+
+  report.phases.E_resize = await phase('E_resize', () => phaseResize(n(25)));
+  report.phases.F_input = await phase('F_input', () => phaseInput(n(200)));
+  report.peakAfterF = await snap('after F');
+
+  report.phases.G_shutdownWithActiveSessions =
+    await phase('G_shutdownWithActiveSessions', () => phaseShutdownWithActiveSessions(n(5)));
+} catch (error) {
+  phaseErrors.push({ phase: 'driver', error: String(error?.message ?? error) });
+  console.error(`DRIVER ABORTED: ${error?.stack ?? error}`);
+}
 
 await new Promise(resolve => setTimeout(resolve, 10000));
-report.final = await snapshot('final');
+report.final = await snap('final');
 report.totalMs = elapsed();
+report.phaseErrors = phaseErrors;
+report.inProcessSessions = inProcessSessions;
 
 if (ASSERT) {
+  const { breaches, skipped } = evaluateThresholds(report);
   report.thresholds = THRESHOLDS;
-  report.breaches = evaluateThresholds(report);
-  for (const breach of report.breaches) console.log(`BREACH ${JSON.stringify(breach)}`);
-  console.log(`THRESHOLDS ${report.breaches.length} breach(es) against ${Object.keys(THRESHOLDS).length} documented limits`);
-  process.exitCode = report.breaches.length ? 1 : 0;
+  for (const failure of phaseErrors) {
+    breaches.push({ threshold: `phaseCompleted:${failure.phase}`, value: failure.error, limit: 'no error' });
+  }
+  report.breaches = breaches;
+  report.skippedChecks = skipped;
+  for (const breach of breaches) console.log(`BREACH ${JSON.stringify(breach)}`);
+  // A skipped check is not a passing one. Named explicitly so a run where a phase
+  // never reported cannot be read as clean.
+  if (skipped.length) console.log(`SKIPPED ${skipped.length} check(s) for want of a measurement: ${skipped.join(', ')}`);
+  console.log(`THRESHOLDS ${breaches.length} breach(es), ${skipped.length} skipped, `
+    + `${Object.keys(THRESHOLDS).length} declared limits, ${inProcessSessions} in-process sessions`);
+  process.exitCode = breaches.length ? 1 : 0;
 }
 
 process.on('exit', code => {
