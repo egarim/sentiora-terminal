@@ -1,4 +1,8 @@
 import { randomUUID } from 'node:crypto';
+// Upper bound on how long close() waits for the emulator write chain to settle.
+// Normally the chain is already resolved and this timer is cleared immediately;
+// it only elapses when a write callback never fires.
+const CLOSE_GRACE_MS = 2000;
 export function dimensions(cols,rows) {
   if (!Number.isInteger(cols)||!Number.isInteger(rows)||cols<2||cols>300||rows<2||rows>150) throw Error('Invalid dimensions');
 }
@@ -15,8 +19,17 @@ export class Session {
     this.revision=0; this.pending=Promise.resolve(); this.exit=null; this.closed=false;
     this.lastActivity=Date.now(); this.waiters=new Set();
     this.writeErrors=0; this.lastWriteError=null;
+    this.renderErrors=0; this.lastRenderError=null; this.closeError=null;
     this.subscriptions=[
-      pty.onData(data=>{if(!this.closed) this.pending=this.pending.then(()=>new Promise(resolve=>terminal.write(data,resolve))).then(()=>{if(this.state==='spawned')this.state='operational';this.changed();})}),
+      // A rejected emulator write must not poison `pending`: observe(), input(),
+      // wait(), resize() and close() all await it, so one bad chunk would make the
+      // session permanently unobservable and -- because close() awaits it too --
+      // unclosable, stranding its registry slot (issue #14). The failure is counted
+      // rather than swallowed so a caller can see that output was dropped.
+      pty.onData(data=>{if(!this.closed) this.pending=this.pending
+        .then(()=>new Promise(resolve=>terminal.write(data,resolve)))
+        .then(()=>{if(this.state==='spawned')this.state='operational';},error=>{this.renderErrors++;this.lastRenderError={code:error?.code??null,message:error?.message??String(error)};})
+        .then(()=>this.changed())}),
       pty.onExit(exit=>{this.exit=exit;if(this.state!=='released')this.state='exited';this.changed();}),
       terminal.onData(data=>{if(!this.closed&&!this.exit)pty.write(data);})
     ];
@@ -48,7 +61,7 @@ export class Session {
   async observe(){
     await this.pending;
     const t=this.terminal,b=t.buffer.active;
-    return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,cols:t.cols,rows:t.rows,writeErrors:this.writeErrors,cursor:{x:b.cursorX,y:b.cursorY},screen:Array.from({length:t.rows},(_,i)=>b.getLine(b.baseY+i)?.translateToString(true)??'').join('\n'),idleMilliseconds:Date.now()-this.lastActivity};
+    return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,cols:t.cols,rows:t.rows,writeErrors:this.writeErrors,renderErrors:this.renderErrors,cursor:{x:b.cursorX,y:b.cursorY},screen:Array.from({length:t.rows},(_,i)=>b.getLine(b.baseY+i)?.translateToString(true)??'').join('\n'),idleMilliseconds:Date.now()-this.lastActivity};
   }
   async input({owner,revision,text}){
     await this.pending;
@@ -75,5 +88,28 @@ export class Session {
   // kill() is required even after a natural exit: on Windows node-pty only
   // disposes its ConPTY conout worker thread from kill(), and a live worker
   // keeps the host event loop alive forever.
-  async close(){if(this.closed)return;this.closed=true;try{this.pty.kill();}catch{}finally{this.state='released';this.changed();await this.pending;for(const s of this.subscriptions)s.dispose();this.terminal.dispose();}}
+  // close() neither throws nor hangs. Its callers deregister on the assumption
+  // that cleanup completed, so a rejection here -- a poisoned write chain, a
+  // disposed handle -- would abort that deregistration and strand the slot
+  // (issue #14). A write chain that never settles strands it just as thoroughly
+  // by never returning, so the wait is bounded: an emulator that does not invoke
+  // its write callback must not be able to hang terminal.close forever. The first
+  // failure is recorded rather than thrown so the caller can report it.
+  async close(){
+    if(this.closed)return;
+    this.closed=true;
+    try{this.pty.kill();}catch(error){this.noteCloseError(error);}
+    this.state='released';this.changed();
+    let timer;
+    try{
+      await Promise.race([this.pending,new Promise(resolve=>{timer=setTimeout(resolve,CLOSE_GRACE_MS);})]);
+    }catch(error){this.noteCloseError(error);}finally{clearTimeout(timer);}
+    for(const s of this.subscriptions){try{s.dispose();}catch(error){this.noteCloseError(error);}}
+    // The emulator is disposed but its buffer stays readable, and observing a
+    // released session is a supported contract: a caller can still inspect the
+    // last screen without keeping the session open. Do not add a `closed` guard to
+    // observe() -- test/windows-native.test.js pins that behaviour.
+    try{this.terminal.dispose();}catch(error){this.noteCloseError(error);}
+  }
+  noteCloseError(error){if(!this.closeError)this.closeError=error?.message??String(error);}
 }

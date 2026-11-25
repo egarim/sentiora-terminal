@@ -10,3 +10,16 @@ test('child pid is exposed on every observation',async()=>{const {s,output}=fixt
 // The guard reaches for node-pty's Windows internals; on Unix and on any future
 // layout that does not expose them it must no-op rather than throw.
 test('the input-socket guard no-ops when node-pty internals are absent',async()=>{const {s,output}=fixture();output('z');const o=await s.observe();assert.equal(o.writeErrors,0);assert.equal(o.state,'operational');await s.close();});
+// Every Session method awaits `pending`, close() included. A single rejected
+// emulator write therefore used to poison the whole session: unobservable, and
+// because close() also awaits the chain, unclosable -- which strands the registry
+// slot and the capacity with it (issue #14).
+function hostileFixture(){let output;const disposable={dispose(){}};const p={pid:4242,onData:f=>(output=f,disposable),onExit:()=>disposable,write(){},kill(){throw Error('kill failed')},resize(){}};const t={cols:80,rows:2,buffer:{active:{baseY:0,cursorX:0,cursorY:0,getLine:()=>({translateToString:()=>''})}},onData:()=>disposable,write(){throw Error('emulator write failed')},dispose(){throw Error('dispose failed')},resize(){}};return {s:new Session(p,t),output};}
+test('a rejected emulator write does not poison the session',async()=>{const {s,output}=hostileFixture();output('boom');const o=await s.observe();assert.equal(o.renderErrors,1);assert.equal(o.state,'spawned','a chunk that never rendered must not be reported as operational');output('boom again');const o2=await s.observe();assert.equal(o2.renderErrors,2);assert.ok(o2.revision>o.revision,'a dropped chunk must still advance the revision so waiters wake');assert.match(s.lastRenderError.message,/emulator write failed/);await s.close();assert.equal(s.state,'released');});
+test('close resolves even when kill, the write chain and dispose all throw',async()=>{const {s,output}=hostileFixture();output('boom');await s.observe();await s.close();assert.equal(s.state,'released');await s.close();assert.equal(s.state,'released');});
+// close() awaits the write chain, so an emulator that accepts a write and never
+// invokes its callback hangs close() just as thoroughly as one that rejects -- and
+// with it every caller's terminal.close and the registry slot behind it. Nothing
+// throws here, so hardening close() against rejection alone is not enough.
+function silentFixture(){let output;const disposable={dispose(){}};const p={pid:4242,onData:f=>(output=f,disposable),onExit:()=>disposable,write(){},kill(){},resize(){}};const t={cols:80,rows:2,buffer:{active:{baseY:0,cursorX:0,cursorY:0,getLine:()=>({translateToString:()=>''})}},onData:()=>disposable,write(){},dispose(){},resize(){}};return {s:new Session(p,t),output};}
+test('close settles when an emulator write never invokes its callback',async()=>{const {s,output}=silentFixture();output('hangs');const started=Date.now();await s.close();const elapsed=Date.now()-started;assert.equal(s.state,'released');assert.ok(elapsed<6000,`close hung for ${elapsed}ms instead of being bounded`);});

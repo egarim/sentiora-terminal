@@ -103,6 +103,7 @@ A session exposes structured observations. This is the actual current shape retu
   "rows": 40,
   "cursor": { "x": 2, "y": 1 },
   "writeErrors": 0,
+  "renderErrors": 0,
   "screen": "Select an option:\n> Continue\n  Cancel",
   "idleMilliseconds": 84
 }
@@ -116,7 +117,10 @@ appearing on screen, reached with `terminal.wait` rather than a sleep.
 
 `pid` is the real child process id, stable across observations and after exit, so a caller can
 verify process identity independently. `writeErrors` counts asynchronous writes to the terminal
-input that failed; a non-zero value means some input was lost.
+input that failed; a non-zero value means some input was lost. `renderErrors` counts output
+chunks the emulator failed to render; a non-zero value means some output was dropped from the
+screen. Neither failure is fatal: the session stays observable and closable, and both counts are
+reported rather than thrown so one bad chunk cannot cost a caller its session.
 
 Revision checks and exclusive input ownership help prevent accidental actions against a changed
 screen. Note that a successful write **advances the revision itself**, so a `terminal.wait` must be
