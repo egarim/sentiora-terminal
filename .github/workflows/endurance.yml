@@ -1,0 +1,111 @@
+name: Endurance
+
+# Manual dispatch only. An endurance run occupies a runner for its whole duration,
+# so triggering it from push or pull_request would bill hours of CI to every commit
+# and every review round. Issue #18 requires this separation explicitly.
+#
+# GitHub-hosted jobs are capped at 6 hours, so the 8h and 24h tiers cannot run
+# there. They require a self-hosted runner (or a local machine); the preflight step
+# below refuses them rather than letting the job be killed at the cap, which would
+# report a truncated run as a failure instead of as "never completed".
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Endurance tier'
+        required: true
+        default: '1h'
+        type: choice
+        options: ['smoke', '1h', '8h', '24h']
+      runner:
+        description: 'Runner label (must be self-hosted for 8h/24h)'
+        required: true
+        default: 'windows-11-arm'
+        type: string
+      self_hosted:
+        description: 'Set true if the runner label above is self-hosted'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Never cancel a run in progress: a partial endurance run is worthless as evidence,
+# and cancelling one silently produces exactly that.
+concurrency:
+  group: endurance-${{ inputs.tier }}-${{ inputs.runner }}
+  cancel-in-progress: false
+
+jobs:
+  endurance:
+    runs-on: ${{ inputs.runner }}
+    # 24h plus setup, teardown and the harness's own 10 minute guard.
+    timeout-minutes: 1560
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight — refuse tiers this runner cannot finish
+        shell: bash
+        run: |
+          tier='${{ inputs.tier }}'
+          if [[ "$tier" == "8h" || "$tier" == "24h" ]] && [[ '${{ inputs.self_hosted }}' != 'true' ]]; then
+            echo "::error::Tier $tier exceeds the 6 hour GitHub-hosted job cap."
+            echo "Run it on a self-hosted runner and set self_hosted=true, or run it locally:"
+            echo "  node test/bench/endurance.mjs --tier=$tier"
+            echo "A run killed at the cap is not a failed endurance test, it is an unrun one,"
+            echo "and must not be reported as either."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Endurance (${{ inputs.tier }})
+        # continue-on-error so the time series and the RESULT line are still
+        # uploaded and readable when a threshold is breached -- a breach is the
+        # interesting outcome, and losing its evidence would be worse than the
+        # red X.
+        continue-on-error: true
+        run: node test/bench/endurance.mjs --tier=${{ inputs.tier }} | tee endurance-output.txt
+
+      - name: Upload time series and result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: endurance-${{ inputs.tier }}-${{ inputs.runner }}
+          path: |
+            artifacts/
+            endurance-output.txt
+          if-no-files-found: warn
+
+      - name: Report completion honestly
+        if: always()
+        shell: bash
+        run: |
+          # `completed` distinguishes a run that finished its requested duration
+          # from one that was cut short. Reporting the tier without it would let a
+          # truncated run be read as a pass.
+          node -e '
+            const fs = require("fs");
+            const text = fs.existsSync("endurance-output.txt") ? fs.readFileSync("endurance-output.txt", "utf8") : "";
+            const line = text.split(/\r?\n/).find(l => l.startsWith("RESULT "));
+            if (!line) { console.log("::error::no RESULT line; the run did not report"); process.exit(1); }
+            const r = JSON.parse(line.slice(7));
+            console.log(`tier=${r.tier} requested=${r.requestedMinutes}m actual=${r.actualMinutes}m completed=${r.completed}`);
+            console.log(`node=${r.node} ${r.platform}/${r.arch} samples=${r.samples} series=${r.seriesPath}`);
+            console.log(`measurement=${JSON.stringify(r.measurement)}`);
+            console.log(`breaches=${JSON.stringify(r.breaches)}`);
+            if (!r.completed) {
+              console.log(`::error::run did NOT complete: ${JSON.stringify(r.aborted)}`);
+              process.exit(1);
+            }
+            if (r.breaches.length) {
+              console.log(`::error::${r.breaches.length} threshold breach(es)`);
+              process.exit(1);
+            }
+          '

@@ -2,6 +2,11 @@ node_modules/
 .qwen/
 *.log
 
+# Endurance and stress time series. These are evidence for a specific run on a
+# specific machine, not source: they belong in CI artifacts and in issue comments,
+# not in git, where a 24h run would add thousands of lines per execution.
+artifacts/
+
 # Build output. apps/desktop/dist is served by the bridge at runtime but is
 # reproducible from source with `npm --prefix apps/desktop run build`.
 dist/
