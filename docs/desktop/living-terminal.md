@@ -411,10 +411,39 @@ and does not pretend to: `test/desktop-native.test.js` drives the real runtime.
 | U15 | Native Windows/Linux/macOS build and smoke tests, x64 vs ARM64 | **BLOCKED for the desktop bundle** (section 8). The runtime's own 8-job matrix is untouched. |
 
 Performance targets from issue #7 (p95 added input latency <10 ms, 60 Hz, no queue growth under
-1 MB/s for 30 s): **NOT TESTED.** The latency target is not achievable on the snapshot protocol as
-measured — each keystroke costs at least one JSON-RPC round trip plus a repaint of changed rows — and
-it should be re-baselined against proposal 9.1 rather than reported as a failure of the UI. The
-no-queue-growth property *is* tested (U11, bounded coalescing).
+1 MB/s for 30 s): **NOT TESTED as written**, and the first two are not meaningful for a
+snapshot-protocol UI. The owner's decision (2026-11-25) is to **re-baseline** them rather than
+report them as a UI failure. The replacement targets are below.
+
+#### Re-baselined performance targets
+
+The original "p95 added input latency under 10 ms" assumes per-frame delivery of terminal output.
+This runtime has no raw-output channel: the bridge long-polls `terminal.wait(afterRevision, 250ms)`
+and publishes whole rendered screens, so observation freshness is bounded by the poll interval and
+no implementation can beat it. A sub-10 ms target is therefore unreachable by construction, not by
+poor engineering. It is decomposed into components that can each be measured:
+
+| # | Target | Budget (p95) | Basis | Status |
+| --- | --- | --- | --- | --- |
+| P1 | **Input acceptance** — keystroke to `terminal.type` result | ≤ 50 ms | **Measured: median 16 ms, p95 32 ms, max 60 ms** over 200 sequential inputs (stress phase F) | **MET** |
+| P2 | **Observation freshness** — child writes to appearing in a snapshot | ≤ poll interval + 50 ms (≤ 300 ms at the 250 ms poll) | Derived from the long-poll design; the runtime-side round trip is measured at median 31 ms | Not measured end to end |
+| P3 | **Keystroke to rendered echo** for a local child — what a user perceives | ≤ 400 ms | Derived: P1 (~32 ms) + child processing + P2 (≤300 ms) + repaint | Not measured end to end |
+| P4 | **No queue growth** under 1 MB/s for 30 s | unchanged from issue #7 | Retained verbatim: it *is* testable on snapshots | **MET** (U11, bounded coalescing) |
+| P5 | **60 Hz smoothness** | Not applicable to terminal content | A snapshot UI repaints per observation, not per frame. Retain only for UI chrome transitions, which is PR2 scope | Deferred to PR2 |
+
+P2 and P3 are **derived from measured components, not measured end to end** — there is no browser
+harness in this repository (§8), so nothing here has been observed in a real webview. They should be
+confirmed during U15 rather than treated as verified.
+
+Two supporting measurements that bound how honest these numbers can be, both from the runtime
+validation work: resize takes ~170 ms to propagate to the child, and a child's exit takes ~1025 ms
+to become observable (node-pty's 1000 ms flush interval). Any target below roughly 50 ms is
+therefore measuring the bridge, not the terminal.
+
+**The original <10 ms target is deferred to proposal 9.1** (raw-output push with
+`subscribe`/`replay`), not abandoned. Only with a push channel is per-frame delivery decoupled from
+the poll interval, and only then does "added latency versus animation-off" become a measurable
+quantity — the animation half of that comparison does not exist until PR2 anyway.
 
 Issue #7 also asks for "actual screenshots and a short recording of transitions": **NOT DELIVERED.**
 There is no browser in this environment and no browser-automation harness in this repository, so
