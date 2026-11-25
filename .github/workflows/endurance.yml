@@ -32,26 +32,37 @@ permissions:
   contents: read
 
 # Never cancel a run in progress: a partial endurance run is worthless as evidence,
-# and cancelling one silently produces exactly that.
+# and cancelling one silently produces exactly that. Keyed on the runner alone, not
+# the tier, so two different tiers cannot run concurrently on the same self-hosted
+# machine and corrupt each other's measurements.
 concurrency:
-  group: endurance-${{ inputs.tier }}-${{ inputs.runner }}
+  group: endurance-${{ inputs.runner }}
   cancel-in-progress: false
 
 jobs:
   endurance:
     runs-on: ${{ inputs.runner }}
-    # 24h plus setup, teardown and the harness's own 10 minute guard.
+    # 24h plus setup, teardown and the host's own 60s graceful-shutdown budget.
     timeout-minutes: 1560
     steps:
       - uses: actions/checkout@v4
 
       - name: Preflight — refuse tiers this runner cannot finish
+        id: preflight
         shell: bash
         run: |
           tier='${{ inputs.tier }}'
-          if [[ "$tier" == "8h" || "$tier" == "24h" ]] && [[ '${{ inputs.self_hosted }}' != 'true' ]]; then
-            echo "::error::Tier $tier exceeds the 6 hour GitHub-hosted job cap."
-            echo "Run it on a self-hosted runner and set self_hosted=true, or run it locally:"
+          # Decided from the runner GitHub actually assigned, not from the
+          # self_hosted input: trusting the input would let `tier=24h` plus
+          # `runner=ubuntu-latest` plus `self_hosted=true` start a run that gets
+          # killed at the 6 hour cap -- reporting a truncated run as a failure
+          # instead of as one that never completed, which is the exact confusion
+          # this step exists to prevent. The input is advisory only.
+          environment='${{ runner.environment }}'
+          echo "runner.environment=$environment (self_hosted input was '${{ inputs.self_hosted }}')"
+          if [[ "$tier" == "8h" || "$tier" == "24h" ]] && [[ "$environment" != "self-hosted" ]]; then
+            echo "::error::Tier $tier exceeds the 6 hour GitHub-hosted job cap and this is a $environment runner."
+            echo "Dispatch it on a self-hosted runner, or run it locally:"
             echo "  node test/bench/endurance.mjs --tier=$tier"
             echo "A run killed at the cap is not a failed endurance test, it is an unrun one,"
             echo "and must not be reported as either."
@@ -66,11 +77,17 @@ jobs:
         run: npm ci
 
       - name: Endurance (${{ inputs.tier }})
+        id: run
         # continue-on-error so the time series and the RESULT line are still
         # uploaded and readable when a threshold is breached -- a breach is the
         # interesting outcome, and losing its evidence would be worse than the
-        # red X.
+        # red X. The reporting step below is the actual gate.
         continue-on-error: true
+        # bash on every platform: the default shell on Windows runners is
+        # pwsh, where `tee` resolves to Tee-Object. It happens to work, but
+        # mixing shells implicitly across steps is how a pipeline's exit status
+        # ends up meaning something different per OS.
+        shell: bash
         run: node test/bench/endurance.mjs --tier=${{ inputs.tier }} | tee endurance-output.txt
 
       - name: Upload time series and result
@@ -84,7 +101,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Report completion honestly
-        if: always()
+        # Skipped when preflight refused the tier: there is no RESULT to report,
+        # and emitting "no RESULT line" there would mask the real reason.
+        if: always() && steps.preflight.outcome == 'success'
         shell: bash
         run: |
           # `completed` distinguishes a run that finished its requested duration
