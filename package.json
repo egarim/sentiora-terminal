@@ -20,6 +20,7 @@
     "desktop:typecheck": "npm --prefix apps/desktop run typecheck",
     "desktop:build": "npm --prefix apps/desktop run build",
     "bench:conpty": "node test/bench/conpty-provider-bench.mjs",
+    "bench:conpty-kill": "node test/bench/conpty-external-kill.mjs",
     "stress": "node test/bench/lifecycle-stress.mjs",
     "endurance": "node test/bench/endurance.mjs",
     "endurance:smoke": "node test/bench/endurance.mjs --tier=smoke --sample-seconds=5",

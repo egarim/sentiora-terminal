@@ -32,6 +32,11 @@ const log = (...args) => console.log(`+${String(Date.now() - t0).padStart(6)}ms`
 const child = spawn(process.execPath, [SERVER], { cwd: REPO_ROOT, stdio: ['pipe', 'pipe', 'pipe'] });
 let stderrBytes = 0;
 child.stderr.on('data', chunk => { stderrBytes += chunk.length; });
+// The whole purpose of this bench is to make the host die mid-request. Without a
+// listener, the write that races the death raises EPIPE as an unhandled 'error'
+// event and kills the bench before it can print RESULT -- i.e. it would fail at
+// exactly the moment it is measuring a failure.
+child.stdin.on('error', () => {});
 
 let exitInfo = null;
 child.on('exit', (code, signal) => { exitInfo = { code, signal }; });
@@ -39,6 +44,7 @@ child.on('exit', (code, signal) => { exitInfo = { code, signal }; });
 const responses = [];
 const idle = [];
 let buffered = '';
+let corruptLines = 0;
 child.stdout.setEncoding('utf8');
 child.stdout.on('data', chunk => {
   buffered += chunk;
@@ -47,7 +53,7 @@ child.stdout.on('data', chunk => {
     const line = buffered.slice(0, newline);
     buffered = buffered.slice(newline + 1);
     if (!line.trim()) continue;
-    try { responses.push(JSON.parse(line)); } catch { /* counted as corruption elsewhere */ }
+    try { responses.push(JSON.parse(line)); } catch { corruptLines += 1; }
     for (const wake of idle.splice(0)) wake();
   }
 });
@@ -87,7 +93,15 @@ for (let round = 0; round < ROUNDS; round += 1) {
     const response = await request('terminal.create', params);
     if (response.hostDied) { failure = { round, stage: 'create', ...exitInfo }; break; }
     if (response.timedOut) { failure = { round, stage: 'create', timedOut: true }; break; }
-    if (response.error) break; // at the session limit
+    if (response.error) {
+      // Only a capacity refusal ends the round. Any other error means the server
+      // is broken, and treating it as "full" would let a dead host read as a
+      // completed round.
+      if (!/Session limit/.test(response.error.message ?? '')) {
+        failure = { round, stage: 'create', error: response.error.message };
+      }
+      break;
+    }
     opened.push(response.result);
     sessionsCreated += 1;
   }
@@ -107,14 +121,20 @@ for (let round = 0; round < ROUNDS; round += 1) {
   }
   if (failure) break;
 
+  // The one response that used to go unchecked: a crash here recorded no failure
+  // and the bench exited 0 while exitInfo showed the access violation.
+  const listed = await request('terminal.list', {});
+  if (listed.hostDied) { failure = { round, stage: 'list', ...exitInfo }; break; }
+  if (listed.timedOut) { failure = { round, stage: 'list', timedOut: true }; break; }
+
   completedRounds = round + 1;
-  log(`round ${round}: created ${opened.length}, registry now ${(await request('terminal.list', {})).result?.length ?? 'n/a'}`);
+  log(`round ${round}: created ${opened.length}, registry now ${listed.result?.length ?? 'n/a'}`);
 }
 
 const result = {
   node: process.version, arch: process.arch, platform: process.platform,
   rounds: ROUNDS, completedRounds, sessionsCreated, childrenKilledExternally: childrenKilled,
-  hostExit: exitInfo, failure, stderrBytes, elapsedMs: Date.now() - t0,
+  hostExit: exitInfo, failure, stderrBytes, corruptLines, elapsedMs: Date.now() - t0,
   accessViolation: exitInfo?.code === 3221225477 || exitInfo?.code === -1073741819,
 };
 console.log(`RESULT ${JSON.stringify(result)}`);
@@ -123,4 +143,8 @@ if (!exitInfo) {
   child.stdin.end();
   await new Promise(resolve => { const t = setTimeout(resolve, 20000); child.once('exit', () => { clearTimeout(t); resolve(); }); });
 }
-process.exit(failure ? 1 : 0);
+// Non-zero on any incomplete round, on a recorded failure, or on a host that died
+// abnormally at any point -- including after the last round finished, which the
+// per-round checks would otherwise miss.
+const hostDiedBadly = Boolean(exitInfo) && (exitInfo.code !== 0 || exitInfo.signal !== null);
+process.exit(failure || hostDiedBadly ? 1 : 0);
