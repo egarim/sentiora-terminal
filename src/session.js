@@ -3,15 +3,15 @@ export function dimensions(cols,rows) {
   if (!Number.isInteger(cols)||!Number.isInteger(rows)||cols<2||cols>300||rows<2||rows>150) throw Error('Invalid dimensions');
 }
 export class Session {
-  // Lifecycle states, in order: 'spawned' (child pid known, nothing rendered
-  // yet) -> 'operational' (the emulator has rendered at least one chunk) ->
-  // 'exited' (child is gone, resources still held) -> 'released' (close() done).
+  // Lifecycle states, in order: 'spawned' (child exists, nothing rendered yet)
+  // -> 'operational' (the emulator has rendered at least one chunk) -> 'exited'
+  // (child is gone, resources still held) -> 'released' (close() done).
   // There is deliberately no 'ready' state: whether the application is ready to
   // accept input is only knowable from an observable condition the caller
   // defines, such as a prompt appearing on screen. 'spawned' is not readiness.
   constructor(pty, terminal) {
     this.id=randomUUID(); this.owner=randomUUID(); this.pty=pty; this.terminal=terminal;
-    this.pid=pty.pid??null; this.state='spawned';
+    this.state='spawned';
     this.revision=0; this.pending=Promise.resolve(); this.exit=null; this.closed=false;
     this.lastActivity=Date.now(); this.waiters=new Set();
     this.writeErrors=0; this.lastWriteError=null;
@@ -23,6 +23,13 @@ export class Session {
     const guard=this.guardInputSocket();
     if(guard)this.subscriptions.push(guard);
   }
+  // Read live rather than cached. node-pty 1.1.0 reports the child pid
+  // synchronously from spawn, but 1.2.0-beta defers the pty connection until its
+  // conout worker is ready and reports 0 until then, so caching in the
+  // constructor would freeze that 0 for the life of the session. 0 maps to null
+  // so a caller can distinguish "not known yet" from a real pid; the value is
+  // stable once the child is producing output.
+  get pid(){return this.pty?.pid||null;}
   // node-pty guards its ConPTY output socket but attaches no 'error' listener to
   // the input socket, so an asynchronous write failure -- EAGAIN once the input
   // pipe is full, EINVAL once the child is gone -- surfaces as an unhandled
