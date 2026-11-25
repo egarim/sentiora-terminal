@@ -27,7 +27,13 @@ const SIGINT_FIXTURE = fileURLToPath(new URL('../fixtures/sigint.mjs', here));
 const SERVER = fileURLToPath(new URL('../../src/server.js', here));
 const REPO_ROOT = fileURLToPath(new URL('../..', here));
 
-const SCALE = Number(process.argv[2] ?? 1);
+// Flags are filtered out before the positional scale, so `--assert` on its own
+// does not become NaN and silently reduce every phase to a single iteration.
+const SCALE = Number(process.argv.slice(2).find(a => !a.startsWith('--')) ?? 1);
+if (!Number.isFinite(SCALE) || SCALE <= 0) {
+  console.error(`invalid scale: expected a positive number, got ${JSON.stringify(process.argv[2])}`);
+  process.exit(64);
+}
 const n = value => Math.max(1, Math.round(value * SCALE));
 const t0 = Date.now();
 const elapsed = () => Date.now() - t0;
@@ -442,6 +448,118 @@ async function phaseShutdownWithActiveSessions(sessions) {
   };
 }
 
+// ------------------------------------------------- acceptance thresholds (#16)
+// This harness reported measurements nobody could fail. These limits make it an
+// assertion. Every number has a stated reason, so a breach reads as a regression
+// rather than as noise -- and so raising one later has to confront the reason.
+//
+// Two of them encode a KNOWN UPSTREAM COST rather than a target. node-pty 1.1.0
+// leaks exactly one libuv Socket per create/close cycle (WindowsPtyAgent._inSocket
+// is never destroyed, only marked unreadable) plus roughly 1.75 Win32 handles, and
+// neither is reclaimable through its public API. Those two are therefore expressed
+// PER SESSION CREATED: they accept the documented leak and fail anything
+// materially worse, which is the only honest bound while the dependency stays
+// pinned at the current stable release.
+const ASSERT = process.argv.includes('--assert');
+
+const THRESHOLDS = {
+  // Hard correctness limits -- no tolerance, any breach is a defect.
+  childrenSurvivingPerPhase: 0,   // a surviving child is a leaked shell process
+  readyFailures: 0,               // a session that never became operational
+  echoFailures: 0,                // a round trip that did not come back
+  inputFailures: 0,               // an accepted write that failed
+  crossTalk: 0,                   // output appearing in the wrong session
+  childDisagreements: 0,          // runtime geometry differing from the child's own
+  writeErrors: 0,                 // asynchronous writes lost
+  wrongExitCode: 0,               // Ctrl+C reporting anything but 130/1
+  cancellationRate: 1,            // every Ctrl+C must actually reach the child
+  exitDetectionRate: 1,           // every external child death must be noticed
+
+  // Per-session resource budgets. See the note above: these bound a known leak.
+  maxSocketLeakPerSession: 1.5,       // measured 1.0 on node-pty 1.1.0
+  maxWin32HandleLeakPerSession: 3,    // measured ~1.75 on node-pty 1.1.0
+
+  // Absolute budgets that must not scale with session count at all.
+  maxMessagePortGrowth: 2,   // ConPTY conout workers; kill() disposes them
+  maxThreadGrowth: 5,
+  maxRssGrowthMb: 250,
+
+  // Latency ceilings, p95. Generous on purpose: these catch a hang or an order of
+  // magnitude regression, not a busy runner.
+  maxStartupP95Ms: 10000,
+  maxCloseP95Ms: 5000,
+  maxInputRoundTripP95Ms: 5000,
+  maxInterruptP95Ms: 5000,
+};
+
+function evaluateThresholds(r) {
+  const breaches = [];
+  const check = (name, value, limit, worse = (v, l) => v > l) => {
+    if (value === undefined || value === null || Number.isNaN(value)) return;
+    if (worse(value, limit)) breaches.push({ threshold: name, value, limit });
+  };
+  const P = r.phases;
+
+  // Every phase, without exception, must leave nothing running.
+  for (const [name, phase] of Object.entries(P)) {
+    check(`${name}.childrenSurviving`, phase?.childrenSurviving, THRESHOLDS.childrenSurvivingPerPhase);
+  }
+
+  check('A.readyFailures', P.A_sequential?.readyFailures, THRESHOLDS.readyFailures);
+  check('A.echoFailures', P.A_sequential?.echoFailures, THRESHOLDS.echoFailures);
+  check('A.startupMs.p95', P.A_sequential?.startupMs?.p95, THRESHOLDS.maxStartupP95Ms);
+  check('A.closeMs.p95', P.A_sequential?.closeMs?.p95, THRESHOLDS.maxCloseP95Ms);
+
+  check('B.crossTalk', P.B_concurrent?.crossTalk, THRESHOLDS.crossTalk);
+  check('B.becameReady', P.B_concurrent?.becameReady, P.B_concurrent?.sessions, (v, l) => v < l);
+
+  check('C.interrupted', P.C_cancellation?.interrupted, P.C_cancellation?.attempts, (v, l) => v < l);
+  check('C.wrongExitCode', P.C_cancellation?.wrongExitCode, THRESHOLDS.wrongExitCode);
+  check('C.interruptLatencyMs.p95', P.C_cancellation?.interruptLatencyMs?.p95, THRESHOLDS.maxInterruptP95Ms);
+
+  check('D.exitDetected', P.D_unexpectedExit?.exitDetected, P.D_unexpectedExit?.attempts, (v, l) => v < l);
+  check('D.inputRejected', P.D_unexpectedExit?.inputRejected, P.D_unexpectedExit?.attempts, (v, l) => v < l);
+  // recoveredWithNewSession is a COUNT of successful recoveries, not a boolean:
+  // every crashed session must be followed by a working replacement.
+  check('D.recoveredWithNewSession', P.D_unexpectedExit?.recoveredWithNewSession, P.D_unexpectedExit?.attempts, (v, l) => v < l);
+
+  check('E.childDisagreements', P.E_resize?.childDisagreements, THRESHOLDS.childDisagreements);
+  check('E.writeErrors', P.E_resize?.writeErrors, THRESHOLDS.writeErrors);
+
+  check('F.failures', P.F_input?.failures, THRESHOLDS.inputFailures);
+  check('F.roundTripMs.p95', P.F_input?.roundTripMs?.p95, THRESHOLDS.maxInputRoundTripP95Ms);
+
+  // Resource growth is measured baseline -> final, after the 10s settle, so it
+  // reflects what the process is still holding rather than what it peaked at.
+  const { baseline: base, final } = r;
+  if (base && final) {
+    const sessionsCreated = (P.A_sequential?.sessions ?? 0)
+      + (P.B_concurrent?.sessions ?? 0)
+      + (P.C_cancellation?.attempts ?? 0)
+      + (P.D_unexpectedExit?.attempts ?? 0)
+      + (P.G_shutdownWithActiveSessions?.sessionsCreated ?? 0);
+    const socketGrowth = (final.handles?.Socket ?? 0) - (base.handles?.Socket ?? 0);
+    const portGrowth = (final.handles?.MessagePort ?? 0) - (base.handles?.MessagePort ?? 0);
+    const rssGrowthMb = Number((final.memoryMb.rss - base.memoryMb.rss).toFixed(1));
+
+    check('socketGrowthPerSession', sessionsCreated ? Number((socketGrowth / sessionsCreated).toFixed(2)) : 0,
+      THRESHOLDS.maxSocketLeakPerSession);
+    check('messagePortGrowth', portGrowth, THRESHOLDS.maxMessagePortGrowth);
+    check('rssGrowthMb', rssGrowthMb, THRESHOLDS.maxRssGrowthMb);
+
+    if (Number.isFinite(final.win32?.handles) && Number.isFinite(base.win32?.handles)) {
+      const handleGrowth = final.win32.handles - base.win32.handles;
+      check('win32HandleGrowthPerSession', sessionsCreated ? Number((handleGrowth / sessionsCreated).toFixed(2)) : 0,
+        THRESHOLDS.maxWin32HandleLeakPerSession);
+      check('threadGrowth', final.win32.threads - base.win32.threads, THRESHOLDS.maxThreadGrowth);
+      r.thresholdInputs = { sessionsCreated, socketGrowth, handleGrowth, messagePortGrowth: portGrowth, rssGrowthMb };
+    } else {
+      r.thresholdInputs = { sessionsCreated, socketGrowth, messagePortGrowth: portGrowth, rssGrowthMb, win32: 'unavailable' };
+    }
+  }
+  return breaches;
+}
+
 // ---------------------------------------------------------------- driver
 console.log(`lifecycle stress: node ${process.version} ${process.arch} scale=${SCALE}`);
 report.baseline = await snapshot('baseline');
@@ -465,6 +583,14 @@ report.phases.G_shutdownWithActiveSessions = await phaseShutdownWithActiveSessio
 await new Promise(resolve => setTimeout(resolve, 10000));
 report.final = await snapshot('final');
 report.totalMs = elapsed();
+
+if (ASSERT) {
+  report.thresholds = THRESHOLDS;
+  report.breaches = evaluateThresholds(report);
+  for (const breach of report.breaches) console.log(`BREACH ${JSON.stringify(breach)}`);
+  console.log(`THRESHOLDS ${report.breaches.length} breach(es) against ${Object.keys(THRESHOLDS).length} documented limits`);
+  process.exitCode = report.breaches.length ? 1 : 0;
+}
 
 process.on('exit', code => {
   report.exitCode = code;
