@@ -23,15 +23,21 @@
 // ST14-10 failed (1 session registered, expected 0), ST14-12 failed (24 creates
 // accepted against a limit of 16) and ST14-13 timed out at 60s (close() hung).
 //
-// ST14-11 is a guard, not a caught regression, and is labelled as one: awaiting
-// delivery confirmation opens a window where a create is spawned but not yet in
-// the registry, so a concurrent shutdown can miss it. Revision 8b8163d did not
-// await the sink, so it passes there; the test exists to keep the new design
-// honest about its own window.
+// ST14-11 and ST14-14 are guards, not caught regressions, and are labelled as
+// such: awaiting delivery confirmation opens a window where a create is spawned
+// but not yet in the registry, so a concurrent shutdown can miss it. Revision
+// 8b8163d did not await the sink, so it has no window to hit and passes both.
+// ST14-11 covers a respond that answers late, which commit() refuses; ST14-14
+// covers one that never answers at all, where only shutdown()'s reap of the
+// in-flight set can release the child.
+//
+// ST14-15 catches a defect of the redesign too: absorbing cleanup failures made
+// them invisible, so a surviving child was reported as a clean close.
 //
 // Contract locks -- these also pass against unfixed code, and are kept because
-// issue #14 explicitly asks for duplicate-request and capacity-recovery coverage
-// rather than because they discriminate: ST14-02, ST14-03, ST14-05, ST14-06.
+// they pin behaviour a caller depends on rather than because they discriminate:
+// ST14-02, ST14-03, ST14-05, ST14-06, and ST14-16 (which pins the delivery grace
+// resolving TRUE, so a slow reader keeps its session).
 //
 // None of these can be run literally against origin/main: the harness imports
 // handleRequest/dispatch/respond/shutdown, which that revision does not export.
@@ -41,7 +47,6 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startRegistry, rpcLine, untilGone, reap } from './helpers/registry.mjs';
 import { FIXTURE } from './helpers/native.mjs';
-import { SESSION_LIMIT } from '../src/server.js';
 
 const opts = { timeout: 180000 };
 const SERVER = fileURLToPath(new URL('../src/server.js', import.meta.url));
@@ -350,13 +355,18 @@ test('ST14-11 shutdown during an in-flight create reaps the child', opts, async 
   await untilGone(pid);
 });
 
-test('ST14-12 pipelined creates cannot exceed the session limit', opts, async () => {
+test('ST14-12 pipelined creates cannot exceed the session limit', opts, async t => {
   // readline emits every complete line of one chunk synchronously, so a client
   // that pipelines creates runs all of their handlers to the first await before
   // any of them registers. A capacity check that reads only sessions.size lets
   // every one through: measured at 24 sessions registered against a limit of 16
   // when registration was deferred without also reserving capacity.
-  const limit = SESSION_LIMIT;
+  //
+  // The limit is read from the runtime rather than imported from src/server.js:
+  // importing that module into the test process attaches a global stdout 'error'
+  // handler and loads the native binding here, neither of which this test needs.
+  const probe = await registry(t);
+  const { limit } = await probe.state();
   const burst = limit + 8;
   const server = startRuntime();
   try {
@@ -406,6 +416,88 @@ test('ST14-13 close settles when an emulator write never completes', opts, async
 
   assert.equal(closed.result, true, 'close must still succeed');
   assert.equal(closed.sessions, 0, 'a non-terminating write chain must not strand the slot');
-  assert.ok(elapsed < 20000, `close took ${elapsed}ms; it must be bounded rather than hang`);
+  // CLOSE_GRACE_MS is 2s. The bound is deliberately tight enough that raising the
+  // grace to something that would stall a caller -- 10s, say -- fails here.
+  assert.ok(elapsed < 8000, `close took ${elapsed}ms; it must be bounded rather than hang`);
+  await untilGone(result.pid);
+});
+
+test('ST14-14 shutdown reaps a create whose delivery verdict never arrives', opts, async t => {
+  // The other half of the teardown race. ST14-11 covers a create whose respond
+  // eventually answers after shutdown began, which commit() refuses; this covers
+  // one whose respond NEVER answers, so nothing will ever call commit() and only
+  // shutdown()'s reap of the in-flight set can release the child. On Windows the
+  // surviving ConPTY worker would also keep the host process from ever exiting.
+  const api = await registry(t);
+  await api.startStuckRpc('stuck', rpcLine(1, 'terminal.create', spawnFixture()));
+
+  let state;
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    state = await api.state();
+    if (state.inflight.length) break;
+    if (Date.now() > deadline) throw new Error('the create never reached the in-flight state');
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.equal(state.sessions, 0, 'an unconfirmed create must not be in the registry');
+  const pid = state.inflight[0].pid;
+  assert.ok(pid > 0, `expected a spawned child, got ${JSON.stringify(state.inflight[0])}`);
+
+  await api.closeAll();
+  const after = await api.state();
+  assert.deepEqual(after.inflight, [], 'shutdown must clear the in-flight set');
+  assert.equal(after.sessions, 0);
+  await untilGone(pid);
+});
+
+test('ST14-15 a failed teardown is reported on stderr rather than swallowed', opts, async t => {
+  // close() absorbs cleanup failures so they cannot strand a slot, which makes
+  // "the slot is free" and "the child is dead" different claims. Both failure
+  // shapes -- a write chain that rejects and an emulator that refuses to dispose
+  // -- must leave a trace, or a surviving process passes silently as a clean close.
+  const api = await registry(t);
+
+  const rejecting = await api.create(spawnFixture({ cols: 40, rows: 12 }));
+  const disposing = await api.create(spawnFixture({ cols: 40, rows: 12 }));
+  await api.sabotage(rejecting.result.sessionId, { poisonPending: true });
+  const mark = api.stderr.length;
+  await api.sabotage(disposing.result.sessionId, { breakDispose: true });
+
+  for (const entry of [rejecting.result, disposing.result]) {
+    const closed = await api.close(entry.sessionId, entry.owner);
+    assert.equal(closed.result, true, 'close must still succeed');
+    await untilGone(entry.pid);
+  }
+  assert.equal((await api.state()).sessions, 0);
+
+  const logged = api.stderr.slice(mark);
+  const reported = logged.split('\n').filter(line => line.includes('cleanup failed for session'));
+  assert.equal(reported.length, 2, `expected one stderr line per failed teardown, got:\n${logged}`);
+  assert.ok(reported.some(line => line.includes(rejecting.result.sessionId)), 'the rejecting write chain was not reported');
+  assert.ok(reported.some(line => line.includes(disposing.result.sessionId)), 'the failing dispose was not reported');
+  for (const line of reported) {
+    assert.ok(!line.slice(line.indexOf(': ') + 2).includes('\n'), 'one failure must stay one line');
+  }
+});
+
+test('ST14-16 a stalled write commits rather than killing a slow client session', opts, async t => {
+  // The delivery grace is a liveness valve, not a verdict: it resolves TRUE. A
+  // client that has merely stopped draining keeps its session, because killing a
+  // healthy client's session to guard against a hypothetical late EPIPE is the
+  // worse failure. The cost -- a commit no longer backed by confirmation -- is the
+  // documented trade, and this pins the behaviour so it cannot change silently.
+  const api = await registry(t);
+  const started = Date.now();
+  const { sent, sessions } = await api.stalledRpc(rpcLine(1, 'terminal.create', spawnFixture()));
+  const elapsed = Date.now() - started;
+
+  assert.equal(sent.length, 1);
+  assert.equal(sessions, 1, 'a stalled write must not roll back a live session');
+  assert.ok(elapsed >= 1500, `respond gave up after ${elapsed}ms; the grace bound should be ~2s`);
+  assert.ok(elapsed < 10000, `respond took ${elapsed}ms; the grace bound must stay short`);
+
+  const result = sent[0].result;
+  const closed = await api.close(result.sessionId, result.owner);
+  assert.equal(closed.result, true);
   await untilGone(result.pid);
 });

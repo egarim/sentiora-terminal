@@ -103,8 +103,12 @@ export class Session {
     let timer;
     try{
       await Promise.race([this.pending,new Promise(resolve=>{timer=setTimeout(resolve,CLOSE_GRACE_MS);})]);
-    }catch{}finally{clearTimeout(timer);}
+    }catch(error){this.noteCloseError(error);}finally{clearTimeout(timer);}
     for(const s of this.subscriptions){try{s.dispose();}catch(error){this.noteCloseError(error);}}
+    // The emulator is disposed but its buffer stays readable, and observing a
+    // released session is a supported contract: a caller can still inspect the
+    // last screen without keeping the session open. Do not add a `closed` guard to
+    // observe() -- test/windows-native.test.js pins that behaviour.
     try{this.terminal.dispose();}catch(error){this.noteCloseError(error);}
   }
   noteCloseError(error){if(!this.closeError)this.closeError=error?.message??String(error);}

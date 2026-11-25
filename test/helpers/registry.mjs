@@ -66,17 +66,29 @@ export function startRegistry() {
     });
   }
 
+  // Writing to a harness that already died is an EPIPE on this stream; without a
+  // listener it becomes an uncaught exception in the test runner during teardown.
+  child.stdin.on('error', () => {});
+
   let stopped = false;
   async function stop() {
     if (stopped) return;
     stopped = true;
     // 'exit' answers with process termination rather than a reply, so completion
     // is the child's exit event.
-    child.stdin.write(`${JSON.stringify({ op: 'exit' })}\n`);
+    if (child.exitCode === null && child.signalCode === null && !child.stdin.destroyed) {
+      child.stdin.write(`${JSON.stringify({ op: 'exit' })}\n`);
+    }
     await new Promise(resolve => {
+      if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
       const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } resolve(); }, 30000);
       child.once('exit', () => { clearTimeout(timer); resolve(); });
     });
+    // A harness that crashed replies with id:null. Surfacing it here means a crash
+    // cannot pass as a clean teardown just because the tests happened to be done.
+    if (harnessErrors.length) {
+      throw new Error(`harness reported ${harnessErrors.length} failure(s):\n${harnessErrors.map(e => e.error).join('\n')}`);
+    }
   }
 
   const api = {
@@ -118,6 +130,12 @@ export function startRegistry() {
     },
     async startSlowRpc(key, line, delayMs) { return send('startSlowRpc', { key, line, delayMs }); },
     async awaitSlowRpc(key) { return send('awaitSlowRpc', { key }); },
+    async startStuckRpc(key, line) { return send('startStuckRpc', { key, line }); },
+    async stalledRpc(line) {
+      const reply = await send('stalledRpc', { line });
+      if (reply.error) throw new Error(`harness stalledRpc failed: ${reply.error}`);
+      return reply;
+    },
   };
   return api;
 }

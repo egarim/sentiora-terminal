@@ -9,10 +9,10 @@ export const sessions=new Map();
 export const SESSION_LIMIT=16;
 // Creates whose response has not been confirmed delivered yet. They count against
 // SESSION_LIMIT, because readline emits every complete line of a chunk
-// synchronously: a client that pipelines creates runs all of their handlers to
-// the first await before any of them registers, so a check that reads only
-// sessions.size lets every one of them through. shutdown() also reaps them, which
-// it cannot do from the registry because they are not in it yet.
+// synchronously: a client that pipelines creates runs all of their handlers to the
+// first await before any of them registers, so a check that reads only
+// sessions.size lets every one through. shutdown() also reaps them, which it cannot
+// do from the registry because they are not in it yet.
 const inflight=new Set();
 let closing=false;
 const keys={Enter:'\r',Escape:'\x1b',Tab:'\t',Backspace:'\x7f',Up:'\x1b[A',Down:'\x1b[B',Right:'\x1b[C',Left:'\x1b[D',CtrlC:'\x03'};
@@ -24,13 +24,19 @@ const conptyDllDefault=process.env.SENTIORA_CONPTY_DLL==='1';
 // "The slot is free" and "the child is dead" are different claims. close() absorbs
 // cleanup failures so that a rejection cannot strand the registry entry, so report
 // what it absorbed rather than letting a surviving process pass silently as a clean
-// close. stderr is diagnostics; it is never the JSON-RPC channel.
+// close. stderr is diagnostics; it is never the JSON-RPC channel. Newlines are
+// flattened so one failure stays one line.
 async function abandon(session){
   await session.close();
-  if(session.closeError)process.stderr.write(`sentiora: cleanup failed for session ${session.id}: ${session.closeError}\n`);
+  if(session.closeError)process.stderr.write(`sentiora: cleanup failed for session ${session.id}: ${String(session.closeError).replace(/[\r\n]+/g,' ')}\n`);
   sessions.delete(session.id);
 }
-async function abandonAll(deferred){for(const d of deferred)await d.rollback();}
+async function abandonAll(deferred){for(const d of deferred??[])await d.rollback();}
+// A create that cannot produce its first observation would sit in `inflight`
+// forever: not in the registry, so terminal.close answers Unknown session, but
+// still holding a slot. Only teardown could reclaim it. Bounded for the same
+// reason close() is -- a failure must not permanently consume capacity.
+const CREATE_OBSERVE_GRACE_MS=10000;
 // terminal.create is the only method that registers state, so it is the only one
 // that can strand a session: the owner token travels in the create response, and a
 // caller that never receives it can never close the session or free its slot. The
@@ -47,7 +53,7 @@ async function createSession(p){
   try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:process.env,useConptyDll:conptyDll??conptyDllDefault});}
   catch(e){terminal.dispose();throw e;}
   let s;
-  try{s=new Session(child,terminal);}catch(e){try{child.kill();}catch{}terminal.dispose();throw e;}
+  try{s=new Session(child,terminal);}catch(e){try{child.kill();}catch{}try{terminal.dispose();}catch{}throw e;}
   const record={
     session:s,settled:false,
     commit(){
@@ -63,13 +69,25 @@ async function createSession(p){
   };
   inflight.add(record);
   let result;
-  try{result={...await s.observe(),owner:s.owner};}catch(e){await record.rollback();throw e;}
+  const observation=(async()=>({...await s.observe(),owner:s.owner}))();
+  // If the race below times out, the observation is still pending; swallow its
+  // eventual rejection so it cannot surface as an unhandled one.
+  observation.catch(()=>{});
+  let timer;
+  try{
+    result=await Promise.race([
+      observation,
+      new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Session observation timed out')),CREATE_OBSERVE_GRACE_MS);}),
+    ]);
+  }catch(e){await record.rollback();throw e;}finally{clearTimeout(timer);}
   return {result,commit:()=>record.commit(),rollback:()=>record.rollback()};
 }
 // deferred is required rather than defaulted: a create pushed into a throwaway
-// array is a session no caller can ever commit or roll back, which is precisely
-// the leak this file exists to prevent.
+// array is a session no caller can ever commit or roll back, which is precisely the
+// leak this file exists to prevent. Checked before anything is spawned.
 export async function dispatch(method,p,deferred){
+  if(!Array.isArray(deferred))throw Error('dispatch requires a deferred sink');
+  if(closing)throw Error('Server shutting down');
   if(method==='initialize')return {protocolVersion:1,platform:process.platform,arch:process.arch,conptyDll:conptyDllDefault};
   if(method==='terminal.create'){const created=await createSession(p);deferred.push(created);return created.result;}
   if(method==='terminal.list')return Promise.all([...sessions.values()].map(s=>s.observe()));
@@ -84,18 +102,27 @@ export async function dispatch(method,p,deferred){
     default:throw Error('Unknown method');
   }
 }
+// Read-only view of creates that are spawned but not yet confirmed delivered.
+export const inflightInfo=()=>[...inflight].map(r=>({pid:r.session.pid,settled:r.settled}));
 let stdoutBroken=false;
 // Without a listener, a failed write on stdout -- EPIPE once the client is gone --
-// is an unhandled 'error' event that kills the host and every session with it. It
-// also invalidates every create still awaiting delivery confirmation, which would
-// otherwise commit a session whose owner token went nowhere.
-process.stdout.on('error',()=>{stdoutBroken=true;for(const record of [...inflight])void record.rollback();});
-// A synchronous write() returning true means "buffered", not "delivered": on a
-// broken pipe the failure arrives later as an 'error' event, by which point a
-// synchronous check has already committed. Confirm through the write callback
-// instead. The grace bound keeps a client that stopped reading from stalling the
-// server indefinitely -- bytes still buffered at that point flush when it resumes,
-// and a genuinely broken pipe errors far sooner than this.
+// is an unhandled 'error' event that kills the host and every session with it. Only
+// the flag is set here: the write callback is what reports delivery per response,
+// so each in-flight create is settled by its own write rather than by a broadcast
+// that could also settle one whose bytes were already accepted.
+process.stdout.on('error',()=>{stdoutBroken=true;});
+// The same argument applies to stderr, which this file writes diagnostics to from
+// rollback and teardown paths -- exactly when the reader is most likely to be gone.
+process.stderr.on('error',()=>{});
+// Resolves true once stdout has accepted the bytes. write() returning true means
+// "buffered", not "delivered": on a broken pipe the failure arrives later, through
+// the callback, after a synchronous check would already have committed.
+// The grace bound is a liveness valve, not a verdict -- it resolves TRUE, so a
+// client that is merely slow to read keeps its session rather than having it killed
+// underneath it. The cost is that after the bound expires the commit is no longer
+// backed by a delivery confirmation and a later failure cannot undo it. That is the
+// deliberate trade: killing a healthy client's session to protect against a
+// hypothetical late EPIPE is the worse failure.
 const DELIVERY_GRACE_MS=2000;
 export function respond(payload){
   return new Promise(resolve=>{
@@ -130,7 +157,9 @@ export async function shutdown(){
   closing=true;
   const doomed=[...sessions.values()];sessions.clear();
   const pending=[...inflight];inflight.clear();
-  await Promise.allSettled([...pending.map(r=>r.rollback()),...doomed.map(s=>s.close())]);
+  // abandon() rather than close() so a teardown that fails is reported the same way
+  // an interactive close that fails is.
+  await Promise.allSettled([...pending.map(r=>r.rollback()),...doomed.map(s=>abandon(s))]);
 }
 function startStdioTransport(){
   const rl=createInterface({input:process.stdin,crlfDelay:Infinity});

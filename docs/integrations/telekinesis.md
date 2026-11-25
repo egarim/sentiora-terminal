@@ -89,6 +89,12 @@ rolled back and its child killed, rather than leaving a session nobody can close
 loses the response therefore has no orphan to clean up, but it also has no session — it must issue
 a fresh `terminal.create` rather than retry `terminal.observe` against an id it never received.
 
+The same rule has a consequence for pipelining: because registration waits on delivery
+confirmation, a `terminal.list` written in the same batch *behind* a `terminal.create` can be
+answered before that create is registered, and will not include it. A caller that needs to see a
+session it just created must wait for the create response instead of pipelining a list behind it.
+The session id and owner token are in that response, so there is normally no reason to list.
+
 `terminal.close` **always answers `true`** once the session is deregistered, even if teardown
 itself failed: `Session.close()` absorbs a `kill()` that throws, a write chain that rejects or
 never settles (bounded at 2s), and an emulator that refuses to dispose. A teardown failure

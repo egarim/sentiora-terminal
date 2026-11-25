@@ -13,7 +13,7 @@
 // and exits explicitly.
 import { createInterface } from 'node:readline';
 import { Writable } from 'node:stream';
-import { handleRequest, dispatch, respond, shutdown, sessions, SESSION_LIMIT } from '../../src/server.js';
+import { handleRequest, dispatch, respond, shutdown, sessions, inflightInfo, SESSION_LIMIT } from '../../src/server.js';
 
 // Captured before any test can swap process.stdout, so replies always reach the
 // test process even while a broken-pipe probe is installed.
@@ -99,6 +99,33 @@ const ops = {
     return { sent: await promise };
   },
 
+  // Starts a request whose response sink NEVER settles, and returns without
+  // awaiting it. The create is then parked in `inflight` indefinitely, which is the
+  // only way to prove that shutdown() reaps it rather than relying on commit()
+  // noticing that teardown has begun.
+  async startStuckRpc({ key, line }) {
+    pendingOps.set(key, handleRequest(line, () => new Promise(() => {})));
+    return {};
+  },
+
+  // Runs the production respond() against a stdout that accepts the write and never
+  // calls back -- a reader that has stopped draining rather than one that has gone
+  // away. Exercises the delivery grace bound, which resolves true on purpose so a
+  // slow client keeps its session.
+  async stalledRpc({ line }) {
+    const sink = [];
+    const real = process.stdout;
+    const stalled = new Writable({ write(chunk, encoding, callback) { sink.push(chunk.toString()); } });
+    stalled.on('error', () => {});
+    swapStdout(stalled);
+    try {
+      await handleRequest(line, respond);
+    } finally {
+      swapStdout(real);
+    }
+    return { sent: sink.map(raw => JSON.parse(raw)) };
+  },
+
   // Calls dispatch() directly and hands back tokens for the deferred creates it
   // produced, so a test can check registry visibility before and after commit.
   async call({ method, params }) {
@@ -126,7 +153,7 @@ const ops = {
   },
 
   async state() {
-    return { ids: [...sessions.keys()], limit: SESSION_LIMIT };
+    return { ids: [...sessions.keys()], limit: SESSION_LIMIT, inflight: inflightInfo() };
   },
 
   // Provokes the cleanup failures a closing session can hit: a write chain that
