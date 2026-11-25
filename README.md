@@ -250,7 +250,7 @@ node test/bench/fd-exhaustion.mjs 1200  # finds the per-host session ceiling
 | --- | --- |
 | [Windows native validation](docs/validation/windows-native-validation.md) | The 20 native ConPTY scenarios, the session-teardown hang and its fix, ARM64 verification, Ctrl+C semantics, measurement pitfalls. |
 | [ConPTY provider comparison](docs/validation/conpty-provider-comparison.md) | OS ConPTY vs bundled `conpty.dll`, lifecycle states, the host-crash defect, long-running reliability, the ~500-session ceiling, CI and the macOS root cause. |
-| [Telekinesis integration](docs/integrations/telekinesis.md) | **Proposed** contract for using Sentiora as an optional Telekinesis console backend. Not implemented. |
+| [Telekinesis integration](docs/integrations/telekinesis.md) | Contract for using Sentiora as an optional Telekinesis console backend. Implemented on the Telekinesis side as [telekinesis#70](https://github.com/egarim/telekinesis/pull/70); Sentiora needs no Telekinesis-specific code. |
 
 ### Ecosystem
 
@@ -260,7 +260,7 @@ in the ecosystem. The relationships below are documentation-level only.
 | Repository | Relationship | Status |
 | --- | --- | --- |
 | [Creatura](https://github.com/egarim/creatura) | Artificial cognition; would consume Sentiora through a World adapter | Proposed — [creatura#101](https://github.com/egarim/creatura/issues/101), [#107](https://github.com/egarim/creatura/issues/107) |
-| [Telekinesis](https://github.com/egarim/telekinesis) | Perception and interaction; Sentiora as an optional console backend | Proposed — [telekinesis#67](https://github.com/egarim/telekinesis/issues/67) |
+| [Telekinesis](https://github.com/egarim/telekinesis) | Perception and interaction; Sentiora as an optional console backend | Adapter open as [telekinesis#70](https://github.com/egarim/telekinesis/pull/70) — [telekinesis#67](https://github.com/egarim/telekinesis/issues/67) |
 | [Sentiora Browser](https://github.com/egarim/sentiora-browser) | Sibling sensorimotor surface for the browser | Separate project |
 | [Vivarium](https://github.com/egarim/vivarium) | Agent habitat and supervision | Supervisory context, not a dependency |
 | [Custodia](https://github.com/egarim/custodia) | Credential management and authorization | No integration |
