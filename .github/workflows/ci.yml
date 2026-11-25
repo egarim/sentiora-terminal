@@ -67,20 +67,24 @@ jobs:
       # runtime over stdio and kills servers and children outright, so a failure
       # here must not be ambiguous with a server-suite failure.
       #
-      # SENTIORA_FAULT_FILL=0 skips the two fill-to-limit tests (FI-09, FI-10).
-      # They are not flaky in the ordinary sense: repeatedly filling the registry to
-      # its 16-session cap and draining it kills the host with
-      # STATUS_ACCESS_VIOLATION (exit 3221225477) on windows-latest with node 22, at
-      # a rate high enough to gate every PR. That is issue #21 -- a node-pty ConPTY
-      # defect that reproduces on unmodified main -- and it needs no external kill;
-      # plain fill-and-drain is enough. They remain in the suite, runnable locally or
-      # with SENTIORA_FAULT_FILL=1, and removing this variable is the acceptance test
-      # for a fix to #21. Capacity is still covered in CI by ST14-05 and ST14-12 in
-      # the server suite, which fill to the limit once rather than repeatedly and
-      # pass on all four platforms.
+      # SENTIORA_FAULT_FILL=0 skips the two fill-to-limit tests (FI-09, FI-10) on
+      # the ONE cell where they crash the host: windows-latest (x64) with node 22.
+      # There, repeatedly filling the registry to its 16-session cap and draining it
+      # kills the host with STATUS_ACCESS_VIOLATION (exit 3221225477) -- issue #21,
+      # a node-pty ConPTY defect that reproduces on unmodified main, and it needs no
+      # external kill; plain fill-and-drain is enough. Observed twice on that cell
+      # and never on windows-11-arm, node 24, ubuntu-latest or macos-latest, so the
+      # gate is scoped to the cell rather than applied to the whole matrix and the
+      # other three still run these tests.
+      #
+      # They stay in the suite, run by default locally, and removing this variable is
+      # the acceptance test for a fix to #21. Capacity accounting is covered on every
+      # cell by ST14-05 (fill, drain, refill), ST14-12 (pipelined creates cannot
+      # exceed the limit) and ST14-03 (a rejected create leaves nothing registered,
+      # in-flight included).
       - name: Fault injection tests
         env:
-          SENTIORA_FAULT_FILL: '0'
+          SENTIORA_FAULT_FILL: ${{ (matrix.os == 'windows-latest' && matrix.node == 22) && '0' || '1' }}
         run: npm run test:fault
 
       - name: Diagnostics after failure

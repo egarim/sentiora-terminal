@@ -26,7 +26,7 @@
 //     already carries the #14 fix, so it guards that fix rather than proving it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startRuntime, expectGone, collectSurvivors, untilGone, reap, rpcLine } from './helpers/runtime.mjs';
+import { startRuntime, expectGone, collectSurvivors, untilGone, rpcLine } from './helpers/runtime.mjs';
 import { FIXTURE } from './helpers/native.mjs';
 
 const opts = { timeout: 180000 };
@@ -297,7 +297,8 @@ test('FI-06 a restarted runtime rejects the previous one\'s session ids', opts, 
   // random, so "no session survives a restart" is true by construction and no
   // change to src/ could falsify it; this is not really a restart test. What it
   // does pin is that a new runtime answers Unknown session for an id it never
-  // issued, on all five session methods, and registers nothing while refusing.
+  // issued, on the five session methods exercised below, and registers nothing
+  // while refusing. dispatch handles six; terminal.key is covered by ST14-01.
   //
   // The stale owner token is sent along with each request but is never compared:
   // dispatch looks the session up before it checks ownership, so the id fails
@@ -520,11 +521,15 @@ test('FI-10 rejected creates do not consume session capacity', fillOpts, async (
     assert.deepEqual(await server.list(), [], 'a rejected create must not register a session');
 
     // The real assertion: capacity is undiminished. A create that reserved a slot
-    // and then threw during validation would show up here and nowhere else.
+    // and then threw during validation would show up here and nowhere else. All
+    // seven cases fail validation rather than spawn, so this covers the validation
+    // path on every platform; the spawn-throw path is Windows-only (see ST14-03 for
+    // why POSIX does not throw there) and a slot burned only on a spawn failure is
+    // not covered by this test.
     const after = await fill();
     assert.equal(after.length, capacity,
       `${invalid.length} rejected creates consumed ${capacity - after.length} slot(s): `
-      + 'a create that reserves capacity must release it when validation or spawn fails');
+      + 'a create that reserves capacity must release it when validation fails');
     await drain(after);
     assert.ok(!CLEANUP_FAILURE.test(server.stderr), `a rejected create caused a cleanup failure:\n${server.stderr}`);
   } finally {
@@ -572,12 +577,15 @@ test('FI-09 session capacity survives repeated fault storms', fillOpts, async ()
       assert.equal((await server.list()).length, capacity,
         `round ${round}: registry disagrees with the number of accepted creates`);
 
-      // Fault the protocol, not the operating system. Mass-killing children behind
-      // the runtime's back and then continuing to create is a separate defect: it
-      // crashes the host with STATUS_ACCESS_VIOLATION inside node-pty's ConPTY
-      // layer, at the same rate on unmodified main, so asserting on it here would
-      // make this test flaky for a reason unrelated to capacity accounting. It is
-      // measured by test/bench/conpty-external-kill.mjs and filed as issue #21.
+      // Fault the protocol, not the operating system. This test no longer kills any
+      // child externally -- but that is a choice about what to ASSERT, not a claim
+      // that external kills are what crash the host. Issue #21's
+      // STATUS_ACCESS_VIOLATION reproduces from plain fill-to-limit-and-drain churn
+      // with nothing killed behind the runtime's back, which is why this test and
+      // FI-10 are gated by SENTIORA_FAULT_FILL on windows-latest/node 22. Do not
+      // read the absence of external kills here as evidence that repeated
+      // fill-and-drain is safe; the external-kill form is separately measured by
+      // test/bench/conpty-external-kill.mjs.
       //
       // Every close below must be refused WITHOUT freeing the slot it targets.
       for (const [i, entry] of opened.entries()) {
@@ -624,7 +632,7 @@ test('FI-09 session capacity survives repeated fault storms', fillOpts, async ()
       assert.equal((await server.close(entry.sessionId, entry.owner)).result, true);
     }
     assert.deepEqual(await server.list(), [], 'the final round did not return its slots');
-    const notKilled = await untilGone(reopenedPids, 5000);
+    const notKilled = await untilGone(reopenedPids, 15000);
     assert.deepEqual(notKilled, [],
       `terminal.close returned true but these children were still alive 5s later: ${notKilled.join(', ')}`);
   } finally {
