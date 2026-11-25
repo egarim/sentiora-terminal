@@ -496,9 +496,15 @@ test('WIN-17 Ctrl+C interrupts only the targeted process', opts, async () => {
   // with no SIGINT handler is terminated by the console itself and reports
   // STATUS_CONTROL_C_EXIT. A child is still in this mode during start-up, before
   // it can call setRawMode, so Ctrl+C sent right after terminal.create kills it
-  // instead of reaching it as data. Callers must wait for a readiness marker.
-  const cooked = createSession({ args: ['-e', 'setInterval(()=>{},1000)'] });
+  // instead of reaching it as data. Callers must wait for a readiness marker --
+  // including this test, which originally did not and was therefore flaky: ^C
+  // sent before the child attached to the console is dropped, and it failed
+  // reliably on the windows-11-arm CI runner while passing locally.
+  const cooked = createSession({
+    args: ['-e', 'process.stdout.write("COOKED-READY");setInterval(()=>{},1000)'],
+  });
   try {
+    await until(cooked.session, screenHas('COOKED-READY'), { label: 'cooked child to be ready' });
     await send(cooked.session, '\x03');
     const killed = await until(cooked.session, s => !s.running, { label: 'cooked child to be terminated by Ctrl+C' });
     assert.equal(killed.exit.exitCode >>> 0, 0xc000013a, 'expected STATUS_CONTROL_C_EXIT');
