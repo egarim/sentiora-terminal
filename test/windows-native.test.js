@@ -542,10 +542,13 @@ test('WIN-19 survives repeated create and close without leaking', opts, async ()
   const pids = [];
 
   for (let i = 0; i < iterations; i += 1) {
-    const { session, child } = createSession({ cols: 40, rows: 10 });
-    pids.push(child.pid);
+    const { session } = createSession({ cols: 40, rows: 10 });
     try {
-      await until(session, screenHas('FIXTURE READY'), { timeout: 10000, label: `iteration ${i} banner` });
+      const ready = await until(session, screenHas('FIXTURE READY'), { timeout: 10000, label: `iteration ${i} banner` });
+      // Captured after readiness, not at spawn: node-pty 1.2.0-beta reports pid 0
+      // until its deferred pty connection completes, and alivePidsAmong now
+      // rejects non-positive pids instead of matching the System Idle Process.
+      pids.push(ready.pid);
       await ask(session, `echo ITER-${i}`, `ECHO:ITER-${i}`, { timeout: 10000 });
     } finally {
       await session.close();
@@ -626,23 +629,30 @@ test('WIN-20 recovers after an unexpected child process exit', opts, async () =>
 
 test('lifecycle states and child pid are observable through a real ConPTY session', opts, async () => {
   const { session, child } = createSession();
+  let readyPid = null;
   try {
-    // 'spawned' means a pid exists, not that the application can take input.
+    // 'spawned' means a child exists, not that the application can take input.
     assert.equal(session.state, 'spawned');
-    assert.equal(session.pid, child.pid, 'the session must expose the real child pid');
-    assert.ok(session.pid > 0);
-    assert.ok(await isPidAlive(session.pid), 'the exposed pid must exist in the OS process table');
+    // node-pty 1.1.0 reports the pid synchronously from spawn; 1.2.0-beta defers
+    // the pty connection until its conout worker is ready and reports 0 until
+    // then, which Session maps to null. Both are correct before the child has
+    // produced output, so accept either and require a real pid afterwards.
+    const earlyPid = session.pid;
+    assert.ok(earlyPid === null || earlyPid > 0, `unexpected pid before readiness: ${earlyPid}`);
 
     const ready = await until(session, screenHas('FIXTURE READY'), { label: 'fixture banner' });
     assert.equal(ready.state, 'operational', 'first rendered output must make the session operational');
+    assert.ok(ready.pid > 0, 'the pid must be known once the child is producing output');
     assert.equal(ready.pid, child.pid, 'every observation must carry the pid');
+    assert.ok(await isPidAlive(ready.pid), 'the exposed pid must exist in the OS process table');
     assert.equal(ready.running, true);
+    readyPid = ready.pid;
 
     await sendLine(session, 'exit 5');
     const exited = await until(session, s => !s.running, { label: 'child exit' });
     assert.equal(exited.state, 'exited', 'a dead child must be distinguishable from a live one');
     assert.equal(exited.exit.exitCode, 5);
-    assert.equal(exited.pid, child.pid, 'the pid must survive exit so a caller can verify identity');
+    assert.equal(exited.pid, readyPid, 'the pid must survive exit so a caller can verify identity');
   } finally {
     await session.close();
   }
@@ -653,7 +663,7 @@ test('lifecycle states and child pid are observable through a real ConPTY sessio
   const final = await session.observe();
   assert.equal(final.state, 'released');
   assert.equal(final.running, false);
-  assert.equal(final.pid, child.pid);
+  assert.equal(final.pid, readyPid, 'the pid must survive release');
   assert.ok(final.screen.includes('FIXTURE READY'), 'the last rendered screen must survive close()');
   await assert.rejects(session.resize(session.owner, 40, 10), /Resize denied/);
 });
@@ -666,9 +676,11 @@ test('ConPTY provider comparison: bundled DLL path works but never releases its 
   // ARM64 conpty.dll and OpenConsole.exe really do load and drive a session.
   for (const [name, { events }] of [['os', os], ['dll', dll]]) {
     assert.equal(events.spawned?.arch, process.arch, `${name}: probe ran on an unexpected architecture`);
-    assert.ok(events.spawned?.pid > 0, `${name}: expected a child pid`);
     assert.equal(events.ready?.ok, true, `${name}: child never became operational through the pseudoconsole`);
     assert.equal(events.ready?.state, 'operational');
+    // Asserted at readiness rather than at spawn: node-pty 1.2.0-beta reports
+    // pid 0 until its deferred pty connection completes.
+    assert.ok(events.ready?.pid > 0, `${name}: expected a child pid once ready`);
     assert.equal(events.roundTrip?.echoed, true, `${name}: interactive round trip failed`);
     assert.equal(events.closed?.state, 'released');
   }

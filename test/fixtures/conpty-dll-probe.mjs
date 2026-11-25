@@ -38,7 +38,7 @@ try {
     if (Date.now() > deadline) break;
     await session.wait(snap.revision, 100);
   }
-  say('ready', { ok: ready !== null, state: ready?.state, ms: Date.now() - t0 });
+  say('ready', { ok: ready !== null, state: ready?.state, pid: ready?.pid ?? null, ms: Date.now() - t0 });
   if (!ready) throw new Error('child never produced output through the pseudoconsole');
 
   const typed = await session.input({ owner: session.owner, revision: ready.revision, text: 'x' });
