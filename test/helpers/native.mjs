@@ -140,6 +140,15 @@ export async function conhostBaseline() {
 // own transient conhost, so batching keeps the measurement from polluting the
 // very thing it is measuring.
 export async function alivePidsAmong(pids) {
+  // Reject non-positive pids up front. PID 0 is the System Idle Process and is
+  // always present in the tasklist, so an unavailable pid would read as "alive
+  // forever" and turn a clear failure into a 30s timeout. node-pty 1.2.0-beta
+  // reports pid 0 until its deferred pty connection completes, which is exactly
+  // how this was found.
+  const invalid = pids.filter(pid => !Number.isInteger(pid) || pid <= 0);
+  if (invalid.length) {
+    throw new Error(`alivePidsAmong received ${invalid.length} invalid pid(s): ${invalid.slice(0, 5).join(', ')}`);
+  }
   const live = new Set(parseRows(await tasklist()).map(row => Number(row[1])));
   return pids.filter(pid => live.has(pid));
 }
