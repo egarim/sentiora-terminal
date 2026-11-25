@@ -149,8 +149,17 @@ export function startRuntime({ env } = {}) {
             + `${responses.length} responses, ${corrupted.length} corrupt; stderr tail:\n${stderr.slice(-2000)}`);
         }
         // The host can outlive its response pipe -- FI-03 does that on purpose --
-        // so stdout ending is its own reason to stop waiting.
+        // so stdout ending is its own reason to stop waiting. But on Windows the
+        // pipe closes before the 'exit' event arrives, so a crashed host would
+        // otherwise be reported as "stdout ended, server still running" and the
+        // crash would be misdiagnosed as a transport fault. Give the exit event a
+        // moment to land and report whichever actually happened.
         if (stdoutEnded) {
+          if (!exitInfo) await new Promise(resolve => setTimeout(resolve, 1000));
+          if (exitInfo) {
+            throw new Error(`server exited (code=${exitInfo.code} signal=${exitInfo.signal}) while awaiting id ${id}; `
+              + `${responses.length} responses, ${corrupted.length} corrupt; stderr tail:\n${stderr.slice(-2000)}`);
+          }
           throw new Error(`server stdout ended while awaiting id ${id}, server still running; `
             + `${responses.length} responses, ${corrupted.length} corrupt; stderr tail:\n${stderr.slice(-2000)}`);
         }
