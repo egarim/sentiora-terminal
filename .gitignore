@@ -1,3 +1,8 @@
 node_modules/
 .qwen/
 *.log
+
+# Build output. apps/desktop/dist is served by the bridge at runtime but is
+# reproducible from source with `npm --prefix apps/desktop run build`.
+dist/
+*.tsbuildinfo

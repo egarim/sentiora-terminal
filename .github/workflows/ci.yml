@@ -57,3 +57,75 @@ jobs:
       - name: Diagnostics after failure
         if: failure()
         run: node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform,osRelease:require('os').release(),cpus:require('os').cpus().length},null,2)"
+
+  # The desktop app (issue #7, PR1) is a *client* of the runtime and lives entirely
+  # under apps/desktop. It gets its own jobs so a desktop-only failure can never be
+  # mistaken for a runtime regression, and the matrix above stays untouched.
+  #
+  # Node 24 only: the desktop bridge has no npm dependencies of its own and adds no
+  # Node-version surface beyond what the runtime matrix already covers.
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, windows-11-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - run: npm ci
+
+      # The desktop native tests spawn real PTY sessions through src/server.js, so
+      # they need the same macOS spawn-helper fix and architecture check as the
+      # runtime suite.
+      - name: Restore native executable permissions
+        run: node scripts/fix-native-permissions.mjs
+
+      - name: Verify native binary architecture
+        run: node scripts/report-native-arch.mjs
+
+      # Split the same way the runtime job does, so a native-only failure on one
+      # platform is obvious instead of hiding inside a single combined run.
+      - name: Desktop bridge tests (mocked runtime)
+        run: node --test --test-timeout=120000 test/desktop-bridge.test.js test/desktop-settings.test.js test/desktop-ipc.test.js
+
+      - name: Desktop bridge tests (real runtime)
+        run: node --test --test-timeout=180000 test/desktop-native.test.js
+
+      - name: Diagnostics after failure
+        if: failure()
+        run: node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform,osRelease:require('os').release(),cpus:require('os').cpus().length},null,2)"
+
+  # Typechecks and builds the React/xterm.js UI. One platform is enough: there are
+  # no native dependencies in apps/desktop, so the result does not vary by OS.
+  desktop-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install UI dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: apps/desktop
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: apps/desktop
+        run: npx vite build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-dist
+          path: apps/desktop/dist
+          retention-days: 7
+          if-no-files-found: error

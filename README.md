@@ -232,6 +232,44 @@ executable bit every spawn fails with `posix_spawnp failed.` CI runs it automati
 The server communicates over newline-delimited JSON-RPC on stdio. See
 [CI results](https://github.com/egarim/sentiora-terminal/actions) for current status.
 
+### Living Terminal desktop app (PR1)
+
+A desktop UI shell and native session bridge for
+[issue #7](https://github.com/egarim/sentiora-terminal/issues/7) lives under `apps/desktop/`. It is a
+**client** of the runtime above — `src/` is unchanged and still independently usable — and it is the
+first consumer to drive the protocol from a human-facing interface rather than from an agent.
+
+```bash
+npm ci                                    # runtime dependencies
+npm --prefix apps/desktop ci              # UI dependencies
+npm --prefix apps/desktop run build       # -> apps/desktop/dist
+npm run desktop                           # prints: open http://127.0.0.1:<port>/#token=<token>
+```
+
+The bridge serves the built UI itself, so the interface and the API share one loopback origin and one
+per-launch bearer token. Session `owner` tokens never leave the bridge process, and the frontend
+cannot launch an arbitrary command — only a shell the backend detected, or an absolute path the user
+typed and the backend validated.
+
+Output is delivered as **rendered screen snapshots**, not bytes, because that is what
+`terminal.observe` exposes: the runtime has no raw-output channel
+([telekinesis integration §4](docs/integrations/telekinesis.md)). Text, Unicode, layout and the
+alternate screen survive; colour and lines that scroll past between two observations do not. The
+proposed protocol addition that would fix this is documented rather than implemented unilaterally.
+
+**Tauri packaging is BLOCKED**: the machine this was built on (Windows 11 ARM64, Snapdragon X Elite)
+has no Rust toolchain and no MSVC compiler/linker, though WebView2 Runtime is present. Nothing was
+faked and no `src-tauri` scaffold was committed; the exact missing prerequisites and install
+commands are in the design document. The browser/dev-server path above is the working fallback and is
+what the tests exercise.
+
+```bash
+npm run test:desktop                      # bridge + settings + IPC + real-runtime suites
+```
+
+See [Living Terminal desktop UI](docs/desktop/living-terminal.md) for the architecture, the measured
+numbers, the security model, the U01–U15 coverage table and the blocked items.
+
 ### Benchmarks and stress harnesses
 
 These are long-running and are **not** part of `npm test`:
@@ -251,6 +289,7 @@ node test/bench/fd-exhaustion.mjs 1200  # finds the per-host session ceiling
 | [Windows native validation](docs/validation/windows-native-validation.md) | The 20 native ConPTY scenarios, the session-teardown hang and its fix, ARM64 verification, Ctrl+C semantics, measurement pitfalls. |
 | [ConPTY provider comparison](docs/validation/conpty-provider-comparison.md) | OS ConPTY vs bundled `conpty.dll`, lifecycle states, the host-crash defect, long-running reliability, the ~500-session ceiling, CI and the macOS root cause. |
 | [Telekinesis integration](docs/integrations/telekinesis.md) | Contract for using Sentiora as an optional Telekinesis console backend. Implemented on the Telekinesis side as [telekinesis#70](https://github.com/egarim/telekinesis/pull/70); Sentiora needs no Telekinesis-specific code. |
+| [Living Terminal desktop UI](docs/desktop/living-terminal.md) | Issue #7 PR1: the desktop bridge and UI shell, the snapshot output model and its measured limits, host pooling at the descriptor ceiling, the security boundary, the blocked Tauri packaging, and the proposed runtime protocol changes. |
 
 ### Ecosystem
 
