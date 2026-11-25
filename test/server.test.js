@@ -71,16 +71,35 @@ test('ST14-02 a delivered create response commits exactly one session', opts, as
   await untilGone(result.pid);
 });
 
-test('ST14-03 a failed spawn registers nothing', opts, async t => {
+test('ST14-03 a create that fails validation or spawn registers nothing', opts, async t => {
   const api = await registry(t);
-  // A cwd that cannot exist makes pty.spawn throw, the one failure that happens
-  // before a Session exists.
-  const { result, error, sessions } = await api.create(spawnFixture({ cwd: 'Z:/definitely/not/here' }));
 
-  assert.equal(result, undefined);
-  assert.ok(error, 'a failed spawn must be reported as a JSON-RPC error');
-  assert.equal(sessions, 0, 'a failed spawn must not consume a slot');
+  // Validation failures happen before any child exists, on every platform.
+  const rejected = [
+    [{ command: '' }, /Invalid command/],
+    [{ command: process.execPath, args: 'not-an-array' }, /Invalid command/],
+    [{ command: process.execPath, args: [FIXTURE], cols: 1, rows: 10 }, /Invalid dimensions/],
+    [{ command: process.execPath, args: [FIXTURE], conptyDll: 'yes' }, /Invalid conptyDll/],
+  ];
+  for (const [params, expected] of rejected) {
+    const { result, error, sessions } = await api.create(spawnFixture(params));
+    assert.equal(result, undefined, `create should have been rejected: ${JSON.stringify(params)}`);
+    assert.match(error?.message ?? '', expected, `wrong error for ${JSON.stringify(params)}`);
+    assert.equal(sessions, 0, 'a rejected create must not consume a slot');
+  }
   assert.equal((await api.state()).sessions, 0);
+
+  // A synchronous pty.spawn failure is provoked with a cwd on a drive that does
+  // not exist. That is Windows-specific: on POSIX the path is merely relative and
+  // forkpty defers cwd/exec failures to the forked child, so spawn() returns a pid
+  // and the session is created normally rather than throwing.
+  if (process.platform === 'win32') {
+    const { result, error, sessions } = await api.create(spawnFixture({ cwd: 'Z:/definitely/not/here' }));
+    assert.equal(result, undefined);
+    assert.ok(error, 'a failed spawn must be reported as a JSON-RPC error');
+    assert.equal(sessions, 0, 'a failed spawn must not consume a slot');
+    assert.equal((await api.state()).sessions, 0);
+  }
 });
 
 test('ST14-04 a cleanup failure during terminal.close still frees the slot', opts, async t => {
