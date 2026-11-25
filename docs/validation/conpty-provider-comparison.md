@@ -190,6 +190,92 @@ One further difference, read from source and **not** measured: on the DLL path `
 termination status derived from the console. Any caller comparing exit codes across providers
 must account for this.
 
+### 2.6 Re-evaluation on node-pty 1.2.0-beta.18 — the ranking inverts
+
+The §2.5 decision is correct **for node-pty 1.1.0**, which is what this project ships. It was
+re-tested against `1.2.0-beta.18` (the `beta` dist-tag; `latest` is still 1.1.0) because every
+defect found here is already reported upstream (§5.3), which makes "is it fixed in a newer
+release?" the actionable question. Same machine, same harness, 30 trials per provider.
+
+| Metric | 1.1.0 OS | 1.1.0 DLL | **beta.18 OS** | **beta.18 DLL** |
+| --- | --- | --- | --- | --- |
+| startup median | 147 ms | 169 ms | 147 ms | 171 ms |
+| round trip median | 31 ms | 16 ms | 31 ms | **15 ms** |
+| `close()` median | 9 ms | 0 ms | 10 ms | **1 ms** |
+| libuv `Socket`, final | 32 | **2** | 32 | **2** |
+| Win32 handles, final | 228 | 438 | 228 | **198** |
+| Win32 threads, final | 14 | 44 | 14 | **14** |
+| rss final | 63.8 MB | 250.8 MB | 62.9 MB | **62.6 MB** |
+| children surviving | 0/30 | 0/30 | 0/30 | 0/30 |
+| natural process exit | 17.4 s, code 0 | **never (code 99)** | 17.4 s, code 0 | **17.5 s, code 0** |
+
+**beta.18 fixes the defect that made the DLL provider unusable.** The single-session probe that
+reported `didNotDrain` / exit 98 on 1.1.0 now reports `exit {code: 0, ms: 1219}` — the conout
+worker is disposed. With that gone, the DLL path is better on every resource metric: no fd leak
+(`Socket` 2 vs 32), a quarter of the Win32 handle growth (+10 vs +40), no thread growth, memory
+fully reclaimed, `close()` at 1 ms and a round trip twice as fast. The only cost is ~24 ms of
+extra startup.
+
+beta.18 also fixes, on **both** providers:
+
+- the ~500-session ceiling — **1200/1200 create/close cycles with zero failures** versus 1.1.0
+  failing at 495 (`g_ptyHandlesMutex` now guards the table that 1.1.0 mutates from two threads);
+- the ~5 s shutdown tail — **1 ms** measured after the last `kill()`;
+- the stderr noise — **0 bytes**, versus ~49 `AttachConsole failed` stack traces per 50 sessions;
+- and the macOS `spawn-helper` packaging defect (§7.2), published as mode 755.
+
+The fd leak on the **OS** path is *not* fixed: still exactly one `Socket` per session
+(1201 after 1200 cycles).
+
+**But beta.18 introduces a breaking change.** `pty.pid` is `0` for roughly 500 ms after spawn,
+because the pty connection is deferred until the conout worker is ready:
+
+```
+pid immediately after spawn : 0     (typeof number)
+pid after 500ms             : 35664
+```
+
+`Session` captured the pid once in its constructor, so it stored `0` for the session's whole life.
+Running the suite against beta.18 gave **33/37**, with all four failures tracing to that one
+change. `Session.pid` is now a **lazy getter** (`this.pty?.pid || null`), which is correct on both
+versions and takes beta.18 to **35/37**.
+
+The two remaining beta.18 failures are expectations that encode 1.1.0 behaviour, not defects:
+
+| Test | beta.18 behaviour | Status |
+| --- | --- | --- |
+| provider comparison asserts the DLL path never drains | it now drains, exit 0 at 1219 ms | assertion is 1.1.0-specific by design |
+| protocol test asserts `terminal.create` returns a pid | returns `null`; the pid appears on a later `terminal.observe` | **protocol-visible consequence** of the deferred connection |
+
+The second one matters for consumers: on beta.18, `terminal.create` **cannot** return a pid, so
+`pid` must be read from a subsequent observation. Any integration that treats the create result's
+`pid` as authoritative — including the Telekinesis adapter in
+[`../integrations/telekinesis.md`](../integrations/telekinesis.md) — would need to poll.
+
+**Decision: stay on 1.1.0.** The dependency is unchanged; `Session.pid` is now lazy purely so the
+codebase is forward-compatible. Upgrading to a beta is not warranted while 1.1.0 is the `latest`
+dist-tag, and the DLL-provider default should **not** be flipped on 1.1.0, where it hangs. When
+1.2.0 reaches `latest`, the provider decision should be reopened with the numbers above — on that
+release the evidence favours `useConptyDll: true`, which is the opposite of the 1.1.0 conclusion.
+
+Reproduce with:
+
+```bash
+npm install node-pty@1.2.0-beta.18            # in a scratch project, not this repo
+node test/bench/conpty-provider-bench.mjs os  30 90000
+node test/bench/conpty-provider-bench.mjs dll 30 90000
+node test/bench/fd-exhaustion.mjs 1200        # 1200/1200 on beta.18; fails at 495 on 1.1.0
+node test/fixtures/conpty-dll-probe.mjs dll   # exit 0 on beta.18; exit 98 (didNotDrain) on 1.1.0
+```
+
+A measurement caveat worth recording: the first beta.18 benchmark run reported
+`aliveImmediatelyAfterClose: 30` — apparently every child orphaned. That was **false**, and the
+bug was in the bench: it captured `child.pid` at spawn, which is `0` on beta.18, and **PID 0 is the
+System Idle Process**, always present in `tasklist`. Every child "matched". The bench now records
+the pid from the post-readiness observation and rejects non-positive pids outright; the corrected
+run reports `0` survivors for both providers. `kill()` was verified separately and does terminate a
+child within 500 ms on beta.18.
+
 ## 3. Experiment B — terminal lifecycle
 
 ### 3.1 The problem

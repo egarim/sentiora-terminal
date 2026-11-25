@@ -67,7 +67,15 @@ async function win32() {
 }
 
 async function alivePids(pids) {
-  const wanted = pids.filter(p => Number.isInteger(p) && p > 0);
+  // Fail loudly rather than silently filtering: dropping an unavailable pid
+  // would make "0 children surviving" vacuously true. node-pty 1.2.0-beta
+  // reports pid 0 until its deferred pty connection completes, so pids must be
+  // captured after readiness, not at spawn.
+  const invalid = pids.filter(p => !Number.isInteger(p) || p <= 0);
+  if (invalid.length) {
+    throw new Error(`alivePids received ${invalid.length} non-positive pid(s); capture pids after readiness`);
+  }
+  const wanted = pids;
   if (!wanted.length) return [];
   try {
     const { stdout } = await run('tasklist', ['/FO', 'CSV', '/NH']);

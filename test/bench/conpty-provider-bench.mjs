@@ -52,6 +52,15 @@ async function win32() {
 
 async function alivePids(pids) {
   if (!pids.length) return [];
+  // Reject non-positive pids loudly. PID 0 is the System Idle Process and is
+  // always present in the tasklist, so an unavailable pid would silently read as
+  // "alive forever" and report every child as an orphan. node-pty 1.2.0-beta
+  // reports pid 0 until its deferred pty connection completes, which is exactly
+  // how this was caught.
+  const invalid = pids.filter(pid => !Number.isInteger(pid) || pid <= 0);
+  if (invalid.length) {
+    throw new Error(`alivePids received ${invalid.length} invalid pid(s): ${invalid.slice(0, 5).join(', ')}`);
+  }
   try {
     const { stdout } = await run('tasklist', ['/FO', 'CSV', '/NH']);
     const live = new Set();
@@ -114,7 +123,6 @@ for (let i = 0; i < TRIALS; i += 1) {
     continue;
   }
   const session = new Session(child, terminal);
-  pids.push(child.pid);
 
   // Readiness is an observable terminal condition, never a sleep: poll the
   // emulator until the fixture's banner has actually been rendered.
@@ -127,6 +135,9 @@ for (let i = 0; i < TRIALS; i += 1) {
     await session.wait(snap.revision, 100);
   }
   if (ready) startupMs.push(Date.now() - spawnAt);
+  // Recorded from the observation, after readiness, not from child.pid at spawn:
+  // node-pty 1.2.0-beta defers the pty connection and reports pid 0 until then.
+  if (ready?.pid) pids.push(ready.pid);
 
   // One interactive round trip through the revision-guarded input path.
   if (ready) {
