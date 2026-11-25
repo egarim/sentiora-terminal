@@ -63,6 +63,12 @@ jobs:
       - name: JSON-RPC server tests
         run: npm run test:server
 
+      # Separate step for the same reason as above: fault injection drives the real
+      # runtime over stdio and kills servers and children outright, so a failure
+      # here must not be ambiguous with a server-suite failure.
+      - name: Fault injection tests
+        run: npm run test:fault
+
       - name: Diagnostics after failure
         if: failure()
         run: node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform,osRelease:require('os').release(),cpus:require('os').cpus().length},null,2)"
