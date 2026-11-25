@@ -170,6 +170,14 @@ test('ST14-03 a create that fails validation or spawn registers nothing', opts, 
     assert.equal(sessions, 0, 'a rejected create must not consume a slot');
   }
   assert.equal((await api.state()).sessions, 0);
+  // The registry is not the only place a slot can be held: a create reserves one in
+  // the in-flight set before the transport confirms delivery, and a create that
+  // reserved and then threw during validation would burn it forever while leaving
+  // `sessions` empty. Asserting only the registry is exactly the blindness FI-10
+  // exists to correct -- and FI-10 is gated off on one CI cell (issue #21), so this
+  // is what covers the invariant on every platform.
+  assert.deepEqual((await api.state()).inflight, [],
+    'a rejected create must not leave an in-flight reservation behind');
 
   // A synchronous pty.spawn failure is provoked with a cwd on a drive that does
   // not exist. That is Windows-specific: on POSIX the path is merely relative and
