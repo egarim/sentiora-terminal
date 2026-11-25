@@ -21,7 +21,7 @@
     "bench:conpty": "node test/bench/conpty-provider-bench.mjs",
     "stress": "node test/bench/lifecycle-stress.mjs",
     "endurance": "node test/bench/endurance.mjs",
-    "endurance:smoke": "node test/bench/endurance.mjs --tier=smoke",
+    "endurance:smoke": "node test/bench/endurance.mjs --tier=smoke --sample-seconds=5",
     "endurance:1h": "node test/bench/endurance.mjs --tier=1h",
     "endurance:8h": "node test/bench/endurance.mjs --tier=8h",
     "endurance:24h": "node test/bench/endurance.mjs --tier=24h"

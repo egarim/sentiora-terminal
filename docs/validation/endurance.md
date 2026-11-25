@@ -183,20 +183,30 @@ line the reporter parses.
 
 | Date | Tier | Platform | Node | Completed | Exit | Breaches | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2026-11-25 | `1h` | win32 **arm64** (local) | v24.18.1 | **true** (60.07 / 60 min) | **0** | **0** | `runs/endurance-1h-2026-11-25-v1.md` — **superseded**, see note |
-| _pending_ | `1h` | win32 arm64 (local) | v24.18.1 | | | | re-run under the corrected harness |
+| 2026-11-25 | `1h` | win32 **arm64** (local) | v24.18.1 | **true** (60.12 / 60 min) | **0** | **0** | [`runs/endurance-1h-2026-11-25.md`](runs/endurance-1h-2026-11-25.md) |
+| 2026-11-25 | `1h` | win32 arm64 (local) | v24.18.1 | true (60.07 / 60 min) | 0 | 0 | [`runs/…-v1.md`](runs/endurance-1h-2026-11-25-v1.md) — **superseded** |
 | — | `8h` | — | — | **never executed** | — | — | — |
 | — | `24h` | — | — | **never executed** | — | — | — |
 
 The 8h and 24h tiers are implemented and runnable but **have not been executed**. They are not
-claimed as passing, and no result should be inferred for them from the 1h row.
+claimed as passing, and no result should be inferred for them from the 1h rows. A tier that has not
+run is listed as "never executed" rather than omitted, so the table cannot be read as complete
+coverage.
 
-The first 1h row was produced by an earlier revision of the harness and is kept only for
-continuity. That revision had two defects found in review which make its verdict unsound, though
-not its raw measurements: `completed` was derived from the wall clock, and its p95 latency figure
-was the churn cycle only, ignoring the 152,758 `observe` calls. The counters it reported (0 errors,
-0 orphans, 50,824 cycles) are still valid observations; the *pass* is not, and is superseded by the
-re-run.
+The current 1h result: 50,758 cycles, 152,523 observations, **0 errors, 0 stalls, 0 orphans**, RSS
+growth −17.2 MB, handle leak exactly 1.00 per churn cycle, and both the latency-trend and
+throughput ratios at 1.000 — no degradation across the hour. It ran on harness revision `f8cb0bd`
+and its series was independently replayed against the current thresholds, which it also passes; the
+run record has both sets of numbers.
+
+The v1 row was produced by an earlier revision whose `completed` flag was wall-clock based and
+whose latency figure ignored `observe` entirely. Its counters are valid observations; its *pass* was
+not comparable, so it is retained marked superseded rather than deleted.
+
+A tier is only eligible to report a trend verdict if it was configured to produce at least 20
+samples (`trendEligible` in `RESULT`). The `smoke` tier at its default 30 s interval produces four
+and is therefore a shakedown, not evidence — `npm run endurance:smoke` passes `--sample-seconds=5`
+so that it does exercise the trend path.
 
 ## Known limitations
 
@@ -221,3 +231,18 @@ re-run.
   separate from the host under test and does not affect its measurements, but it bounds how long
   the harness can run unattended; a future revision should stream percentiles instead of retaining
   samples.
+- **The duration budget includes host startup.** `t0` is taken at module load, before the host is
+  spawned and `initialize` is answered, so `actualMinutes` is marginally generous — bounded in
+  practice by the 30 s `initialize` request timeout, not by the 5 s completion tolerance. For any
+  tier that produces enough samples to evaluate a trend the lost work is well under 1% of the
+  budget, and every verdict-bearing metric is sample- or quartile-based rather than duration-based,
+  so it cannot change a verdict. It is not corrected because doing so would complicate the budget
+  arithmetic for no verdict gain; it is recorded so the number is not read as pure workload time.
+- **`errorRate` has no per-operation breakdown.** Its denominator counts every successful operation
+  (~3×10⁵ per hour, and ~5–6 counted operations per unit of churn work), so a failure rate that is
+  catastrophic for one operation can sit below the 1e-3 limit. A `terminal.close` failure is not
+  caught by it at all — `abandon()` deregisters unconditionally and `Session.close()` absorbs
+  cleanup failures, so no RPC error is raised and the live-session count does not rise. What does
+  catch a close that failed to kill its child is the orphan sweep. A close whose cleanup failed
+  *without* leaving a live child is currently caught only by the `sentiora: cleanup failed`
+  diagnostic in `hostStderrTail`, which is captured but not thresholded. Known gap, not fixed here.

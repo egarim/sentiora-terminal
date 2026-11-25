@@ -117,6 +117,16 @@ if (!Number.isInteger(MAX_CHURN) || MAX_CHURN < 1 || MAX_CHURN > NODE_PTY_SESSIO
 }
 const STALL_TIMEOUT_MS = numArg('stall-timeout-ms', 120000);
 const REQUEST_TIMEOUT_MS = numArg('request-timeout-ms', 30000);
+// Both must be positive. --request-timeout-ms=0 would make every call fail
+// immediately, and because the per-worker idle budget is derived from it
+// (STALL_SLACK_MS) it would also collapse stall detection. Refusing here reports a
+// configuration error instead of surfacing much later as exit 4 or 5.
+for (const [name, value] of [['--stall-timeout-ms', STALL_TIMEOUT_MS], ['--request-timeout-ms', REQUEST_TIMEOUT_MS]]) {
+  if (!Number.isFinite(value) || value <= 0) {
+    console.error(`${name} must be a positive number of milliseconds, got ${value}`);
+    process.exit(64);
+  }
+}
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const OUT = resolve(arg('out', `artifacts/endurance-${tier ?? `${MINUTES}m`}-${stamp}.jsonl`));
 
@@ -167,8 +177,10 @@ const THRESHOLDS = {
   minThroughputRatio: numArg('min-throughput-ratio', 0.5),
   maxOrphans: numArg('max-orphans', 0),
   // Live sessions must stay at pool + at most one transient churn session. If
-  // terminal.close stopped releasing registry entries this climbs to 16.
-  maxLiveSessions: POOL + 2,
+  // terminal.close stopped releasing registry entries this climbs toward the host's
+  // own 16-session limit. Clamped to 15 so the check stays reachable even at
+  // --pool=15, where POOL+2 would exceed the host's ceiling and could never fire.
+  maxLiveSessions: Math.min(POOL + 2, 15),
   // A run that could not measure the host's resources is not a pass, however
   // green everything else looks.
   minMeasurableSampleFraction: numArg('min-measurable-sample-fraction', 0.9),
@@ -362,12 +374,19 @@ const series = [];
 try {
   mkdirSync(dirname(OUT), { recursive: true });
 } catch (error) {
-  console.log(`RESULT ${JSON.stringify({
+  // Flushed through the write callback, per the rule this file states at the bottom:
+  // console.log followed immediately by process.exit can truncate the very RESULT
+  // line the CI reporter parses, which would report "no RESULT line" instead of the
+  // real cause.
+  const payload = JSON.stringify({
     completed: false, error: `cannot create series directory ${dirname(OUT)}`,
     detail: String(error?.message ?? error), tier, requestedMinutes: MINUTES,
-  })}`);
-  console.log('EXIT 5 completed=false breaches=0 samples=0');
-  process.exit(5);
+    breaches: [], samples: 0,
+  });
+  setTimeout(() => process.exit(5), 3000); // backstop if the callback never fires
+  process.stdout.write(`RESULT ${payload}\n`, () => {
+    process.stdout.write('EXIT 5 completed=false breaches=0 samples=0\n', () => process.exit(5));
+  });
 }
 let seriesWriteError = null;
 const writeSeries = record => {
@@ -431,7 +450,11 @@ async function sendLine(host, sessionId, owner, text, marker, worker) {
       counters.writes += 1;
       break;
     } catch (error) {
-      if (!/Stale observation/.test(error.message) || attempt === 24) { recordError(error); throw error; }
+      // A stale revision is ordinary protocol behaviour, not a fault, so it is
+      // retried and not counted. A real failure is rethrown and counted ONCE by the
+      // worker's catch -- counting it here too inflated every error metric twofold
+      // on exactly the path most likely to fail.
+      if (!/Stale observation/.test(error.message) || attempt === 24) throw error;
     }
   }
   return waitReady(host, sessionId, marker);
@@ -444,7 +467,17 @@ async function openSession(host, worker, cols = 60, rows = 20) {
   counters.creates += 1;
   if (Number.isInteger(created.pid) && created.pid > 0) allPids.add(created.pid);
   touch(worker);
-  await waitReady(host, created.sessionId);
+  try {
+    await waitReady(host, created.sessionId);
+  } catch (error) {
+    // A session that never became ready is still registered and still holds a
+    // child, and the caller never receives it -- so nothing else would ever close
+    // it. Leaking it here would put the harness in the position it exists to
+    // detect. The original error is the one that matters, so a failed cleanup is
+    // swallowed rather than allowed to mask it.
+    try { await closeSession(host, created); } catch { /* reported via counters below */ }
+    throw error;
+  }
   if (Number.isInteger(created.pid) && created.pid > 0) allPids.add(created.pid);
   touch(worker);
   return created;
@@ -774,7 +807,10 @@ const measurement = {
   orphans: orphans.length,
   orphanPids: orphans.slice(0, 20),
   spawnedPids: allPids.size,
-  maxLiveSessions: Math.max(0, ...series.map(s => s.sessions ?? 0)),
+  // Reduced rather than spread: a 24h run at a 1s sample interval is ~86k entries,
+  // and spreading that many arguments throws RangeError at module top level after
+  // the host has stopped, losing the RESULT line for the whole run.
+  maxLiveSessions: series.reduce((max, s) => Math.max(max, s.sessions ?? 0), 0),
   measurableSamples,
   totalSamples: series.length,
   measurableFraction,
@@ -811,16 +847,40 @@ check('maxP95ObserveMs', measurement.p95ObserveMs, THRESHOLDS.maxP95ObserveMs, (
 // sample, and the live-session count must have been read at all. Without this, a
 // terminal.list that fails on every sample yields maxLiveSessions 0 -- inside the
 // limit -- and the run passes having measured nothing.
+//
+// Counted separately from thresholdsEvaluated on purpose: these are derived checks,
+// not entries in THRESHOLDS, and folding them in made the evaluated count exceed
+// the declared count, which defeats the comparison the two numbers exist to
+// support.
+let coverageChecksEvaluated = 0;
 for (const [metric, count] of Object.entries(coverage)) {
   const fraction = series.length ? Number((count / series.length).toFixed(3)) : 0;
-  check(`minCoverage:${metric}`, fraction, THRESHOLDS.minMeasurableSampleFraction, (v, l) => v < l);
+  coverageChecksEvaluated += 1;
+  if (fraction < THRESHOLDS.minMeasurableSampleFraction) {
+    breaches.push({
+      threshold: `minCoverage:${metric}`, value: fraction, limit: THRESHOLDS.minMeasurableSampleFraction,
+    });
+  }
+}
+// Coverage proves the listing succeeded, not that it yielded anything. A provider
+// that answers terminal.list but reports no pid (node-pty >= 1.2 defers its pty
+// connection and Session.pid maps 0 to null) would leave allPids empty and report
+// "0 orphans" having checked nothing.
+if (counters.creates > 0 && allPids.size === 0) {
+  breaches.push({ threshold: 'orphanCheckHadPidsToCheck', value: 0, limit: `> 0 of ${counters.creates} creates` });
 }
 
 // Conditions that are failures rather than threshold breaches, because they mean
 // the run did not measure what it claimed to.
-if (series.length < MIN_SAMPLES_FOR_TREND) {
-  // A run too short to evaluate any trend must not be indistinguishable, by exit
-  // code, from a 24h pass.
+//
+// The sample floor is only a breach when the run was CONFIGURED to reach it. A
+// two-minute shakedown at a 30s interval yields four samples and can never support
+// a trend comparison; failing it would make the documented smoke tier permanently
+// red, so it is reported as not evidence-eligible instead. A run that was supposed
+// to produce 120 samples and produced 4 is a different thing, and that is a breach.
+const expectedSamples = Math.floor(durationMs / (SAMPLE_SECONDS * 1000));
+const trendEligible = expectedSamples >= MIN_SAMPLES_FOR_TREND;
+if (trendEligible && series.length < MIN_SAMPLES_FOR_TREND) {
   breaches.push({ threshold: 'enoughSamplesForTrend', value: series.length, limit: MIN_SAMPLES_FOR_TREND });
 }
 if (measurement.churnProducedNoCycles) {
@@ -872,13 +932,17 @@ const result = {
   counters,
   latency: Object.fromEntries(Object.entries(latencies).map(([k, v]) => [k, stats(v)])),
   samples: series.length,
+  expectedSamples,
+  // false means the run was too short, by configuration, to support any trend
+  // comparison. Such a run is a shakedown, not evidence, and must not be quoted as
+  // though its null growth metrics meant "flat".
+  trendEligible,
   seriesPath: OUT,
   measurement,
-  // Which metrics were readable, on how many samples, and how many checks that
-  // turned into -- so a green run can be told apart from an unevaluated one.
   coverage,
   thresholdsEvaluated,
   thresholdsDeclared: Object.keys(THRESHOLDS).length,
+  coverageChecksEvaluated,
   breaches,
   topErrors: [...errorMessages.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
     .map(([message, count]) => ({ count, message })),
