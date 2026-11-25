@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node src/server.js",
     "fix:native-permissions": "node scripts/fix-native-permissions.mjs",
-    "test": "node --test --test-timeout=180000 test/*.test.js",
+    "test": "npm run test:unit && npm run test:native && npm run test:desktop",
     "test:unit": "node --test --test-timeout=60000 test/session.test.js",
     "test:native": "node --test --test-timeout=180000 test/native.test.js test/windows-native.test.js test/windows-server.test.js",
     "test:desktop": "node --test --test-timeout=180000 test/desktop-bridge.test.js test/desktop-settings.test.js test/desktop-ipc.test.js test/desktop-native.test.js",
