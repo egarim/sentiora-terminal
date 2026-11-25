@@ -95,20 +95,37 @@ median of the second quartile**, skipping the first quartile as warm-up, and req
 | `maxErrorRate` | 0.001 | `errors / (successful operations + errors)`. Deliberately not errors/successes — that ratio reports **0 when everything failed** |
 | `maxStalls` | 0 | Any stall is a deadlock candidate |
 | `maxLatencyDegradationRatio` | 3 | Final-quartile p95 ÷ second-quartile p95. An absolute ceiling alone passes a run that got 8× slower over its own duration, which is what endurance testing exists to catch |
-| `maxP95LatencyMs` | 5000 | Absolute backstop on the whole run |
+| `maxP95LatencyMs` | 2000 | Absolute backstop on the churn cycle (measured p95 230 ms), so a hang or an order-of-magnitude regression fails even when the trend ratio does not |
+| `maxP95ObserveMs` | 1000 | `observe` is the highest-volume call — three per pool cycle — so a regression there is diluted into the cycle figure without its own ceiling (measured p95 0.7 ms) |
 | `minThroughputRatio` | 0.5 | Final-quartile cycles/min ÷ second-quartile. Catches a collapse that no single call would reveal |
 | `maxOrphans` | 0 | Every pid the host ever reported must be gone once it exits |
 | `maxLiveSessions` | `pool + 2` | If `terminal.close` stopped releasing registry entries this climbs toward 16; visible in every sample, so it is checked |
 | `minMeasurableSampleFraction` | 0.9 | A run that could not read the host's resources is not a pass, however green everything else looks |
 
-Three conditions are reported as breaches rather than silently skipped, because each would
-otherwise let a broken run look healthy:
+Arguments are validated, not trusted: `--pool` is 1–15 (one slot must stay free for the churn
+workload, since the host's own limit is 16), `--max-churn` is 1–495 (the node-pty ceiling),
+`--minutes` is at least 1, `--sample-seconds` at least 1, and an unknown `--tier` is rejected.
+`--pool=0` would otherwise produce a green "sustained use" run containing no sustained use, and
+`--sample-seconds=0` would spin the sampler hard enough to starve the process it measures.
 
-- the churn workload produced **no** cycles inside the comparison window (which would delete the
+Beyond the thresholds, these conditions are reported as breaches, because each would otherwise let
+a broken run look healthy:
+
+- the run produced **fewer samples than the trend floor**, so no trend was evaluated at all —
+  without this, a 36-second run and a 24-hour pass are indistinguishable by exit code;
+- the **churn workload produced no cycles** inside the comparison window (which would delete the
   only leak-rate metric);
-- the host had to be **SIGKILLed** to stop it (`neededKillToStop`) — a host that no longer exits on
-  stdin EOF is itself a regression, and is the documented failure mode of a leaked ConPTY worker;
+- the host had to be **SIGKILLed** to stop it (`neededKillToStop`), or exited with a **non-zero
+  code or any signal** — a host that no longer exits cleanly on stdin EOF is itself a regression,
+  and is the documented failure mode of a leaked ConPTY worker;
+- any **coverage** figure below `minMeasurableSampleFraction`, per metric this platform claims to
+  support *and* for the live-session count. A `terminal.list` that fails on every sample would
+  otherwise fold to `sessions: 0` — inside the limit — and the run would pass having measured
+  nothing;
 - any workload did not run to completion.
+
+`RESULT` also reports `thresholdsEvaluated` against `thresholdsDeclared`, so "0 breaches" can be
+distinguished from "nothing was evaluated".
 
 ### What `null` means, and what it does not
 

@@ -80,13 +80,32 @@ if (!Number.isFinite(MINUTES) || MINUTES <= 0) {
   console.error('usage: --tier=smoke|1h|8h|24h or --minutes=N');
   process.exit(64);
 }
+// A run shorter than this cannot produce enough samples to evaluate a single
+// trend, so it would report completed=true with every growth metric null -- which
+// is indistinguishable, by exit code, from a 24h pass. Refuse it instead.
+if (MINUTES < 1) {
+  console.error(`--minutes must be at least 1 (got ${MINUTES}): a shorter run cannot produce the `
+    + '20 samples MIN_SAMPLES_FOR_TREND requires, so every trend metric would be null and the '
+    + 'run would report a vacuous pass');
+  process.exit(64);
+}
 
 // Validated rather than trusted: --pool=0 would otherwise produce a green
 // "sustained use" run with no sustained use in it, and an out-of-range
 // --max-churn would defeat the node-pty ceiling the cap exists to respect.
+// The pool ceiling is SESSION_LIMIT-1: at 16 the pool alone fills the host, every
+// churn create is refused, and maxLiveSessions becomes unreachable.
 const POOL = numArg('pool', 4);
-if (!Number.isInteger(POOL) || POOL < 1 || POOL > 16) {
-  console.error(`--pool must be an integer 1..16, got ${JSON.stringify(arg('pool', 4))}`);
+if (!Number.isInteger(POOL) || POOL < 1 || POOL > 15) {
+  console.error(`--pool must be an integer 1..15 (one slot must stay free for the churn `
+    + `workload; the host's own limit is 16), got ${JSON.stringify(arg('pool', 4))}`);
+  process.exit(64);
+}
+const SAMPLE_SECONDS = numArg('sample-seconds', 30);
+if (!Number.isFinite(SAMPLE_SECONDS) || SAMPLE_SECONDS < 1) {
+  // 0 or negative would spin the sampler back-to-back, spawning PowerShell in a
+  // tight loop and starving the very process it is supposed to be measuring.
+  console.error(`--sample-seconds must be at least 1, got ${JSON.stringify(arg('sample-seconds', 30))}`);
   process.exit(64);
 }
 const NODE_PTY_SESSION_CEILING = 495;
@@ -96,7 +115,6 @@ if (!Number.isInteger(MAX_CHURN) || MAX_CHURN < 1 || MAX_CHURN > NODE_PTY_SESSIO
     + `creating sessions near ${NODE_PTY_SESSION_CEILING}), got ${JSON.stringify(arg('max-churn', 250))}`);
   process.exit(64);
 }
-const SAMPLE_SECONDS = numArg('sample-seconds', 30);
 const STALL_TIMEOUT_MS = numArg('stall-timeout-ms', 120000);
 const REQUEST_TIMEOUT_MS = numArg('request-timeout-ms', 30000);
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -135,9 +153,15 @@ const THRESHOLDS = {
   maxStalls: numArg('max-stalls', 0),
   // Latency is checked as DEGRADATION between quartiles, not as an absolute
   // figure: an absolute ceiling passes a run that got 8x slower over its own
-  // duration, which is the thing endurance testing exists to catch.
+  // duration, which is the thing endurance testing exists to catch. The absolute
+  // backstops below are separate and deliberately tight -- a churn cycle measured
+  // p95 230ms and an observe 0.7ms, so these catch a hang or an order-of-magnitude
+  // regression, not a busy runner. observe gets its own ceiling because it is the
+  // highest-volume call (three per pool cycle) and a regression there is otherwise
+  // diluted into the cycle figure.
   maxLatencyDegradationRatio: numArg('max-latency-degradation-ratio', 3),
-  maxP95LatencyMs: numArg('max-p95-latency-ms', 5000),
+  maxP95LatencyMs: numArg('max-p95-latency-ms', 2000),
+  maxP95ObserveMs: numArg('max-p95-observe-ms', 1000),
   // Throughput must not collapse: a run that still answers, but ten times slower,
   // is a failure even though no single call breached anything.
   minThroughputRatio: numArg('min-throughput-ratio', 0.5),
@@ -222,6 +246,11 @@ function startHost() {
 
   let exitInfo = null;
   child.once('exit', (code, signal) => { exitInfo = { code, signal }; });
+  // A spawn failure surfaces as an 'error' event, not an 'exit'. Without this the
+  // harness would wait forever on a host that never started and print no RESULT.
+  child.once('error', error => {
+    exitInfo = exitInfo ?? { code: null, signal: null, spawnError: String(error?.message ?? error) };
+  });
 
   const pending = new Map();
   let buffered = '';
@@ -327,7 +356,19 @@ const workerState = new Map();
 const touch = worker => { lastProgress.set(worker, performance.now()); };
 
 const series = [];
-mkdirSync(dirname(OUT), { recursive: true });
+// Outside the orchestration try, at module load: an unwritable --out would
+// otherwise throw before anything ran and leave no RESULT line at all, so the
+// failure would not match any documented exit code.
+try {
+  mkdirSync(dirname(OUT), { recursive: true });
+} catch (error) {
+  console.log(`RESULT ${JSON.stringify({
+    completed: false, error: `cannot create series directory ${dirname(OUT)}`,
+    detail: String(error?.message ?? error), tier, requestedMinutes: MINUTES,
+  })}`);
+  console.log('EXIT 5 completed=false breaches=0 samples=0');
+  process.exit(5);
+}
 let seriesWriteError = null;
 const writeSeries = record => {
   series.push(record);
@@ -341,19 +382,17 @@ const writeSeries = record => {
   }
 };
 
+// Times a call and records it. Errors are NOT counted here: every caller already
+// handles and records them, so counting in both places inflated counters.errors,
+// timeouts and topErrors roughly twofold and made the diagnostics misleading.
 const timed = async (bucket, fn) => {
   const started = performance.now();
-  try {
-    const value = await fn();
-    const ms = performance.now() - started;
-    latencies[bucket].push(ms);
-    windowLatencies.push(ms);
-    windowOps += 1;
-    return value;
-  } catch (error) {
-    recordError(error);
-    throw error;
-  }
+  const value = await fn();
+  const ms = performance.now() - started;
+  latencies[bucket].push(ms);
+  windowLatencies.push(ms);
+  windowOps += 1;
+  return value;
 };
 
 // Wait for readiness by observation, never by sleeping: a spawned process is not
@@ -655,11 +694,14 @@ const hostDiedDuringRun = aborted !== null && ['host-died', 'host-gone'].include
 // before any reaping, so the number is real rather than self-fulfilling.
 const orphans = [];
 {
-  const orphansDeadline = Date.now() + 60000;
+  // Monotonic like every other budget here: this is a verdict-bearing path, and a
+  // wall-clock step would either shorten the grace and report a slow-but-correct
+  // child as an orphan, or stall the wait indefinitely.
+  const orphansDeadline = performance.now() + 60000;
   for (;;) {
     const live = [...allPids].filter(alive);
     if (!live.length) break;
-    if (Date.now() > orphansDeadline) { orphans.push(...live); break; }
+    if (performance.now() > orphansDeadline) { orphans.push(...live); break; }
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
 }
@@ -673,10 +715,29 @@ const quartileTrend = (pick, combine = (last, second) => last - second) => {
   const q = Math.floor(values.length / 4);
   if (q < 2) return null;
   const median = arr => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
-  return Number(combine(median(values.slice(q * 3)), median(values.slice(q, q * 2))).toFixed(2));
+  // A ratio combinator returns null when the denominator is 0 (a quarter of the
+  // run in which nothing happened). Calling toFixed on that would throw here, at
+  // module top level after the host was already stopped -- destroying the RESULT
+  // line for a multi-hour run and exiting 1, which is documented as "completed but
+  // breached". Skip instead, and let the coverage checks below report the gap.
+  const combined = combine(median(values.slice(q * 3)), median(values.slice(q, q * 2)));
+  if (combined === null || !Number.isFinite(combined)) return null;
+  return Number(combined.toFixed(2));
 };
 
-const measurableSamples = series.filter(s => Number.isFinite(s.host?.rssMb)).length;
+// Coverage per metric, not just for RSS. A metric this platform claims to support
+// but could not read -- PowerShell blocked, /proc/<pid>/fd unreadable, or
+// terminal.list failing on every sample -- must count as a measurement failure.
+// Folding its absence into a number (Math.max over `sessions ?? 0`) is what let a
+// run that measured nothing report a clean pass.
+const metricField = { rss: 'rssMb', handles: 'handles', threads: 'threads' };
+const coverage = {};
+for (const metric of SUPPORTED) {
+  const field = metricField[metric];
+  coverage[metric] = series.filter(s => Number.isFinite(s.host?.[field])).length;
+}
+coverage.sessions = series.filter(s => Number.isFinite(s.sessions)).length;
+const measurableSamples = coverage.rss;
 const measurableFraction = series.length ? Number((measurableSamples / series.length).toFixed(3)) : 0;
 
 const handleGrowth = quartileTrend(r => r.host.handles);
@@ -724,8 +785,13 @@ const measurement = {
 };
 
 const breaches = [];
+// How many checks actually ran, as opposed to how many were skipped because the
+// value was null. Without this, "0 breaches" cannot be told apart from "nothing
+// was evaluated", which is the confusion every coverage rule above exists to stop.
+let thresholdsEvaluated = 0;
 const check = (name, value, limit, worse) => {
   if (value === null || value === undefined || Number.isNaN(value)) return;
+  thresholdsEvaluated += 1;
   if (worse(value, limit)) breaches.push({ threshold: name, value, limit });
 };
 check('maxRssGrowthMb', rssGrowthMb, THRESHOLDS.maxRssGrowthMb, (v, l) => v > l);
@@ -739,14 +805,35 @@ check('minThroughputRatio', throughputRatio, THRESHOLDS.minThroughputRatio, (v, 
 check('maxOrphans', measurement.orphans, THRESHOLDS.maxOrphans, (v, l) => v > l);
 check('maxLiveSessions', measurement.maxLiveSessions, THRESHOLDS.maxLiveSessions, (v, l) => v > l);
 check('minMeasurableSampleFraction', measurableFraction, THRESHOLDS.minMeasurableSampleFraction, (v, l) => v < l);
+check('maxP95ObserveMs', measurement.p95ObserveMs, THRESHOLDS.maxP95ObserveMs, (v, l) => v > l);
+
+// Every metric this platform claims to support must have been read on almost every
+// sample, and the live-session count must have been read at all. Without this, a
+// terminal.list that fails on every sample yields maxLiveSessions 0 -- inside the
+// limit -- and the run passes having measured nothing.
+for (const [metric, count] of Object.entries(coverage)) {
+  const fraction = series.length ? Number((count / series.length).toFixed(3)) : 0;
+  check(`minCoverage:${metric}`, fraction, THRESHOLDS.minMeasurableSampleFraction, (v, l) => v < l);
+}
 
 // Conditions that are failures rather than threshold breaches, because they mean
 // the run did not measure what it claimed to.
+if (series.length < MIN_SAMPLES_FOR_TREND) {
+  // A run too short to evaluate any trend must not be indistinguishable, by exit
+  // code, from a 24h pass.
+  breaches.push({ threshold: 'enoughSamplesForTrend', value: series.length, limit: MIN_SAMPLES_FOR_TREND });
+}
 if (measurement.churnProducedNoCycles) {
   breaches.push({ threshold: 'churnWorkloadProducedNoCycles', value: churnGrowth, limit: '> 0' });
 }
 if (stopReport.neededKill) {
   breaches.push({ threshold: 'hostExitedOnItsOwn', value: false, limit: true });
+}
+// "Cleanly" means code 0 and no signal, not merely "did not have to be killed":
+// shutdown() is fire-and-forget in src/server.js, so a rejection during teardown
+// exits the host non-zero after the workloads finished, and that is a regression.
+if (stopReport.exitInfo && (stopReport.exitInfo.code !== 0 || stopReport.exitInfo.signal !== null)) {
+  breaches.push({ threshold: 'hostExitedCleanly', value: stopReport.exitInfo, limit: { code: 0, signal: null } });
 }
 // Every workload must have run to the end. A pool worker that died in minute one
 // and a run that finished are not the same result, even if the host stayed up.
@@ -787,14 +874,24 @@ const result = {
   samples: series.length,
   seriesPath: OUT,
   measurement,
+  // Which metrics were readable, on how many samples, and how many checks that
+  // turned into -- so a green run can be told apart from an unevaluated one.
+  coverage,
+  thresholdsEvaluated,
+  thresholdsDeclared: Object.keys(THRESHOLDS).length,
   breaches,
   topErrors: [...errorMessages.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
     .map(([message, count]) => ({ count, message })),
 };
 
 let code = 0;
-if (seriesWriteError && !series.length) code = 5;
-else if (hostDiedDuringRun || (stopReport.exitInfo && !completed && aborted?.reason?.startsWith('host'))) code = 2;
+// Harness failure is checked first: if the measuring instrument broke, the run's
+// verdict is meaningless and must not be reported as "interrupted" (4) or
+// "breached" (1), which is what happened when exit 5 was reachable only from the
+// empty-series case.
+if (aborted?.reason === 'harness-failed' || aborted?.reason === 'sampler-failed'
+  || (seriesWriteError && !series.length)) code = 5;
+else if (hostDiedDuringRun) code = 2;
 else if (aborted?.reason === 'stall') code = 3;
 else if (!completed) code = 4;
 else if (seriesWriteError) code = 5;
