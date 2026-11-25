@@ -46,13 +46,22 @@ jobs:
           node --check src/server.js
           node --check src/session.js
 
-      # Mocked and native suites run as separate steps so a native-only failure
-      # on one platform is obvious instead of hiding inside a single "npm test".
+      # Mocked, native and server suites run as separate steps so a failure is
+      # attributable to one layer instead of hiding inside a single "npm test".
+      # The server suite is also kept out of the same process batch as the native
+      # suite on purpose: both spawn real PTY sessions, and running them
+      # concurrently starved the server-shutdown test on windows-latest, where it
+      # exceeded its 30s budget against a locally measured ~5s. Serialising them
+      # removes the contention instead of widening the budget, which would only
+      # mask a genuine hang.
       - name: Mocked unit tests
         run: npm run test:unit
 
       - name: Native PTY tests
         run: npm run test:native
+
+      - name: JSON-RPC server tests
+        run: npm run test:server
 
       - name: Diagnostics after failure
         if: failure()
