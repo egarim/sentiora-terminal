@@ -96,6 +96,27 @@ fixed: the workflow captures Windows event-log entries 1000/1001 on failure, whi
 faulting module and the exception code (`0xc0000005` is `STATUS_ACCESS_VIOLATION`). The next
 occurrence can be named instead of speculated about.
 
+Note also what that stderr flood costs: the crash sat among **21** identical
+`Error: AttachConsole failed` traces in that one job's log, each from
+`conpty_console_list_agent` and each followed by its own `Node.js v24.22.3` footer. Those are benign
+— every `kill()` forks that agent and it fails to attach to an already-exited console, so node-pty
+resolves via a 5000ms timeout — but they make a real crash hard to find, which is why identifying
+this one took three reads of the same log.
+
+### Resolution status
+
+The next commit (`47cbc6d` — documentation and CI diagnostics only, nothing
+`windows-native.test.js` imports) re-ran the cell and it passed, in run
+[`45795716953`](https://github.com/egarim/sentiora-terminal/actions/runs/45795716953), which is
+**17/17 green**. Measured there for `test (windows-latest, 24)`: arch check OK with 9 x64 binaries,
+unit 40/40, native 23/23 with `WIN-14` itself passing in 11775ms and reporting 0 leftover conhost
+hosts, server 26/26, fault 8/10 with the 2 expected gate skips — **97 / 99** executed.
+
+This is **one more sample from a non-deterministic suite, not a fix.** Nothing about `WIN-14`,
+node-pty or ConPTY changed between the two runs, so the only honest statement is that the failure
+does not reproduce on every run — which was already known. It is recorded unattributed on #21 and
+stays open.
+
 ## The container's PID 1 does not reap
 
 The container job passed every step up to fault injection, and failed there:

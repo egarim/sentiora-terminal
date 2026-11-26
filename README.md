@@ -63,8 +63,8 @@ The runtime is deliberately model-agnostic. Sentiora supplies perception and act
 
 This table says what was **executed**, not what each platform is expected to support. Every count was
 read out of the named CI job's own Node test-runner summary in run
-[`45792413782`](https://github.com/egarim/sentiora-terminal/actions/runs/45792413782); the four
-runtime suites hold **99** tests.
+[`45795716953`](https://github.com/egarim/sentiora-terminal/actions/runs/45795716953), which is
+**17/17 green**; the four runtime suites hold **99** tests.
 
 | Platform | Backend | Arch | Verified on | Node | Executed | Skipped |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -75,18 +75,21 @@ runtime suites hold **99** tests.
 | macOS | Unix PTY | Apple Silicon | `macos-latest` | 22, 24 | **71 / 99** | 28 |
 | macOS | Unix PTY | Intel | **not verified** — `macos-latest` is arm64 and there is no `macos-13` job | — | — | — |
 
-**One cell in that run was red, and the table above does not hide it.** `test (windows-latest, 24)`
-failed: the native suite's process died inside `WIN-14 cleans up without orphaned processes` after 14
-tests passed, with no JavaScript error, no exit code and no exception in the log. The x64 Windows
-counts therefore come from the Node 22 cell. The same cell passed on both earlier commits of this
-branch and passes on `main`, and `windows-native.test.js` imports nothing this PR touched, so it is
-an intermittent native crash rather than a regression — but it is **not** attributed to
-[#21](https://github.com/egarim/sentiora-terminal/issues/21) here, because `WIN-14` creates 3
-concurrent sessions against the near-the-cap concurrency of #21's other occurrences, and guessing
-would be worse than saying the log was insufficient. What the failure did expose is that it was
-undiagnosable, so the workflow now dumps Windows event-log entries 1000/1001 on failure, which carry
-the faulting module and the exception code. Details in
-[Linux containers](docs/validation/linux-containers.md).
+**The run cited above is green, and the run immediately before it was not.** In run
+[`45792413782`](https://github.com/egarim/sentiora-terminal/actions/runs/45792413782) (commit
+`2a8f9f2`) `test (windows-latest, 24)` failed: the native suite's process died inside
+`WIN-14 cleans up without orphaned processes` after 14 tests had passed, leaving no JavaScript error,
+no exit code and no exception in the log — only Node's own footer. The next commit changed only
+documentation and CI diagnostics, nothing `windows-native.test.js` imports, and the cell passed.
+
+That is **one more sample from a non-deterministic suite, not a fix**, and it is recorded here rather
+than dropped because a table of green cells that hides a red one is worse than no table. The crash is
+logged unattributed on [#21](https://github.com/egarim/sentiora-terminal/issues/21). It is
+deliberately *not* blamed on #21 either: `WIN-14` creates 3 concurrent sessions, against the
+near-the-16-cap concurrency of every previously recorded occurrence, and the log contained no
+exception code to match. What was actionable is that the failure could not be diagnosed at all, so
+the workflow now dumps Windows event-log entries 1000/1001 on failure, which carry the faulting
+module and the exception code. Details in [Linux containers](docs/validation/linux-containers.md).
 
 The 2 Windows skips are `FI-09` and `FI-10`, held back by the `SENTIORA_FAULT_FILL=0` gate because
 repeatedly filling and draining to the session cap crashes the host — issue
