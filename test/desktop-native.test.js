@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import { createRealBackend, allStrings, drainUntilQuiet } from './helpers/desktop.mjs';
 import { FIXTURE, rawHex } from './helpers/native.mjs';
 import { detectShells, defaultShell } from '../apps/desktop/bridge/shell-catalog.js';
+import { WAIT_POLL_MS } from '../apps/desktop/bridge/protocol.js';
 
 const opts = { timeout: 120000 };
 
@@ -413,8 +414,18 @@ test('U11 a burst far larger than the viewport stays ordered, bounded and faithf
     const subscription = backend.bridge.attach(session.sessionId);
 
     // Sent as several writes rather than one so the output genuinely arrives over
-    // time: a single write could be applied by the emulator in one pass, which
-    // would not exercise coalescing at all.
+    // time: a single write could be applied by the emulator in one pass, which would
+    // not exercise coalescing at all.
+    //
+    // "Over time" is enforced, not hoped for. Coalescing only happens once the pump
+    // has published more frames than maxQueuedFrames (2) while nobody is draining,
+    // and sending the batches back to back leaves that to chance: if all eight land
+    // inside a single pump round trip, the pump publishes one frame and `coalesced`
+    // stays 0. That is exactly how this test failed intermittently on macos-latest
+    // while passing on the commits either side of it -- it was asserting on the
+    // relative speed of producer and consumer, i.e. on machine load (issue #30).
+    // Waiting one poll interval per batch makes each batch its own observation, so
+    // eight frames go into a queue of two by construction.
     const batches = 8;
     const perBatch = 50;
     const total = batches * perBatch;
@@ -424,6 +435,7 @@ test('U11 a burst far larger than the viewport stays ordered, bounded and faithf
         (_, i) => `FLOOD-${String(batch * perBatch + i).padStart(4, '0')}`,
       ).join('\r\n');
       await backend.bridge.type(session.sessionId, `bytes ${Buffer.from(`${payload}\r\n`, 'utf8').toString('hex')}\r`);
+      await new Promise(resolve => setTimeout(resolve, WAIT_POLL_MS));
     }
 
     // The child signals the end of the flood itself. `echo` produces exactly one
@@ -444,6 +456,16 @@ test('U11 a burst far larger than the viewport stays ordered, bounded and faithf
     const frames = await drainUntilQuiet(subscription, { quietMs: 1000, hardMs: 20000 });
     assert.ok(frames.length > 0, 'the consumer must have received frames');
     assert.ok(frames.length < total, `a consumer this slow must not receive a frame per line: ${frames.length}`);
+    // Delivered plus coalesced is how many frames the pump actually published. With
+    // one poll interval of pacing per batch that must be at least `batches`, which is
+    // the precondition for a queue of 2 to overflow at all. Asserting it separately
+    // means a future failure says WHICH half broke -- the pump publishing too few
+    // frames, or the queue failing to coalesce them -- instead of reporting
+    // `coalesced === 0` and leaving the cause to guesswork, which is what the
+    // intermittent version of this test did.
+    const published = frames.length + subscription.coalesced;
+    assert.ok(published >= batches,
+      `the pump published ${published} frames for ${batches} paced batches: the pacing failed, not the queue`);
     // Bounded: with a queue of 2 and hundreds of revision bumps, the excess has to
     // have been coalesced rather than queued. This is the backpressure guarantee.
     assert.ok(subscription.coalesced > 0, 'frames must have been coalesced for a slow consumer');
