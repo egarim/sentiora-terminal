@@ -29,7 +29,9 @@ function archOf(file) {
   if (magic === 0xcafebabe || magic === 0xbebafeca) return 'macho-fat';
 
   if (buf.readUInt32BE(0) === 0x7f454c46) {
-    const machine = buf.readUInt16LE(buf[5] === 1 ? 18 : 18);
+    // e_machine is at offset 18 in both ELF32 and ELF64, so EI_CLASS does not
+    // change where to read.
+    const machine = buf.readUInt16LE(18);
     return ELF_MACHINE[machine] ?? `elf-unknown-0x${machine.toString(16)}`;
   }
 
@@ -40,9 +42,12 @@ const require = createRequire(import.meta.url);
 let pkg;
 try {
   pkg = require('node-pty/package.json');
-} catch {
-  console.log('node-pty is not installed');
-  process.exit(0);
+} catch (error) {
+  // Not a pass. node-pty is a hard dependency, so if it cannot be resolved then
+  // either the install failed or the layout changed, and in both cases the
+  // architecture of the binary that will actually be loaded is unknown.
+  console.error(`node-pty could not be resolved, so no native architecture was verified: ${error.code ?? error.message}`);
+  process.exit(1);
 }
 
 // node-pty's main is ./lib/index.js, so resolving the entry point lands in lib/;
@@ -87,7 +92,15 @@ for (const dir of roots) {
   }
 }
 
-if (found === 0) console.log('  no native binaries found in build/Release or prebuilds/');
+if (found === 0) {
+  // Printing "OK" here would be a false green: a job where node-pty produced no
+  // native binary at all would still report a successful architecture check, which
+  // is precisely the failure this script exists to prevent. Nothing inspected means
+  // nothing verified, so the check fails instead of passing vacuously.
+  console.log('  no native binaries found in build/Release or prebuilds/');
+  console.error('ARCH CHECK INCONCLUSIVE: no native binary was inspected, so no architecture was verified');
+  process.exit(1);
+}
 if (mismatches.length) {
   console.log(`ARCH MISMATCH vs runtime ${process.arch}: ${mismatches.length} file(s)`);
   process.exit(1);
