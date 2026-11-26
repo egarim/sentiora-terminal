@@ -119,6 +119,25 @@ jobs:
         if: failure()
         run: node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform,osRelease:require('os').release(),cpus:require('os').cpus().length},null,2)"
 
+      # The native suites drive ConPTY in-process, so a native crash takes the test
+      # file's own process with it and `node --test` reports only the file as failed:
+      # no exit code, no exception, no faulting module. That is exactly what a
+      # windows-latest/node-24 failure at WIN-14 looked like -- 14 tests passed, the
+      # process died, and the log could not say why, so the cause could not be named.
+      #
+      # The Windows event log does record it. EventID 1000 (Application Error)
+      # carries the faulting module and the exception code, where 0xc0000005 is the
+      # STATUS_ACCESS_VIOLATION that #21 describes, and 1001 carries the WER report.
+      # Capturing it here means the next occurrence is diagnosable from the job log
+      # alone instead of needing a local reproduction. Best effort: it runs only
+      # after a failure and must not be able to fail the job a second time.
+      - name: Windows crash evidence after failure
+        if: failure() && startsWith(matrix.os, 'windows')
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wevtutil qe Application /q:"*[System[(EventID=1000 or EventID=1001)]]" /c:25 /rd:true /f:text
+
   # Issue #28: the matrix above proves the suites pass on a GitHub-hosted ARM64
   # *runner image*. That is not the deployment shape. Vivarium runs sessions inside
   # build containers, which differ in three ways that each break something on their
@@ -131,6 +150,22 @@ jobs:
   # One job, Node 24 only, runtime suites only: the variable under test is the
   # environment, and Node 22 vs 24 on this axis is already covered by the two
   # ubuntu-24.04-arm matrix cells. The desktop app is not a container workload.
+  #
+  # MEASURED, and worth knowing before reading a failure here: this container's
+  # PID 1 is `tail`, which the runner uses to keep the container up and which never
+  # calls wait(). So when FI-05 SIGKILLs the runtime, the runtime's PTY children
+  # lose their master fd, take SIGHUP and exit -- but nobody collects the exit
+  # status, and they stay in the process table as zombies (state Z, ppid 1) for the
+  # life of the container. A runner image does not show this because its PID 1 is
+  # systemd, which reaps.
+  #
+  # That is a property of running without an init, not a defect in this repository:
+  # a SIGKILLed process cannot run cleanup, and it is not the parent of record any
+  # more. FI-05 therefore asserts that nothing is still RUNNING and reports unreaped
+  # exit records separately instead of counting them as leaked processes. The
+  # deployment consequence is real and is documented in
+  # docs/validation/linux-containers.md: run the container with an init
+  # (`docker run --init`, or tini/dumb-init as PID 1) if you intend to kill runtimes.
   container-linux-arm64:
     name: container (debian bookworm arm64, non-root, no TTY)
     runs-on: ubuntu-24.04-arm
