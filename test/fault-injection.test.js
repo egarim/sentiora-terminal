@@ -26,7 +26,7 @@
 //     already carries the #14 fix, so it guards that fix rather than proving it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startRuntime, expectGone, collectSurvivors, untilGone, rpcLine } from './helpers/runtime.mjs';
+import { startRuntime, expectGone, collectSurvivors, untilGone, reap, describePid, describeInit, rpcLine } from './helpers/runtime.mjs';
 import { FIXTURE } from './helpers/native.mjs';
 
 const opts = { timeout: 180000 };
@@ -287,11 +287,20 @@ test('FI-05 killing the runtime outright leaves no orphaned shells', opts, async
     const info = await server.exited();
     assert.ok(info, 'the runtime survived SIGKILL');
 
-    // Reaped before asserting, so a failure cannot leak into the next test.
-    const survivors = await expectGone(pids);
+    // Described BEFORE reaping. expectGone signals survivors as it returns them, and
+    // a process that was running turns into one that is dying, which is precisely the
+    // distinction this test has to report: a leaked running shell and an unreaped
+    // exit record are different defects with different owners.
+    const survivors = await untilGone(pids);
+    const detail = survivors.map(describePid);
+    const pid1 = describeInit();
     console.log(`    FI-05 survivors after SIGKILL of the runtime: ${survivors.length} of ${pids.length} `
-      + `(${process.platform}, exit ${JSON.stringify(info)})`);
-    assert.deepEqual(survivors, [], `killing the runtime orphaned shell pids ${survivors.join(', ')}`);
+      + `(${process.platform}, exit ${JSON.stringify(info)}, pid1 ${JSON.stringify(pid1)})`);
+    if (detail.length) console.log(`    FI-05 survivor detail: ${JSON.stringify(detail)}`);
+    // Reaped before asserting, so a failure cannot leak into the next test.
+    reap(survivors);
+    assert.deepEqual(survivors, [], `killing the runtime orphaned shell pids ${survivors.join(', ')}; `
+      + `kernel state ${JSON.stringify(detail)}; pid1 ${JSON.stringify(pid1)}`);
   } finally {
     if (!server.hasExited) { server.killHard(); await server.exited(10000); }
     await collectSurvivors(pids, 0);
@@ -327,7 +336,19 @@ test('FI-06 a restarted runtime rejects the previous one\'s session ids', opts, 
     // instead of failing in seconds.
     first.killHard();
     await first.exited();
-    if (stalePid !== null) await collectSurvivors([stalePid], 20000);
+    if (stalePid !== null) {
+      // Logged, not asserted: this is a `finally`, where throwing would mask the
+      // failure the test actually came to report. But the wait costs 20s whether or
+      // not anything is printed, so it may as well leave behind the same
+      // live-versus-zombie evidence FI-05 does instead of spending the budget and
+      // reporting nothing. Before this, a container where the orphan never cleared
+      // showed up only as an unexplained 20s in the job timeline.
+      const { survivors } = await collectSurvivors([stalePid], 20000);
+      if (survivors.length) {
+        console.log('    FI-06 orphan still present 20s after SIGKILL of the runtime: '
+          + `${JSON.stringify(survivors.map(describePid))}`);
+      }
+    }
   }
 
   const second = startRuntime();

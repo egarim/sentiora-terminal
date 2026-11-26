@@ -4,6 +4,7 @@
 // the server runs exactly as an agent runs it, so transport loss, abrupt teardown
 // and host crashes can be provoked for real rather than simulated.
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 // Re-exported for callers, and bound locally: `export { x } from '...'` alone
@@ -20,6 +21,71 @@ const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 // so untilGone can be slow rather than immediate there; the budget absorbs that.
 export function alive(pid) {
   try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+}
+
+// Pure, and exported, so it can be verified without a Linux kernel. A mis-parse
+// here would report state null and leave the live-versus-zombie question
+// unanswerable, which is the single thing this diagnostic exists to settle.
+//
+// /proc/<pid>/stat is: pid (comm) state ppid pgrp session tty_nr ...
+// Field 2, comm, is wrapped in parentheses by the kernel and may itself contain
+// spaces and parentheses -- "(Web Content (gpu))" is a real one -- so the split has
+// to key off the LAST ')' rather than the first, and off the space after it.
+export function parseProcStat(text) {
+  const unknown = { comm: null, state: null, ppid: null };
+  if (typeof text !== 'string') return unknown;
+  const open = text.indexOf('(');
+  const close = text.lastIndexOf(')');
+  if (open === -1 || close <= open) return unknown;
+  const rest = text.slice(close + 2).split(' ');
+  const rawPpid = rest[1];
+  return {
+    comm: text.slice(open + 1, close),
+    state: rest[0] || null,
+    // Rejecting anything that is not plain digits keeps a truncated or unexpected
+    // read from being reported as ppid 0, which would look like a kernel thread.
+    ppid: /^\d+$/.test(rawPpid ?? '') ? Number(rawPpid) : null,
+  };
+}
+
+// Reads what the kernel actually records about a pid, rather than inferring liveness
+// from whether kill(pid, 0) throws. The two are not the same question: kill(pid, 0)
+// succeeds for a zombie, so `alive` cannot tell a shell that is still running from
+// one that exited and was never reaped -- and those are opposite conclusions, one a
+// leaked process and one a leaked pid-table entry.
+//
+// This matters for FI-05, which SIGKILLs the runtime and so runs no cleanup code at
+// all. Whether its children vanish then depends on whether PID 1 of the pid
+// namespace reaps orphans. A normal runner image runs systemd, which does; a plain
+// container has no init and does not, so exited children stay visible as `Z` forever.
+// `state` distinguishes R/S/D (running) from Z (exited, unreaped), and `ppid === 1`
+// confirms the reparenting that makes PID 1 the responsible reaper.
+//
+// Best effort by design: on platforms without /proc the fields stay null and the
+// caller still has killSaysAlive. Never throws, because it is called from failure
+// paths and from `finally`.
+export function describePid(pid) {
+  const info = { pid, killSaysAlive: alive(pid), state: null, ppid: null, comm: null };
+  if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return info;
+  try {
+    const parsed = parseProcStat(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+    info.state = parsed.state;
+    info.ppid = parsed.ppid;
+    info.comm = parsed.comm;
+  } catch { /* already gone, or not readable by this user */ }
+  return info;
+}
+
+// PID 1 of the current pid namespace, so a log says which process was responsible
+// for reaping orphans instead of leaving the reader to guess the environment. On
+// platforms without /proc this says so rather than printing nulls that could be
+// mistaken for "PID 1 was probed and had no name".
+export function describeInit() {
+  if (process.platform !== 'linux') {
+    return { pid: 1, comm: null, state: null, note: `no /proc on ${process.platform}` };
+  }
+  const init = describePid(1);
+  return { pid: 1, comm: init.comm, state: init.state, note: null };
 }
 
 // A pid this helper cannot probe is a bug in the caller, not evidence of a clean
