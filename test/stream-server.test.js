@@ -16,7 +16,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import xterm from '@xterm/headless';
 import { startRuntime } from './helpers/runtime.mjs';
-import { replayRecording } from '../src/recording.js';
+import { replayRecording, SESSION_SCROLLBACK } from '../src/recording.js';
 import { FIXTURE } from './helpers/native.mjs';
 
 const { Terminal } = xterm;
@@ -87,7 +87,7 @@ const outputText = events => Buffer.concat(
 // Replays recorded bytes through a real emulator built with the same options
 // src/server.js uses, so the comparison against observe() is like for like.
 async function replayBytes(buffer, cols, rows) {
-  const terminal = new Terminal({ cols, rows, scrollback: 2000, allowProposedApi: true });
+  const terminal = new Terminal({ cols, rows, scrollback: SESSION_SCROLLBACK, allowProposedApi: true });
   try {
     await new Promise(resolve => terminal.write(buffer, resolve));
     const b = terminal.buffer.active;
@@ -367,7 +367,11 @@ test('STR-07 a small cap truncates, stays bounded, and tells a stale watcher to 
 
     const { result: recording } = await server.call('terminal.recording', { sessionId, owner });
     assert.equal(recording.truncated, true, 'the cap must have been hit');
-    assert.ok(recording.bytes <= 4096 + 512, `retained ${recording.bytes} bytes against a 4096 cap`);
+    // No slack here. The re-anchoring snapshot a 60x20 screen produces is ~1.3 KB,
+    // well inside a 4 KiB cap, so the bound is the cap exactly. The "cap plus one
+    // viewport" case only bites when the cap is smaller than a viewport, and REC-20
+    // covers that; padding this assertion to hide it would hide it here too.
+    assert.ok(recording.bytes <= 4096, `retained ${recording.bytes} bytes against a 4096 cap`);
     assert.ok(recording.droppedEvents > 0, 'what was dropped must be reported, not silent');
 
     // The stale watcher is told it missed data and handed a current screen, rather
@@ -400,7 +404,11 @@ test('STR-07 a small cap truncates, stays bounded, and tells a stale watcher to 
 test('STR-08 a watcher that never polls does not stall the session or grow the record', opts, async () => {
   const server = startRuntime();
   try {
-    const created = await server.create(spawnFixture({ recordBytes: 8192 }));
+    // Cap comfortably above what 30 commands produce, so nothing truncates and the
+    // assertions below are about the producer rather than about the ring's bounds.
+    // Bounding under pressure is STR-07's job; conflating the two is what made the
+    // previous version of this test assert something it could not guarantee.
+    const created = await server.create(spawnFixture({ recordBytes: 65536 }));
     const { sessionId, owner } = created;
     await server.waitScreen(sessionId, 'FIXTURE READY');
 
@@ -408,19 +416,26 @@ test('STR-08 a watcher that never polls does not stall the session or grow the r
     // half of "a slow watcher does not slow the program" that a polling design has
     // to prove, because there is no back-pressure to hide behind.
     for (let i = 0; i < 30; i += 1) await sendCommand(server, sessionId, owner, `echo unwatched-${i}`);
-    const observed = await server.waitScreen(sessionId, 'ECHO:unwatched-29');
-    // NOT asserting the marker again: waitScreen only returns once the screen
-    // contains it, so re-checking it asserts nothing -- which is what this test
-    // originally did. What is worth asserting is that all 30 commands were rendered
-    // rather than only the last one, since each accepted input bumps the revision.
-    // A producer that STALLED is caught separately, by waitScreen exceeding its own
-    // budget and throwing. That, not a wall-clock threshold, is the "does not slow
-    // the program" half: a timing assertion here would be a guess about runner load,
-    // which is how WIN-02 became a flake (#30).
-    assert.ok(observed.revision >= 30, `revision ${observed.revision} after 30 typed commands`);
+    await server.waitScreen(sessionId, 'ECHO:unwatched-29');
 
     const { result: recording } = await server.call('terminal.recording', { sessionId, owner });
-    assert.ok(recording.bytes <= 8192 + 512, `an unwatched session must stay bounded, retained ${recording.bytes}`);
+    assert.equal(recording.droppedEvents, 0, 'this cap must not truncate, or the assertions below are not about the producer');
+    const retained = Buffer.concat(
+      recording.events.filter(e => e.kind === 'output').map(e => Buffer.from(e.data, 'base64')),
+    ).toString('latin1');
+    // Output-dependent, which the assertion this replaces was not. `revision >= 30`
+    // is guaranteed by the 30 accepted terminal.type calls alone -- input() bumps the
+    // revision itself -- so it passed even if every byte of output had been dropped:
+    // the same tautology class as the waitScreen assertion before it. Both ends of the
+    // run must be in the record, so a producer that shed output cannot pass.
+    //
+    // The "does not STALL" half is carried by waitScreen above exceeding its own
+    // budget and throwing. There is deliberately no wall-clock threshold here: on a
+    // shared runner that is a guess about machine load, which is how WIN-02 became a
+    // flake (#30).
+    assert.ok(retained.includes('ECHO:unwatched-0'), 'the first unwatched command must be in the record');
+    assert.ok(retained.includes('ECHO:unwatched-29'), 'and so must the last');
+    assert.ok(recording.bytes <= 65536, `an unwatched session must stay bounded, retained ${recording.bytes}`);
   } finally {
     await server.stop();
   }
@@ -432,17 +447,25 @@ test('STR-09 streaming an exited session reports the exit and does not hang', op
     const created = await server.create(spawnFixture());
     const { sessionId, owner } = created;
     await server.waitScreen(sessionId, 'FIXTURE READY');
+    // Attach BEFORE the exit. An attach returns a snapshot and a cursor at the end of
+    // the ring, so attaching afterwards can hand back a cursor already past the exit
+    // event, and the loop below would then wait out its whole deadline for an event
+    // that will never be re-delivered -- reporting "must settle, not block" and
+    // misdiagnosing a test bug as a product hang. Whether it fires depends on the
+    // child exiting and being recorded before the first stream call lands, so it is
+    // exactly the platform-dependent race this file was fixed for elsewhere.
+    const { result: attach } = await server.call('terminal.stream', { sessionId, afterSequence: 0, timeoutMs: 200 });
     await sendCommand(server, sessionId, owner, 'exit 3');
 
     // waitScreen cannot help here: the child is going away. Poll the stream, which
     // is the thing under test, and let its own timeout bound the wait.
     //
-    // With an ADVANCING cursor, as a consumer uses. The first response is the attach
-    // snapshot and carries no events by design, so breaking out on `running === false`
-    // at that point would assert on an empty event list and report that the exit was
-    // never recorded when it simply had not been asked for yet.
+    // With an ADVANCING cursor, as a consumer does. A snapshot response carries no
+    // events by design, so breaking out on `running === false` at that point would
+    // assert on an empty event list and report that the exit was never recorded when
+    // it simply had not been asked for yet.
     const deadline = Date.now() + 20000;
-    let cursor = 0;
+    let cursor = attach.nextSequence;
     let exit = null;
     let last = null;
     for (;;) {

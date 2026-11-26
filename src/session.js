@@ -87,14 +87,20 @@ export class Session {
     const t=this.terminal,b=t.buffer.active;
     return {cols:t.cols,rows:t.rows,cursor:{x:b.cursorX,y:b.cursorY},screen:Array.from({length:t.rows},(_,i)=>b.getLine(b.baseY+i)?.translateToString(true)??'').join('\n')};
   }
-  async observe(){
-    await this.pending;
+  // The full observation, synchronously. observe() is this after awaiting the write
+  // chain; stream() needs it WITHOUT a second await, because every await is a point
+  // where another request's continuation can run and change what gets reported.
+  observationSync(){
     const snap=this.screenSnapshot();
     // Field order is deliberately identical to the pre-#27 response. Nothing in tree
     // depends on it, but "no existing method changed shape" ought to hold at the
     // serialised-byte level and not only in the field-set sense, so a client
     // comparing responses sees no difference at all.
     return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,cols:snap.cols,rows:snap.rows,writeErrors:this.writeErrors,renderErrors:this.renderErrors,cursor:snap.cursor,screen:snap.screen,idleMilliseconds:Date.now()-this.lastActivity};
+  }
+  async observe(){
+    await this.pending;
+    return this.observationSync();
   }
   async input({owner,revision,text}){
     await this.pending;
@@ -136,29 +142,33 @@ export class Session {
     if(!Number.isSafeInteger(cursor)||cursor<0)throw Error('Invalid sequence');
     if(!Number.isFinite(timeout)||timeout<0)throw Error('Invalid stream');
     await this.pending;
-    const base=()=>({
-      sessionId:this.id,state:this.state,running:!this.exit&&!this.closed,exit:this.exit,
-      oldestSequence:this.recording.oldestSequence,
-      truncated:this.recording.truncated,droppedEvents:this.recording.droppedEvents,
-      inputRecorded:this.recording.inputRecorded,
-    });
     // Falling behind the ring is reported rather than papered over: a gap-free
     // replay from a stale cursor is impossible.
     const resync=this.recording.missedEvents(cursor);
-    // A snapshot response carries NO events, and nextSequence is the ring position
-    // the snapshot was taken at. Returning both would be self-contradictory: the
-    // snapshot is produced after the events would have been selected, so it already
-    // contains them, while a cursor pointing at the last returned event tells the
-    // consumer to apply them a second time. One snapshot, one cursor, no overlap.
-    // It also means an attach or a resync answers immediately instead of waiting out
-    // timeoutMs for events the caller has no use for.
+    // A snapshot response carries NO events, and nextSequence is the ring position the
+    // snapshot was taken at. Returning both would be self-contradictory: the snapshot
+    // already accounts for those bytes, so a consumer that rendered it and then
+    // applied the events would paint that output twice. One snapshot, one cursor, no
+    // overlap. It also means an attach or a resync answers immediately instead of
+    // waiting out timeoutMs for events the caller has no use for.
     if(cursor===0||resync){
-      const snapshot=await this.observe();
-      // Read after the observation resolves: the write chain records each chunk as it
-      // is rendered, so once observe() has settled, the ring holds everything the
-      // snapshot shows and this cursor is exactly the snapshot's position.
+      // The screen, the ring position and the lifecycle fields are all read in ONE
+      // synchronous block, with no await between them. That is load-bearing rather
+      // than tidy: resize() records outside the emulator write chain, so when its
+      // continuation is queued on the same `pending` it can run between an awaited
+      // screen read and a later cursor read. The consumer would then get a
+      // pre-resize snapshot with a cursor PAST the resize event it is never given --
+      // permanent geometry divergence, silently. The first version of this did
+      // `await this.observe()` and then read latestSequence, which is exactly that.
+      const snapshot=this.observationSync();
       const at=this.recording.latestSequence;
-      return {...base(),resync,revision:snapshot.revision,snapshot,events:[],nextSequence:at,latestSequence:at};
+      return {
+        sessionId:this.id,state:snapshot.state,running:snapshot.running,exit:snapshot.exit,
+        oldestSequence:this.recording.oldestSequence,
+        truncated:this.recording.truncated,droppedEvents:this.recording.droppedEvents,
+        inputRecorded:this.recording.inputRecorded,
+        resync,revision:snapshot.revision,snapshot,events:[],nextSequence:at,latestSequence:at,
+      };
     }
     let selected=this.recording.eventsAfter(cursor,{includeInput:false});
     // Waiting reuses the same waiter set as wait(), so a stream poll is woken by the
@@ -173,7 +183,12 @@ export class Session {
     }
     const events=selected.events;
     // Never the owner token: a watcher must not be able to type. Pinned by test.
-    return {...base(),resync:false,revision:this.revision,snapshot:null,events,
+    return {
+      sessionId:this.id,state:this.state,running:!this.exit&&!this.closed,exit:this.exit,
+      oldestSequence:this.recording.oldestSequence,
+      truncated:this.recording.truncated,droppedEvents:this.recording.droppedEvents,
+      inputRecorded:this.recording.inputRecorded,
+      resync:false,revision:this.revision,snapshot:null,events,
       nextSequence:events.length?events[events.length-1].seq:cursor,
       latestSequence:this.recording.latestSequence};
   }

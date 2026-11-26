@@ -81,7 +81,7 @@ described in §4.
 | `console_list()` | `terminal.list {}` | Returns full observations, not summaries. |
 | `IConsoleSession.IsAlive` | `observe().running`, or `state` | `state` distinguishes `exited` from `released`, which `running` alone does not. |
 | `IConsoleSession.Shell` | *(not exposed)* | Sentiora does not echo the command back. The adapter must remember what it asked for. |
-| raw-output callback (constructor) | *(no equivalent)* | **Semantic mismatch** — see §4. |
+| raw-output callback (constructor) | `terminal.stream {sessionId, afterSequence}` | **Poll, not push** — the bytes are available (issue #27) but the adapter must run a loop per session; see §4. |
 | Ctrl-C | `terminal.key {key:"CtrlC"}` or `terminal.type {text:"\x03"}` | Same byte; mode-dependent outcome — see §6. |
 
 `terminal.create` returns `{sessionId, owner, pid, state, revision, running, exit, cols, rows,
@@ -327,7 +327,8 @@ internal sealed class SentioraConsoleSession : IConsoleSession
 }
 ```
 
-Deliberately excluded from the smallest contract: the raw-output callback (§4), a Sentiora-side
+Deliberately excluded from the smallest contract: the raw-output callback (§4 — reachable via
+`terminal.stream` since issue #27, but not needed for `console_read` semantics), a Sentiora-side
 redaction policy (§11), and host pooling past the 16-session cap (§7). Each is a separate decision.
 
 ## 13. What must be true before this is built
@@ -336,7 +337,11 @@ redaction policy (§11), and host pooling past the 16-session cap (§7). Each is
       **done**, run [`45479968125`](https://github.com/egarim/sentiora-terminal/actions/runs/45479968125):
       all 8 matrix jobs green (ubuntu, windows x64, windows ARM64, macOS ARM64 × Node 22 and 24).
       #67's precondition "only after native CI is verified" is satisfied.
-- [ ] Decide the raw-output-callback question (§4); it is the only true semantic mismatch.
+      *Now historical:* the matrix has since grown to 17 jobs, adding Linux ARM64 and a Debian
+      container — see [Linux containers](../validation/linux-containers.md) for current counts.
+- [ ] Decide whether the adapter should drive Telekinesis's raw-output callback from
+      `terminal.stream` (§4). No longer a semantic mismatch — the bytes are available as of issue #27
+      — but still a design choice: it means one polling loop per session instead of screen diffs.
 - [ ] Decide where redaction lives (§11.2).
 - [ ] Confirm the 16-session cap and the ~495-session ceiling are acceptable, or add host pooling
       and recycling.

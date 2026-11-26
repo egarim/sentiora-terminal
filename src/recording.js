@@ -28,6 +28,15 @@ export const RESPONSE_BYTES_LIMIT = 1 << 18;
 // Charged against the limit for every event, so that the cap bounds event COUNT and
 // not only payload bytes. See #cost.
 export const RECORD_EVENT_OVERHEAD = 64;
+// Scrollback for a session's emulator, and the value replay must use to match it.
+// One constant, imported by src/server.js, precisely because the two have to agree:
+// scrollback changes what a resize puts in the viewport, since a live session with
+// history can surface scrolled-off lines into newly added rows while a replay with
+// none fills them with blanks. With the two disagreeing, "a recording played back
+// ends in the same screen" holds only until the session scrolls and is then resized.
+// A consumer rendering at a different scrollback should pass its own to
+// replayRecording.
+export const SESSION_SCROLLBACK = 2000;
 
 // Monotonic clock for event timestamps. Injected in tests so ordering and elapsed
 // times can be asserted exactly instead of slept through.
@@ -83,12 +92,13 @@ export class Recording {
     // exact, only non-zero, so that the limit bounds events as well as bytes.
     const overhead = RECORD_EVENT_OVERHEAD;
     if (event.kind === 'output' || event.kind === 'input') return overhead + event.data.length;
-    // A snapshot carries up to a whole viewport of screen text (~45 KB at 300x150),
-    // so charging it the flat overhead alone made `bytes` understate what was really
-    // retained. It is charged in full. Note the consequence: because a snapshot is
-    // appended *after* the ring is cleared and cannot itself be dropped without
-    // destroying replay fidelity, the true bound is the limit plus at most one
-    // viewport, not the limit exactly.
+    // A snapshot carries up to a whole viewport of screen text (~45 KB at the
+    // 300x150 ceiling dimensions() allows), so charging it the flat overhead alone
+    // made `bytes` understate what was really retained. It is charged in full. Note
+    // the consequence: truncation zeroes `bytes` and *then* appends the snapshot, and
+    // a snapshot cannot be dropped without destroying replay fidelity, so the
+    // reachable maximum is max(limit, one snapshot) -- not `limit`, and not
+    // `limit + one viewport` as an earlier revision of this comment claimed.
     if (event.kind === 'snapshot') return overhead + (typeof event.screen === 'string' ? event.screen.length : 0);
     return overhead;
   }
@@ -105,10 +115,15 @@ export class Recording {
   #enforceLimit() {
     // The guard is load-bearing, not defensive. Truncation re-enters #append to store
     // the re-anchoring snapshot, and a snapshot is charged its screen text -- up to
-    // ~45 KB at 300x150 -- so with a small limit the snapshot alone can exceed the
-    // cap. Without #truncating that would clear the ring, append another snapshot,
-    // exceed the cap again, and recurse until the stack went. No minimum limit can
-    // prevent it, because no fixed floor bounds a viewport.
+    // ~45 KB at the 300x150 ceiling -- so with a small limit the snapshot alone can
+    // exceed the cap. Without #truncating that would clear the ring, append another
+    // snapshot, exceed the cap again, and recurse until the stack went.
+    //
+    // A sufficiently high minimum limit would also prevent this, since dimensions()
+    // caps the viewport at 300x150 and therefore bounds any single snapshot; an
+    // earlier comment here claimed otherwise, which was wrong. The guard is used
+    // instead because it holds for *every* accepted limit and does not force a ~46 KB
+    // floor on a caller that legitimately wants a small ring.
     if (this.bytes <= this.limit || this.#truncating) return;
     this.#truncating = true;
     try {
@@ -208,15 +223,19 @@ export class Recording {
 // The Terminal is injected: this module must not import @xterm/headless itself, or
 // replaying a recording would depend on the runtime's emulator rather than on
 // whatever the consumer uses to render it.
-export async function replayRecording({ events, cols, rows, Terminal }) {
-  const terminal = new Terminal({ cols, rows, scrollback: 0, allowProposedApi: true });
+export async function replayRecording({ events, cols, rows, Terminal, scrollback = SESSION_SCROLLBACK }) {
+  const terminal = new Terminal({ cols, rows, scrollback, allowProposedApi: true });
   const write = data => new Promise(resolve => terminal.write(data, resolve));
   try {
     for (const event of events) {
       switch (event.kind) {
         case 'snapshot': {
-          // A snapshot is the truncation boundary: it replaces everything before it,
-          // so replay starts from it rather than trying to merge it with prior output.
+          // A snapshot states what the WHOLE screen was at that instant, so replay
+          // has to replace the screen rather than overprint it. Normally a snapshot
+          // is the first event and there is nothing to replace, but the stream can
+          // also deliver one mid-list at a truncation boundary: a cursor of exactly
+          // oldestSequence - 1 is not "stale", so it is served as ordinary events
+          // rather than as a resync.
           if (typeof event.screen !== 'string') {
             // Throwing rather than skipping, for the same reason an unknown kind
             // throws: replay cannot proceed without the screen, and continuing would
@@ -226,12 +245,18 @@ export async function replayRecording({ events, cols, rows, Terminal }) {
           // Geometry first. A resize from before the truncation was dropped with the
           // prefix, so the snapshot's own cols/rows are the only surviving record of
           // the shape this screen was rendered in; writing it into the session's
-          // initial geometry would wrap and scroll it into something else.
+          // initial geometry would wrap and scroll it into something else. Bounded by
+          // the same ceiling dimensions() enforces, because a recording is data a
+          // consumer may have read back off disk and terminal.resize would otherwise
+          // allocate whatever it claims.
           if (Number.isInteger(event.cols) && Number.isInteger(event.rows)
             && event.cols >= 2 && event.rows >= 2
+            && event.cols <= 300 && event.rows <= 150
             && (event.cols !== terminal.cols || event.rows !== terminal.rows)) {
             terminal.resize(event.cols, event.rows);
           }
+          // Erase the viewport and the scrollback, then home, before writing the text.
+          await write('\x1b[2J\x1b[3J\x1b[H');
           await write(event.screen.replace(/\n/g, '\r\n'));
           // Then the cursor, and this is not cosmetic. Writing the viewport text
           // leaves the cursor on the last row, but the live cursor was wherever the

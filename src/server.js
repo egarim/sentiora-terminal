@@ -5,6 +5,7 @@ import {realpathSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {Session,dimensions} from './session.js';
 import {sessionEnv,envValidationError} from './env.js';
+import {SESSION_SCROLLBACK} from './recording.js';
 const {Terminal}=xterm;
 export const sessions=new Map();
 export const SESSION_LIMIT=16;
@@ -72,7 +73,7 @@ async function createSession(p){
   // that quoted the offending entry would leak the secret it was rejecting into a
   // JSON-RPC response and every log downstream of it.
   const envError=envValidationError(env);if(envError)throw Error(envError);
-  const terminal=new Terminal({cols,rows,scrollback:2000,allowProposedApi:true});
+  const terminal=new Terminal({cols,rows,scrollback:SESSION_SCROLLBACK,allowProposedApi:true});
   let child;
   try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:sessionEnv(env),useConptyDll:conptyDll??conptyDllDefault});}
   catch(e){terminal.dispose();throw e;}

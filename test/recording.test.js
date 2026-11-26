@@ -11,16 +11,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import xterm from '@xterm/headless';
-import { Recording, replayRecording, RECORD_EVENT_OVERHEAD } from '../src/recording.js';
+import { Recording, replayRecording, RECORD_EVENT_OVERHEAD, SESSION_SCROLLBACK } from '../src/recording.js';
 
 const { Terminal } = xterm;
 
 // A real headless emulator, not a mock: replay's entire claim is that feeding the
 // recorded bytes back through a terminal reproduces the screen, and asserting that
-// against a stub would test the stub. scrollback 0 keeps the comparison to the
-// visible viewport, which is what screen text can express.
+// against a stub would test the stub. Scrollback matches the value src/server.js
+// constructs session terminals with, because comparing against a different scrollback
+// would make any resize-after-scroll divergence look like a replay bug.
 function emulator(cols = 20, rows = 6) {
-  const terminal = new Terminal({ cols, rows, scrollback: 0, allowProposedApi: true });
+  const terminal = new Terminal({ cols, rows, scrollback: SESSION_SCROLLBACK, allowProposedApi: true });
   const write = data => new Promise(resolve => terminal.write(data, resolve));
   const screen = () => {
     const b = terminal.buffer.active;
@@ -196,6 +197,16 @@ test('REC-10 a truncated recording replays to the same screen AND cursor as an i
   assert.equal(small.truncated, true, 'the small ring must have truncated or this test proves nothing');
   assert.ok(small.bytes <= 512, `retained ${small.bytes} bytes against a 512 cap`);
   assert.deepEqual(snapshotOf(live).cursor, expectedCursor, 'both emulators saw the same input');
+  // The precondition that actually matters is the BOUNDARY snapshot's cursor, not the
+  // final one. If truncation lands so that the boundary cursor sits on the last row,
+  // writing the viewport text leaves the replay cursor in the same place and this test
+  // passes without exercising the restore at all -- which is how the original version
+  // of it went vacuous. Asserting the final cursor only was diagnostic by arithmetic
+  // luck, so assert the one that drives the behaviour.
+  const boundary = small.eventsAfter(0).events[0];
+  assert.equal(boundary.kind, 'snapshot');
+  assert.ok(boundary.cursor.y < 5,
+    `boundary snapshot cursor must be above the last row to be diagnostic, got ${JSON.stringify(boundary.cursor)}`);
   live.terminal.dispose();
 
   const intact = await replayRecording({ events: full.eventsAfter(0).events, cols: 20, rows: 6, Terminal });
@@ -356,4 +367,67 @@ test('REC-20 survives a snapshot larger than the whole limit instead of overflow
   assert.ok(r.bytes <= 1024 + screen.length + RECORD_EVENT_OVERHEAD,
     `retained ${r.bytes} bytes, over the cap-plus-one-viewport bound`);
   assert.ok(r.droppedEvents > 0);
+});
+
+test('REC-21 a snapshot arriving mid-list replaces the screen rather than overprinting it', async () => {
+  // The stream can deliver a truncation snapshot INSIDE `events`, not only in the
+  // top-level snapshot field: a cursor of exactly oldestSequence - 1 is not stale, so
+  // the boundary is served as an ordinary event with resync false. A consumer's
+  // emulator already holds content by then, so replay must clear it -- otherwise the
+  // snapshot's text is written wherever the cursor happens to be and the result is a
+  // merge of two screens that matches neither.
+  const events = [
+    { seq: 1, kind: 'output', data: Buffer.from('STALE-STALE-STALE\r\n', 'utf8').toString('base64') },
+    { seq: 2, kind: 'snapshot', screen: 'fresh-a\nfresh-b', cols: 20, rows: 4, cursor: { x: 7, y: 1 } },
+    { seq: 3, kind: 'output', data: Buffer.from('!', 'utf8').toString('base64') },
+  ];
+  const replayed = await replayRecording({ events, cols: 20, rows: 4, Terminal });
+  const rows = replayed.screen.split('\n');
+  assert.equal(rows[0].trimEnd(), 'fresh-a', 'the pre-snapshot output must be gone, not merged');
+  assert.equal(rows[1].trimEnd(), 'fresh-b!', 'and later output applies at the restored cursor');
+  assert.ok(!replayed.screen.includes('STALE'), 'no part of the replaced screen may survive');
+});
+
+test('REC-22 ignores a snapshot geometry outside the limits the runtime enforces', async () => {
+  // A recording is data a consumer may have read back off disk, so its cols and rows
+  // are untrusted input. dimensions() caps a live session at 300x150; replay applies
+  // the same ceiling instead of letting a corrupt or hostile file drive terminal.resize
+  // into an enormous allocation.
+  const events = [
+    { seq: 1, kind: 'snapshot', screen: 'x', cols: 200000, rows: 200000, cursor: { x: 0, y: 0 } },
+  ];
+  const replayed = await replayRecording({ events, cols: 20, rows: 6, Terminal });
+  assert.equal(replayed.cols, 20, 'an out-of-range snapshot geometry must be ignored');
+  assert.equal(replayed.rows, 6, 'an out-of-range snapshot geometry must be ignored');
+});
+
+test('REC-23 replay matches the live emulator after scrolling and then growing the viewport', async () => {
+  // Scrollback is the reason replay cannot use a different value from the session.
+  // Once content has scrolled off, growing rows makes a live terminal with history
+  // surface old lines into the new rows, while a replay with none fills them with
+  // blanks -- so the two diverge on exactly the "played back ends in the same screen"
+  // criterion. Scrollback is now a shared constant rather than two literals.
+  const emu = new Terminal({ cols: 20, rows: 4, scrollback: SESSION_SCROLLBACK, allowProposedApi: true });
+  const write = data => new Promise(resolve => emu.write(data, resolve));
+  const r = new Recording({ cols: 20, rows: 4, snapshotProvider: () => {
+    const b = emu.buffer.active;
+    return {
+      screen: Array.from({ length: emu.rows }, (_, i) => b.getLine(b.baseY + i)?.translateToString(true) ?? '').join('\n'),
+      cols: emu.cols, rows: emu.rows, cursor: { x: b.cursorX, y: b.cursorY },
+    };
+  } });
+  const chunks = [];
+  for (let i = 0; i < 40; i += 1) chunks.push(`row-${String(i).padStart(2, '0')}\r\n`);
+  for (const c of chunks) { await write(c); r.recordOutput(c); }
+  // Grow the viewport AFTER scrolling: the live terminal can pull history back into
+  // the new rows, which is the divergence this pins.
+  emu.resize(20, 8);
+  r.recordResize(20, 8);
+  const b = emu.buffer.active;
+  const expected = Array.from({ length: emu.rows }, (_, i) => b.getLine(b.baseY + i)?.translateToString(true) ?? '').join('\n');
+  emu.dispose();
+
+  const replayed = await replayRecording({ events: r.eventsAfter(0).events, cols: 20, rows: 4, Terminal });
+  assert.equal(replayed.rows, 8, 'the recorded resize must be applied');
+  assert.equal(replayed.screen, expected, 'replay must match the live screen after scroll-then-grow');
 });
