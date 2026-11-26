@@ -7,11 +7,48 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # windows-latest is x64 and windows-11-arm is ARM64; keeping both makes
-        # the two architectures independently visible instead of assuming the
-        # x64 result speaks for ARM64.
-        os: [ubuntu-latest, windows-latest, windows-11-arm, macos-latest]
+        # windows-latest is x64 and windows-11-arm is ARM64; macos-latest is arm64
+        # (Apple silicon) and ubuntu-24.04-arm is Linux ARM64. Keeping both
+        # architectures on both Windows and Linux makes the two independently visible
+        # instead of assuming the x64 result speaks for ARM64.
+        #
+        # ubuntu-24.04-arm was added for issue #28: Vivarium runs sessions inside
+        # build containers whose Docker engine reports linux/arm64, so that is the
+        # architecture a real deployment uses, and it was previously untested.
+        #
+        # Still NOT covered, so nothing may claim it: macOS x64. macos-latest is
+        # arm64 and there is no macos-13 job, leaving Intel macOS unverified.
+        #
+        # expectArch/expectPlatform are what each label is supposed to select, and
+        # the "Assert the runtime environment" step compares them against what Node
+        # actually observes. That assertion -- not the binary check below -- is what
+        # makes an ARM64 claim safe: report-native-arch.mjs compares each binary
+        # against process.arch, so an x64 machine serving an arm64 label would
+        # produce x64 binaries under an x64 runtime, pass that check, and still be
+        # reported as ARM64 coverage. Only checking process.arch itself closes that.
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-latest
         node: [22, 24]
+        include:
+          - os: ubuntu-latest
+            expectArch: x64
+            expectPlatform: linux
+          - os: ubuntu-24.04-arm
+            expectArch: arm64
+            expectPlatform: linux
+          - os: windows-latest
+            expectArch: x64
+            expectPlatform: win32
+          - os: windows-11-arm
+            expectArch: arm64
+            expectPlatform: win32
+          - os: macos-latest
+            expectArch: arm64
+            expectPlatform: darwin
     runs-on: ${{ matrix.os }}
     # A hanging native test must fail the job instead of running to the six hour
     # account limit: before the session teardown fix, the Windows job hung for
@@ -25,6 +62,9 @@ jobs:
 
       - name: Record runtime
         run: node -p "'node '+process.version+' arch='+process.arch+' platform='+process.platform+' abi='+process.versions.modules"
+
+      - name: Assert the runtime environment
+        run: node scripts/assert-runtime-env.mjs --expect-arch=${{ matrix.expectArch }} --expect-platform=${{ matrix.expectPlatform }}
 
       # npm ci refuses to run unless package-lock.json matches package.json, so a
       # dependency drift fails the build instead of silently testing something else.
@@ -46,6 +86,8 @@ jobs:
           node --check src/server.js
           node --check src/session.js
           node --check src/env.js
+          node --check scripts/report-native-arch.mjs
+          node --check scripts/assert-runtime-env.mjs
 
       # Mocked, native and server suites run as separate steps so a failure is
       # attributable to one layer instead of hiding inside a single "npm test".
@@ -102,17 +144,259 @@ jobs:
         if: failure()
         run: node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform,osRelease:require('os').release(),cpus:require('os').cpus().length},null,2)"
 
+      # The native suites drive ConPTY in-process, so a native crash takes the test
+      # file's own process with it and `node --test` reports only the file as failed:
+      # no exit code, no exception, no faulting module. That is what a
+      # windows-latest/node-24 failure at WIN-14 looked like, and the log could not
+      # say why, so the cause could not be named.
+      #
+      # The Windows event log does record it: the `Application Error` provider logs
+      # EventID 1000 ("Application Crashing Events") with the faulting application,
+      # the faulting module and the exception code, where 0xc0000005 is the
+      # STATUS_ACCESS_VIOLATION that #21 describes.
+      #
+      # Two filters that are not optional, both learned by running the first version
+      # of this step and reading what it actually produced:
+      #
+      #   - PROVIDER. Querying EventID 1000/1001 alone returned four
+      #     Microsoft-Windows-LoadPerf performance-counter messages and no crash
+      #     record, because LoadPerf reuses those ids for something unrelated. That
+      #     reproduced the observability failure this step was added to fix.
+      #   - TIME. `Windows Error Reporting` EventID 1001 was then tried and returned
+      #     fifteen LiveKernelEvent and BlueScreen records dating back months, each
+      #     with a multi-line dump listing -- enough to bury a real crash. Restricting
+      #     to the last hour also stops a stale event left on the runner image from
+      #     being read as this job's.
+      #
+      # An empty result is reported explicitly rather than printing nothing, because
+      # "no crash event" and "the step did not run" must be distinguishable, and
+      # because a timeout leaves no crash event at all -- ST14-05, the other recorded
+      # #21 signature, is exactly that case and produced none.
+      #
+      # Verified locally on both branches: the time-bounded query on a machine whose
+      # newest crash was two days old printed the explicit no-crash line, while the
+      # same query unbounded returned eight historical crashes with faulting module
+      # and exception code.
+      #
+      # Best effort: it runs only after a failure and must not fail the job twice.
+      - name: Windows crash evidence after failure
+        if: failure() && startsWith(matrix.os, 'windows')
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $q = "*[System[Provider[@Name='Application Error'] and (EventID=1000) and TimeCreated[timediff(@SystemTime) <= 3600000]]]"
+          $out = & wevtutil qe Application "/q:$q" /c:15 /rd:true /f:text 2>&1
+          if ($out) { $out } else { 'no Application Error event in the last hour: this failure was not a process crash (a timeout produces no such event)' }
+
+  # Issue #28: the matrix above proves the suites pass on a GitHub-hosted ARM64
+  # *runner image*. That is not the deployment shape. Vivarium runs sessions inside
+  # build containers, which differ in three ways that each break something on their
+  # own: no compiler toolchain, a non-root user whose HOME is not /root, and no
+  # controlling terminal. This job runs the runtime suites inside a plain
+  # debian:bookworm-slim container on linux/arm64 and *asserts* those conditions
+  # rather than assuming them, because an assumption here is indistinguishable from
+  # not testing it.
+  #
+  # One job, Node 24 only, runtime suites only: the variable under test is the
+  # environment, and Node 22 vs 24 on this axis is already covered by the two
+  # ubuntu-24.04-arm matrix cells. The desktop app is not a container workload.
+  #
+  # MEASURED, and worth knowing before reading a failure here: this container's
+  # PID 1 is `tail`, which the runner uses to keep the container up and which never
+  # calls wait(). So when FI-05 SIGKILLs the runtime, the runtime's PTY children
+  # lose their master fd, take SIGHUP and exit -- but nobody collects the exit
+  # status, and they stay in the process table as zombies (state Z, ppid 1) for the
+  # life of the container. A runner image does not show this because its PID 1 is
+  # systemd, which reaps.
+  #
+  # That is a property of running without an init, not a defect in this repository:
+  # a SIGKILLed process cannot run cleanup, and it is not the parent of record any
+  # more. FI-05 therefore asserts that nothing is still RUNNING and reports unreaped
+  # exit records separately instead of counting them as leaked processes. The
+  # deployment consequence is real and is documented in
+  # docs/validation/linux-containers.md: run the container with an init
+  # (`docker run --init`, or tini/dumb-init as PID 1) if you intend to kill runtimes.
+  container-linux-arm64:
+    name: container (debian bookworm arm64, non-root, no TTY)
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:bookworm-slim
+    timeout-minutes: 25
+    steps:
+      # debian:bookworm-slim ships no curl, no CA certificates, no git and no
+      # compiler. The compiler is not a convenience here: node-pty 1.1.0 publishes
+      # prebuilds for darwin-arm64, darwin-x64, win32-arm64 and win32-x64 ONLY --
+      # there are no Linux prebuilds for either architecture -- so every Linux
+      # install compiles node-pty from source with node-gyp. A deployment container
+      # without python3, make and g++ cannot install this package at all, which is a
+      # fact about the dependency and is recorded in the README's platform table.
+      - name: Install prerequisites and create a non-root user (as root)
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git xz-utils python3 make g++ procps
+          useradd --create-home --shell /bin/bash sentiora
+
+      # Node is installed from the official linux-arm64 tarball instead of
+      # actions/setup-node, so this job does not depend on an action working inside
+      # a bare container. The checksum is verified against the published
+      # SHASUMS256.txt rather than trusted from the download.
+      - name: Install Node.js 24 (linux-arm64, checksum verified)
+        run: |
+          set -eu
+          curl -fsSLO https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt
+          TARBALL=$(grep -oE 'node-v[0-9.]+-linux-arm64\.tar\.xz' SHASUMS256.txt | head -n1)
+          test -n "$TARBALL"
+          curl -fsSLO "https://nodejs.org/dist/latest-v24.x/$TARBALL"
+          grep " $TARBALL\$" SHASUMS256.txt | sha256sum -c -
+          tar -xJf "$TARBALL" -C /usr/local --strip-components=1
+          rm -f "$TARBALL" SHASUMS256.txt
+          node --version
+          npm --version
+
+      - uses: actions/checkout@v4
+
+      # checkout runs as root; everything after this point runs as `sentiora`, so
+      # the tree -- including node_modules and the compiled native binary -- has to
+      # be owned by that user for npm ci to write into it.
+      - name: Hand the workspace to the non-root user
+        run: chown -R sentiora:sentiora "$GITHUB_WORKSPACE"
+
+      # Every matrix cell now asserts its own architecture, so what is unique to this
+      # job is the rest: that the process is not root, that neither stream is a TTY,
+      # and that HOME is the unprivileged user's rather than /root -- the last being
+      # what proves the `runuser -u sentiora -- env HOME=...` plumbing took effect.
+      #
+      # Honest scope: a GitHub Actions `run` step never has a TTY, so --expect-no-tty
+      # cannot fail here; it documents a property of the runner rather than testing
+      # this job. It is not vacuous in general -- run locally against an attached
+      # console it fails and reports stdinIsTTY:true -- and issue #28 asked for the
+      # no-TTY condition to be verified, so it is asserted rather than assumed even
+      # though the answer is predetermined. The load-bearing checks here are uid and
+      # arch. Same for --expect-home, which can only fail if the `env` prefix is
+      # dropped, which is exactly the plumbing worth pinning.
+      #
+      # It lives in a script rather than inline because the inline form needs
+      # YAML -> bash -c '...' -> node -e "..." nesting, and at that depth a
+      # mis-escaped quote silently weakens the check while still exiting 0. The
+      # script was exercised locally in both directions first: it passes with piped
+      # stdio on a matching arch, and fails on a wrong arch, on a platform that has
+      # no uid at all, on a typo'd flag (exit 64) and when the required flags are
+      # missing (exit 64).
+      - name: Assert the environment actually is non-root, arm64 and TTY-less
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c '
+            set -eu
+            echo "id: $(id)"
+            echo "pwd: $(pwd)"
+            echo "tty: $(tty || true)"
+            node scripts/assert-runtime-env.mjs \
+              --expect-arch=arm64 \
+              --expect-platform=linux \
+              --expect-non-root \
+              --expect-no-tty \
+              --expect-home=/home/sentiora
+          '
+
+      - name: Install dependencies (as the non-root user)
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c '
+            set -eu
+            npm ci
+          '
+
+      # node-pty publishes prebuilds/*/spawn-helper as mode 644. Only macOS
+      # posix_spawnp()s it, so this is a no-op on Linux -- kept so the step order
+      # matches the matrix job and a future Linux spawn-helper cannot regress
+      # silently.
+      - name: Restore native executable permissions
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c '
+            set -eu
+            node scripts/fix-native-permissions.mjs
+          '
+
+      - name: Verify native binary architecture
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c '
+            set -eu
+            node scripts/report-native-arch.mjs
+          '
+
+      - name: Syntax check
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c '
+            set -eu
+            node --check src/server.js
+            node --check src/session.js
+            node --check src/env.js
+          '
+
+      # Split the same way the matrix job does, so a failure is attributable to one
+      # layer. test:fault runs all ten tests here: the SENTIORA_FAULT_FILL=0 gate is
+      # Windows-only, because the STATUS_ACCESS_VIOLATION it works around (#21) is a
+      # ConPTY defect. Linux ARM64 filling and draining to the 16-session cap
+      # repeatedly is real evidence, not coverage traded away.
+      - name: Mocked unit tests
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c 'set -eu; npm run test:unit'
+
+      - name: Native PTY tests
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c 'set -eu; npm run test:native'
+
+      - name: JSON-RPC server tests
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c 'set -eu; npm run test:server'
+
+      - name: Fault injection tests
+        run: |
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c 'set -eu; npm run test:fault'
+
+      - name: Diagnostics after failure
+        if: failure()
+        run: |
+          node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform,osRelease:require('os').release(),cpus:require('os').cpus().length},null,2)"
+          cat /etc/os-release || true
+          ldd --version || true
+          runuser -u sentiora -- env HOME=/home/sentiora bash -c 'ls -la node_modules/node-pty/build/Release 2>/dev/null || echo "no build/Release"' || true
+
   # The desktop app (issue #7, PR1) is a *client* of the runtime and lives entirely
   # under apps/desktop. It gets its own jobs so a desktop-only failure can never be
   # mistaken for a runtime regression, and the matrix above stays untouched.
   #
   # Node 24 only: the desktop bridge has no npm dependencies of its own and adds no
   # Node-version surface beyond what the runtime matrix already covers.
+  #
+  # ubuntu-24.04-arm is included so the desktop bridge's real-runtime path is
+  # measured on Linux ARM64 as well, matching the runtime matrix rather than leaving
+  # an unexplained asymmetry. The container job above deliberately does NOT run the
+  # desktop suites: a container is not a desktop workload.
   desktop:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, windows-11-arm, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
+        # Same expectations as the runtime matrix: the desktop job also runs real
+        # PTY sessions and the same architecture check, so its ARM64 cell needs the
+        # same direct assertion on process.arch rather than trusting the label.
+        include:
+          - os: ubuntu-latest
+            expectArch: x64
+            expectPlatform: linux
+          - os: ubuntu-24.04-arm
+            expectArch: arm64
+            expectPlatform: linux
+          - os: windows-latest
+            expectArch: x64
+            expectPlatform: win32
+          - os: windows-11-arm
+            expectArch: arm64
+            expectPlatform: win32
+          - os: macos-latest
+            expectArch: arm64
+            expectPlatform: darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -120,6 +404,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+
+      - name: Assert the runtime environment
+        run: node scripts/assert-runtime-env.mjs --expect-arch=${{ matrix.expectArch }} --expect-platform=${{ matrix.expectPlatform }}
 
       - run: npm ci
 

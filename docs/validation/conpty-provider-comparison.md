@@ -705,8 +705,11 @@ Node 24 result in §6.
 7. **No source-compilation path tested** — no MSVC on this machine. Only the vendored ARM64
    prebuild route is validated.
 8. **PowerShell 5.1 only**; no `pwsh` installed, so PowerShell 7 behaviour is untested.
-9. **Only Windows ARM64 has physical-machine coverage.** Windows x64, Linux x64 and macOS ARM64
-   are verified by CI alone; macOS Intel and Linux ARM64 have no coverage at all. The
+9. **Only Windows ARM64 has physical-machine coverage.** Windows x64, Linux x64, Linux ARM64 and
+   macOS ARM64 are verified by CI alone; macOS Intel has no coverage at all. Linux ARM64 was added
+   for issue #28 and now runs on `ubuntu-24.04-arm` for Node 22 and 24, and inside a plain
+   `debian:bookworm-slim` container as a non-root user with no controlling terminal — see
+   [Linux containers](linux-containers.md). The
    per-scenario evidence in §6 and the stress results in §5 are Windows ARM64 measurements and
    should not be assumed to hold elsewhere — in particular the descriptor leak and the
    ~500-session ceiling are ConPTY-specific and untested against Unix PTY.
@@ -736,9 +739,11 @@ Node 24 result in §6.
    configurable threshold and reports a clear error, rather than letting the host reach the
    `Invalid pty handle` state. Not implemented here to keep the change reviewable.
 5. **Add `timeout-minutes` to any future workflow** — already done for this one.
-6. **Extend the matrix to the two uncovered architectures** — `macos-15-intel` and
-   `ubuntu-24.04-arm` — before claiming Intel macOS or Linux ARM64 support. macOS ARM64, Windows
-   x64 and Windows ARM64 are now CI-verified and can be claimed.
+6. **Extend the matrix to the one architecture still uncovered** — `macos-15-intel`. Linux ARM64
+   was added for issue #28: `ubuntu-24.04-arm` on Node 22 and 24, plus a plain
+   `debian:bookworm-slim` container as a non-root user with no controlling terminal, both in
+   [Linux containers](linux-containers.md). macOS ARM64, Windows x64 and Windows ARM64 were already
+   CI-verified. Intel macOS still cannot be claimed.
 
 ## 10. Remaining work
 

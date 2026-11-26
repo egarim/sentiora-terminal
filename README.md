@@ -61,19 +61,79 @@ The runtime is deliberately model-agnostic. Sentiora supplies perception and act
 
 ### Target platforms
 
-| Platform | Backend | Architectures | Verification status |
-| --- | --- | --- | --- |
-| Windows | ConPTY | ARM64 | **Verified twice** — physical Snapdragon X hardware (20 native scenarios, 37 tests, Node 22 and 24) and GitHub-hosted `windows-11-arm`. See [Windows native validation](docs/validation/windows-native-validation.md). |
-| Windows | ConPTY | x64 | **Verified in CI** (`windows-latest`, Node 22 and 24). No physical-machine x64 run. |
-| Linux | Unix PTY | x64 | **Verified in CI** — mocked suite plus one cross-platform native PTY test. |
-| macOS | Unix PTY | Apple Silicon | **Verified in CI** (`macos-latest`, Node 22 and 24) after the `spawn-helper` permissions fix. |
-| Linux | Unix PTY | ARM64 | Not verified. |
-| macOS | Unix PTY | Intel | Not verified — `macos-latest` is Apple Silicon; Intel needs `macos-15-intel`. |
+This table says what was **executed**, not what each platform is expected to support. Every count was
+read out of the named CI job's own Node test-runner summary in run
+[`45795716953`](https://github.com/egarim/sentiora-terminal/actions/runs/45795716953), which is
+**17/17 green**; the four runtime suites hold **99** tests.
 
-These are targets plus whatever has actually been measured, not a blanket compatibility claim.
-CI verifies that every native binary's architecture matches the runtime
-(`scripts/report-native-arch.mjs`), so an x64 image running under emulation can never be reported
-as ARM64.
+| Platform | Backend | Arch | Verified on | Node | Executed | Skipped |
+| --- | --- | --- | --- | --- | --- | --- |
+| Windows | ConPTY | ARM64 | physical Snapdragon X **and** `windows-11-arm` | 22, 24 | **97 / 99** | 2 |
+| Windows | ConPTY | x64 | `windows-latest` | 22, 24 | **97 / 99** | 2 |
+| Linux | Unix PTY | ARM64 | `ubuntu-24.04-arm`, plus a `debian:bookworm-slim` container as a non-root user with no TTY | 22, 24 | **71 / 99** | 28 |
+| Linux | Unix PTY | x64 | `ubuntu-latest` | 22, 24 | **71 / 99** | 28 |
+| macOS | Unix PTY | Apple Silicon | `macos-latest` | 22, 24 | **71 / 99** | 28 |
+| macOS | Unix PTY | Intel | **not verified** — `macos-latest` is arm64 and there is no `macos-13` job | — | — | — |
+
+**The run cited above is green, and the run immediately before it was not.** In run
+[`45792413782`](https://github.com/egarim/sentiora-terminal/actions/runs/45792413782) (commit
+`2a8f9f2`) `test (windows-latest, 24)` failed: the native suite's process died while
+`WIN-14 cleans up without orphaned processes` was in flight. Its summary read `tests 15, pass 14,
+fail 1` — `WIN-01`…`WIN-13` plus the one cross-platform test in `native.test.js`, with the single
+failure being the file-level entry Node records when a test file's process dies. There was no
+JavaScript error, no exit code and no exception in the log, only Node's own footer. The next commit
+changed only documentation and CI diagnostics, nothing `windows-native.test.js` imports, and the cell
+passed.
+
+That is **one more sample from a non-deterministic suite, not a fix**, and it is recorded here rather
+than dropped because a table of green cells that hides a red one is worse than no table. The crash is
+logged unattributed on [#21](https://github.com/egarim/sentiora-terminal/issues/21). It is
+deliberately *not* blamed on #21 either: `WIN-14` creates 3 concurrent sessions, against the
+near-the-16-cap concurrency of every previously recorded occurrence, and the log contained no
+exception code to match. What was actionable is that the failure could not be diagnosed at all, so
+the workflow now dumps Windows event-log entries 1000/1001 on failure, which carry the faulting
+module and the exception code. Details in [Linux containers](docs/validation/linux-containers.md).
+
+The 2 Windows skips are `FI-09` and `FI-10`, held back by the `SENTIORA_FAULT_FILL=0` gate because
+repeatedly filling and draining to the session cap crashes the host — issue
+[#21](https://github.com/egarim/sentiora-terminal/issues/21), a node-pty ConPTY defect that
+reproduces on unmodified `main`. The gate is containment, not a fix, and removing it is the
+acceptance test for one. See [Windows native validation](docs/validation/windows-native-validation.md).
+
+The 28 POSIX skips are all `native ConPTY scenario: Windows only` — 22 in `windows-native.test.js`
+and 6 in `windows-server.test.js`. What that leaves is worth stating plainly: the cross-platform
+native file `native.test.js` is **one test**. POSIX platforms do run 71 tests including real Unix
+PTY sessions across the server, environment and fault suites, but the native-scenario breadth is
+Windows-only. That is a gap, not a green tick.
+
+Two gates back the architecture column, because one is not enough. Every cell asserts that
+`process.arch` and `process.platform` are what its runner label claims
+(`scripts/assert-runtime-env.mjs`), and `scripts/report-native-arch.mjs` then reads the container
+header of every native binary node-pty will load — PE `Machine`, Mach-O `cputype`, ELF `e_machine` —
+and fails the job if any belongs to a different architecture than the runtime.
+
+Both are needed. The binary check alone cannot catch a mislabelled runner: if an x64 machine served
+an `arm64` label, node-pty would install x64 binaries under an x64 runtime, everything would be
+self-consistent, and the job would still report ARM64 coverage. Only asserting `process.arch`
+directly closes that. Conversely the arch assertion says nothing about what was actually loaded,
+which is the binary check's job.
+
+The binary check also fails rather than passing when it has nothing to show: **zero** binaries
+inspected, or any matched file whose architecture it could not determine — truncated, unreadable,
+header-less, a universal Mach-O fat binary, or an unlisted machine code. Both cases used to print
+`OK … all consistent with <arch>`, which is the one thing a gate like this must never say without
+having checked. All four branches were exercised locally, not just reasoned about: a clean install
+(`OK, 9 of 9 binaries verified as arm64`), node-pty unresolvable (exit 1), an injected header-less
+`.node` (`ARCH CHECK INCONCLUSIVE`, naming the file), and a real x64 `pty.node` copied into the
+arm64 prebuilds directory (`ARCH MISMATCH`, naming the file and its architecture).
+
+The same step reports how many binaries each platform actually has, which is a measurement in its
+own right: **1** on Linux, **2** on macOS, **9** on Windows. Linux has 1 because node-pty 1.1.0
+publishes prebuilds for `darwin-arm64`, `darwin-x64`, `win32-arm64` and `win32-x64` only — **there
+are no Linux prebuilds**, so every Linux install compiles node-pty from source and needs `python3`,
+`make` and a C++ toolchain present. A container without them cannot install this package at all.
+Details, including what a container changes about process cleanup, are in
+[Linux containers](docs/validation/linux-containers.md).
 
 ## Developer experience
 
@@ -292,6 +352,7 @@ node test/bench/fd-exhaustion.mjs 1200  # finds the per-host session ceiling
 | --- | --- |
 | [Windows native validation](docs/validation/windows-native-validation.md) | The 20 native ConPTY scenarios, the session-teardown hang and its fix, ARM64 verification, Ctrl+C semantics, measurement pitfalls. |
 | [ConPTY provider comparison](docs/validation/conpty-provider-comparison.md) | OS ConPTY vs bundled `conpty.dll`, lifecycle states, the host-crash defect, long-running reliability, the ~500-session ceiling, CI and the macOS root cause. |
+| [Linux containers](docs/validation/linux-containers.md) | Issue #28: Linux ARM64 and the plain-Debian container run, why node-pty has no Linux prebuilds, per-platform test counts, and why a container's PID 1 decides whether killed sessions leave zombies behind. |
 | [Telekinesis integration](docs/integrations/telekinesis.md) | Contract for using Sentiora as an optional Telekinesis console backend. Implemented on the Telekinesis side as [telekinesis#70](https://github.com/egarim/telekinesis/pull/70); Sentiora needs no Telekinesis-specific code. |
 | [Living Terminal desktop UI](docs/desktop/living-terminal.md) | Issue #7 PR1: the desktop bridge and UI shell, the snapshot output model and its measured limits, host pooling at the descriptor ceiling, the security boundary, the blocked Tauri packaging, and the proposed runtime protocol changes. |
 

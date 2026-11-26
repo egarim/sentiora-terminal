@@ -26,7 +26,7 @@
 //     already carries the #14 fix, so it guards that fix rather than proving it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startRuntime, expectGone, collectSurvivors, untilGone, rpcLine } from './helpers/runtime.mjs';
+import { startRuntime, expectGone, collectSurvivors, untilGone, untilNotRunning, reap, describeInit, rpcLine } from './helpers/runtime.mjs';
 import { FIXTURE } from './helpers/native.mjs';
 
 const opts = { timeout: 180000 };
@@ -287,11 +287,26 @@ test('FI-05 killing the runtime outright leaves no orphaned shells', opts, async
     const info = await server.exited();
     assert.ok(info, 'the runtime survived SIGKILL');
 
-    // Reaped before asserting, so a failure cannot leak into the next test.
-    const survivors = await expectGone(pids);
-    console.log(`    FI-05 survivors after SIGKILL of the runtime: ${survivors.length} of ${pids.length} `
-      + `(${process.platform}, exit ${JSON.stringify(info)})`);
-    assert.deepEqual(survivors, [], `killing the runtime orphaned shell pids ${survivors.join(', ')}`);
+    // The runtime is SIGKILLed, so it cannot reap its own children and PID 1 of the
+    // pid namespace inherits that job. Hence untilNotRunning rather than untilGone:
+    // a child that exited and was never reaped is a pid-table entry, not a leaked
+    // shell, and in a container whose PID 1 is not an init it would otherwise fail
+    // this test forever while measuring nothing about this repository.
+    //
+    // Everything is described before anything is signalled, because reaping turns a
+    // running process into a dying one and destroys the distinction being reported.
+    const { running, zombies } = await untilNotRunning(pids);
+    const pid1 = describeInit();
+    console.log(`    FI-05 after SIGKILL of the runtime: ${running.length} running, `
+      + `${zombies.length} exited-but-unreaped, of ${pids.length} `
+      + `(${process.platform}, exit ${JSON.stringify(info)}, pid1 ${JSON.stringify(pid1)})`);
+    if (zombies.length) console.log(`    FI-05 unreaped exit records: ${JSON.stringify(zombies)}`);
+    // Signalled before asserting, so a failure cannot leak a live shell into the next
+    // test. A zombie cannot be reaped from here -- we are not its parent, PID 1 is.
+    reap(running.map(entry => entry.pid));
+    assert.deepEqual(running.map(entry => entry.pid), [],
+      `killing the runtime left ${running.length} shell(s) STILL RUNNING: ${JSON.stringify(running)}; `
+      + `pid1 ${JSON.stringify(pid1)}`);
   } finally {
     if (!server.hasExited) { server.killHard(); await server.exited(10000); }
     await collectSurvivors(pids, 0);
@@ -327,7 +342,32 @@ test('FI-06 a restarted runtime rejects the previous one\'s session ids', opts, 
     // instead of failing in seconds.
     first.killHard();
     await first.exited();
-    if (stalePid !== null) await collectSurvivors([stalePid], 20000);
+    if (stalePid !== null) {
+      // Logged, not asserted: this is a `finally`, where throwing would mask the
+      // failure the test actually came to report.
+      //
+      // untilNotRunning throws on a pid it cannot probe. That is correct inside a
+      // test body -- a leak check that quietly skips an unprobeable pid asserts
+      // nothing -- and wrong here, which is why collectSurvivors, the function this
+      // replaced, filtered instead of throwing. Filter the same way rather than
+      // reintroducing the hazard. The window is not hypothetical: node-pty
+      // 1.2.0-beta reports pid 0 until its deferred pty connection completes, and
+      // src/session.js documents that.
+      const probeable = [stalePid].filter(pid => Number.isInteger(pid) && pid > 0);
+      if (probeable.length) {
+        // untilNotRunning also gives back the 20s collectSurvivors used to spend
+        // waiting on a zombie that nothing in a container without an init can reap.
+        const { running, zombies } = await untilNotRunning(probeable, 20000);
+        if (running.length || zombies.length) {
+          console.log(`    FI-06 after SIGKILL of the runtime: ${JSON.stringify({ running, zombies })}`);
+        }
+        reap(running.map(entry => entry.pid));
+      } else {
+        // Reported rather than treated as gone, for the same reason the helper
+        // throws in the first place: silence here would look like a clean teardown.
+        console.log(`    FI-06 cannot probe stale pid ${JSON.stringify(stalePid)}; not claiming it is gone`);
+      }
+    }
   }
 
   const second = startRuntime();
