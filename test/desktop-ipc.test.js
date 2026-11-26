@@ -574,3 +574,78 @@ test('without a build the server says so instead of serving nothing', opts, asyn
     await context.stop();
   }
 });
+
+// ------------------------------------------------------------------ session env
+//
+// Round 1 of review found that living-terminal.md promised callers they could
+// narrow a session with `env`, while SessionBridge.create had no such parameter and
+// POST /api/sessions never forwarded one -- so a client posting {"env":{}} got 201
+// and the user's entire environment. These tests exist so that path cannot silently
+// regress again: the fake runtime echoes what it actually received.
+
+test('POST /api/sessions forwards a caller env to the runtime', opts, async () => {
+  const context = await startServer();
+  try {
+    const created = await context.call('POST', '/api/sessions', {
+      shellId: SHELL_ID, cols: 40, rows: 10, env: { SENTIORA_ENV_PROBE: 'narrow' },
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    const stream = await openSse(context.url, `/api/sessions/${created.json.session.sessionId}/stream`, context.token);
+    const snapshot = await stream.next(event => event.name === 'snapshot', { label: 'snapshot' });
+    const screen = snapshot.data.lines.join('\n');
+    // keys=1 is the load-bearing part: it proves the caller's env REPLACED the
+    // bridge's own environment rather than being merged into it. Deleting the
+    // forwarding line in ipc.js or SessionBridge.create makes this fail.
+    assert.match(screen, /FAKE ENV probe=narrow keys=1/,
+      `the caller env did not reach the runtime intact:\n${screen}`);
+    await stream.close();
+    await context.call('DELETE', `/api/sessions/${created.json.session.sessionId}`);
+  } finally {
+    await context.stop();
+  }
+});
+
+test('a session created without an explicit env still gets the bridge environment', opts, async () => {
+  // The desktop bridge deliberately opts into its own environment: it runs as the
+  // local user and its sessions ARE that user's shells, so applying the runtime's
+  // allowlist would drop the user's variables with no security gain. If
+  // RuntimeClient stopped substituting this.env, every desktop shell would silently
+  // lose the user's environment -- and nothing else would notice.
+  process.env.SENTIORA_BRIDGE_MARKER = 'bridge-default';
+  const context = await startServer();
+  try {
+    const created = await context.call('POST', '/api/sessions', { shellId: SHELL_ID, cols: 40, rows: 10 });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    const stream = await openSse(context.url, `/api/sessions/${created.json.session.sessionId}/stream`, context.token);
+    const snapshot = await stream.next(event => event.name === 'snapshot', { label: 'snapshot' });
+    assert.match(snapshot.data.lines.join('\n'), /FAKE ENV bridge=bridge-default/,
+      'the bridge did not opt its own environment in for a default create');
+    await stream.close();
+    await context.call('DELETE', `/api/sessions/${created.json.session.sessionId}`);
+  } finally {
+    delete process.env.SENTIORA_BRIDGE_MARKER;
+    await context.stop();
+  }
+});
+
+test('a malformed env is refused with 400 invalid-env, not a runtime 500', opts, async () => {
+  const context = await startServer();
+  try {
+    // `null` is the important one: it used to mean "not supplied", so the bridge
+    // substituted its OWN environment and answered 201 -- a narrowing feature
+    // failing open on the only externally reachable path.
+    const shapes = [null, 'not-an-object', 42, true, [], { 'A=B': 'x' }, { A: 1 }, { A: null }, { A: 'x\u0000y' }, { '': 'x' }];
+    for (const env of shapes) {
+      const refused = await context.call('POST', '/api/sessions', { shellId: SHELL_ID, cols: 40, rows: 10, env });
+      assert.equal(refused.status, 400, `env ${JSON.stringify(env)} should be refused, got ${refused.status}`);
+      assert.equal(refused.json.kind, 'invalid-env',
+        `env ${JSON.stringify(env)} got the wrong kind: ${JSON.stringify(refused.json)}`);
+      // The refusal must not become a second leak.
+      assert.ok(!JSON.stringify(refused.json).includes('\u0000'), 'the refusal echoed a control character');
+    }
+    assert.deepEqual((await context.call('GET', '/api/sessions')).json.sessions, [],
+      'a refused create must not leave a session behind');
+  } finally {
+    await context.stop();
+  }
+});
