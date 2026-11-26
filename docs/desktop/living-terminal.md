@@ -351,16 +351,22 @@ The runtime was deliberately left untouched. These are proposals for coordinatio
 PRs, per issue #7's "coordinate schema changes with existing runtime PRs". Nothing in PR1 depends on
 them being accepted; each has a working fallback today.
 
-1. **Raw output notifications** — the highest-value change by a wide margin.
-   A server-initiated notification per PTY chunk, e.g.
-   `{"jsonrpc":"2.0","method":"terminal.output","params":{"sessionId":"…","revision":N,"data":"<base64>"}}`,
-   plus a `terminal.subscribe`/`terminal.replay(sessionId, fromRevision)` pair so a late consumer can
-   resync from a bounded server-side ring.
-   This would restore ANSI colour, exact byte framing, native xterm.js scrollback and mouse
-   reporting, and would make "no lost bytes" a byte-level guarantee instead of a viewport-level one.
-   The bridge already negotiates `outputModes`, so switching is a capability check rather than a
-   rewrite. Note this requires the runtime to emit unsolicited lines on stdout, which WIN-15
-   currently proves it never does — so it needs a deliberate framing decision, not a drive-by change.
+1. **Raw output notifications** — *half done by issue #27; the transport half is still open.*
+   The raw-byte channel now exists: `terminal.stream {sessionId, afterSequence, timeoutMs}` returns
+   the child's original chunks base64-encoded with monotonic sequence numbers from a bounded
+   server-side ring, with a snapshot on first attach and a `resync` flag plus a fresh snapshot when a
+   consumer falls behind. That is functionally the `subscribe`/`replay` pair described here, so ANSI
+   colour, exact byte framing and a byte-level "no lost bytes" guarantee are all now available to a
+   consumer. See [streaming and recording](../streaming-and-recording.md).
+   What remains unimplemented is the **push** half: a server-initiated
+   `{"jsonrpc":"2.0","method":"terminal.output",…}` line per chunk. It still requires the runtime to
+   emit unsolicited lines on stdout, which WIN-15 proves it never does, so it still needs a
+   deliberate framing decision rather than a drive-by change — every current client parses stdout as
+   responses to what it sent. `initialize` advertises `stream: 1`, which is where a `push: 1`
+   capability would go once that decision is made.
+   The bridge has **not** been migrated: it still long-polls `terminal.wait` and publishes rendered
+   snapshots, so colour still does not reach the UI. It already negotiates `outputModes`, so
+   switching is a capability check rather than a rewrite.
 
 2. **Distinct JSON-RPC error codes.** Every error is `-32000` and only the message string
    distinguishes it. Already recommended in telekinesis.md §10. `bridge/errors.js` is the single
@@ -426,10 +432,15 @@ report them as a UI failure. The replacement targets are below.
 #### Re-baselined performance targets
 
 The original "p95 added input latency under 10 ms" assumes per-frame delivery of terminal output.
-This runtime has no raw-output channel: the bridge long-polls `terminal.wait(afterRevision, 250ms)`
+This **bridge** does not use a raw-output channel: it long-polls `terminal.wait(afterRevision, 250ms)`
 and publishes whole rendered screens, so observation freshness is bounded by the poll interval and
-no implementation can beat it. A sub-10 ms target is therefore unreachable by construction, not by
-poor engineering. It is decomposed into components that can each be measured:
+no implementation of the bridge can beat it. A sub-10 ms target is therefore unreachable by
+construction, not by poor engineering. It is decomposed into components that can each be measured:
+
+The runtime *has* grown a raw-output channel since this was written — `terminal.stream`, issue #27 —
+but the bridge has not been migrated to it, so the budgets below still describe the bridge as built.
+Migrating would replace one poll interval with another of the same shape; only the server-initiated
+push variant in §9.1 would remove the interval entirely.
 
 | # | Target | Budget (p95) | Basis | Status |
 | --- | --- | --- | --- | --- |

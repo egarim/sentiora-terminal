@@ -60,8 +60,14 @@ Tools: `console_open`, `console_write`, `console_read`, `console_resize`, `conso
 `console_list`. Session ids are `con1`, `con2`, …; `console_resize` clamps cols/rows to 2–1000.
 
 Sentiora: newline-delimited JSON-RPC 2.0 over stdio — `initialize`, `terminal.create`,
-`terminal.list`, `terminal.observe`, `terminal.type`, `terminal.key`, `terminal.wait`,
-`terminal.resize`, `terminal.close`.
+`terminal.list`, `terminal.observe`, `terminal.stream`, `terminal.recording`, `terminal.type`,
+`terminal.key`, `terminal.wait`, `terminal.resize`, `terminal.close`.
+
+The Telekinesis console surface maps onto the snapshot methods only. `terminal.stream` and
+`terminal.recording` (issue #27) have no Telekinesis counterpart and this adapter does not need them;
+they are documented in [streaming and recording](../streaming-and-recording.md). An adapter that did
+want colour-preserving output would use `terminal.stream` in place of the `terminal.wait` polling loop
+described in §4.
 
 ## 3. Operation mapping
 

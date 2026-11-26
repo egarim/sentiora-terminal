@@ -188,27 +188,57 @@ armed with the revision returned by the write, not the one read before it.
 
 ### Initial protocol surface
 
-| Operation | Purpose |
-| --- | --- |
-| initialize | Negotiate protocol capabilities |
-| terminal.create | Start an interactive process |
-| terminal.list | Enumerate sessions |
-| terminal.observe | Read screen and process state |
-| terminal.type | Send text |
-| terminal.key | Send a keyboard event |
-| terminal.wait | Wait for change or exit |
-| terminal.resize | Change terminal dimensions |
-| terminal.close | End a session |
+| Operation | Purpose | Owner token |
+| --- | --- | --- |
+| initialize | Negotiate protocol capabilities | — |
+| terminal.create | Start an interactive process | returned once, here only |
+| terminal.list | Enumerate sessions | not required, not returned |
+| terminal.observe | Read screen and process state | not required |
+| terminal.stream | Read-only sequence-numbered output stream | not required, never returned |
+| terminal.recording | Retrieve the replayable session record | **required** |
+| terminal.type | Send text | required |
+| terminal.key | Send a keyboard event | required |
+| terminal.wait | Wait for change or exit | not required |
+| terminal.resize | Change terminal dimensions | required |
+| terminal.close | End a session | required |
 
 The protocol is provisional until the implementation and contract tests land.
 
-`terminal.create` accepts `{command, args, cwd, cols, rows, conptyDll}` and returns the first
-observation plus the `owner` token for that session. `conptyDll` selects node-pty's bundled
-`conpty.dll` instead of the OS ConPTY and defaults to `false`; the host-wide default can be set
-with `SENTIORA_CONPTY_DLL=1`, and `initialize` reports the effective value. The bundled provider is
-**exposed for comparison, not recommended**: measured over 30 sessions it leaks a worker thread,
-about 8 Win32 handles and ~6.5 MB per session, and leaves the host process unable to exit. See the
-[provider comparison](docs/validation/conpty-provider-comparison.md).
+`terminal.create` accepts `{command, args, cwd, cols, rows, conptyDll, env, recordInput,
+recordBytes}` and returns the first observation plus the `owner` token for that session. `conptyDll`
+selects node-pty's bundled `conpty.dll` instead of the OS ConPTY and defaults to `false`; the
+host-wide default can be set with `SENTIORA_CONPTY_DLL=1`, and `initialize` reports the effective
+value. The bundled provider is **exposed for comparison, not recommended**: measured over 30
+sessions it leaks a worker thread, about 8 Win32 handles and ~6.5 MB per session, and leaves the
+host process unable to exit. See the
+[provider comparison](docs/validation/conpty-provider-comparison.md). `env` narrows the child's
+environment (issue #26). `recordInput` and `recordBytes` control the recording, below.
+
+### Watching and recording a session (issue #27)
+
+`terminal.observe` returns one rendered screen of **text**: `translateToString()` drops every
+attribute, so colour does not survive it, and an existing test pins that no escape byte leaks into
+`screen`. Watching a live session and keeping it as evidence both need more than that, which is what
+`terminal.stream` and `terminal.recording` are for. Full details, including the measured guarantees
+and the limits, are in [Streaming and recording](docs/streaming-and-recording.md).
+
+`terminal.stream {sessionId, afterSequence, timeoutMs}` is a read-only long poll. It returns the raw
+output chunks the child produced — base64, so arbitrary bytes and ANSI colour survive — each with a
+monotonic `seq`, plus `nextSequence` to poll with next. The first call (`afterSequence: 0`) and any
+call whose cursor has fallen behind the retained window carry a full `snapshot`; the latter also set
+`resync: true`, which is the "you missed some, take a new snapshot" signal.
+
+It is a poll and not a server-initiated notification on purpose: pushing unsolicited lines on stdout
+would break the framing invariant `WIN-15` pins, that a child can never get a line onto the RPC
+channel, and every existing client parses stdout as responses.
+
+`terminal.recording {sessionId, owner}` is **owner-gated** and returns the whole record — output,
+resizes, the exit status, relative timestamps, and keystrokes if `recordInput: true` was passed at
+create — along with `inputRecorded` so a consumer can tell "nothing was typed" from "typing was not
+being recorded". Keystrokes can hold a secret, so they are off by default, filtered out of
+`terminal.stream` at the source rather than by the caller, and never present in a watcher's view at
+any cursor. The record is a ring bounded by `recordBytes` (default 1 MiB, maximum 16 MiB), so a
+watcher that never polls cannot grow the host without limit.
 
 ## The Creatura ecosystem
 
@@ -315,11 +345,15 @@ per-launch bearer token. Session `owner` tokens never leave the bridge process, 
 cannot launch an arbitrary command — only a shell the backend detected, or an absolute path the user
 typed and the backend validated.
 
-Output is delivered as **rendered screen snapshots**, not bytes, because that is what
-`terminal.observe` exposes: the runtime has no raw-output channel
-([telekinesis integration §4](docs/integrations/telekinesis.md)). Text, Unicode, layout and the
-alternate screen survive; colour and lines that scroll past between two observations do not. The
-proposed protocol addition that would fix this is documented rather than implemented unilaterally.
+Output is delivered as **rendered screen snapshots**, not bytes. That was forced when PR1 landed,
+because the runtime had no raw-output channel — it is no longer forced. `terminal.stream` (issue #27)
+now carries the child's original bytes with sequence numbers, so colour and output that scrolls past
+between two observations are both recoverable. **The bridge has not been migrated to it**, so this
+paragraph still describes what the desktop UI does today: text, Unicode, layout and the alternate
+screen survive, while colour and lines that scroll past between two observations do not. Migrating is
+a capability check rather than a rewrite, since the bridge already negotiates `outputModes`.
+([telekinesis integration §4](docs/integrations/telekinesis.md),
+[streaming and recording](docs/streaming-and-recording.md))
 
 **Tauri packaging is BLOCKED**: the machine this was built on (Windows 11 ARM64, Snapdragon X Elite)
 has no Rust toolchain and no MSVC compiler/linker, though WebView2 Runtime is present. Nothing was
@@ -350,6 +384,7 @@ node test/bench/fd-exhaustion.mjs 1200  # finds the per-host session ceiling
 
 | Document | Contents |
 | --- | --- |
+| [Streaming and recording](docs/streaming-and-recording.md) | Issue #27: the read-only `terminal.stream` and owner-gated `terminal.recording`, why the stream is a poll rather than a push, how truncation keeps replay exact, the guarantee-to-test map, and the limits. |
 | [Windows native validation](docs/validation/windows-native-validation.md) | The 20 native ConPTY scenarios, the session-teardown hang and its fix, ARM64 verification, Ctrl+C semantics, measurement pitfalls. |
 | [ConPTY provider comparison](docs/validation/conpty-provider-comparison.md) | OS ConPTY vs bundled `conpty.dll`, lifecycle states, the host-crash defect, long-running reliability, the ~500-session ceiling, CI and the macOS root cause. |
 | [Linux containers](docs/validation/linux-containers.md) | Issue #28: Linux ARM64 and the plain-Debian container run, why node-pty has no Linux prebuilds, per-platform test counts, and why a container's PID 1 decides whether killed sessions leave zombies behind. |
