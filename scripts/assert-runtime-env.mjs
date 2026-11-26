@@ -1,6 +1,13 @@
-// Asserts the properties of the environment that the container CI job claims to
-// test in: a specific architecture and platform, a non-root user, and no
-// controlling terminal.
+// Asserts what a CI job's environment actually is, instead of trusting the runner
+// label that selected it: the architecture and platform Node really observes, and
+// optionally that the process is not root and has no controlling terminal.
+//
+// Every cell runs it, not just the container job. `runs-on: ubuntu-24.04-arm` is
+// GitHub's claim about the machine; `process.arch === 'arm64'` is a measurement.
+// The distinction is load-bearing because scripts/report-native-arch.mjs compares
+// each binary against process.arch -- so if a label ever resolved to an x64
+// machine, the binaries would be x64 too, that check would pass, and the job would
+// still report ARM64 coverage. Only asserting the arch directly closes that hole.
 //
 // This is a file rather than inline shell for one reason. The alternative is three
 // layers of quoting -- YAML block scalar, then bash -c '...', then node -e "..." --
@@ -13,7 +20,7 @@
 // actually wrong instead of stopping at the first mismatch.
 //
 // Usage:
-//   node scripts/assert-container-env.mjs --expect-arch=arm64 --expect-platform=linux \
+//   node scripts/assert-runtime-env.mjs --expect-arch=arm64 --expect-platform=linux \
 //     [--expect-non-root] [--expect-no-tty] [--expect-home=/home/sentiora]
 //
 // Exit codes: 0 all assertions held, 1 at least one failed, 64 bad invocation.

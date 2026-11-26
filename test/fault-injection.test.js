@@ -344,15 +344,29 @@ test('FI-06 a restarted runtime rejects the previous one\'s session ids', opts, 
     await first.exited();
     if (stalePid !== null) {
       // Logged, not asserted: this is a `finally`, where throwing would mask the
-      // failure the test actually came to report. It used to call collectSurvivors,
-      // which never asserts either but does wait out its whole budget on a zombie --
-      // 20s of the container job spent learning nothing. untilNotRunning returns as
-      // soon as nothing is running and says what is left.
-      const { running, zombies } = await untilNotRunning([stalePid], 20000);
-      if (running.length || zombies.length) {
-        console.log(`    FI-06 after SIGKILL of the runtime: ${JSON.stringify({ running, zombies })}`);
+      // failure the test actually came to report.
+      //
+      // untilNotRunning throws on a pid it cannot probe. That is correct inside a
+      // test body -- a leak check that quietly skips an unprobeable pid asserts
+      // nothing -- and wrong here, which is why collectSurvivors, the function this
+      // replaced, filtered instead of throwing. Filter the same way rather than
+      // reintroducing the hazard. The window is not hypothetical: node-pty
+      // 1.2.0-beta reports pid 0 until its deferred pty connection completes, and
+      // src/session.js documents that.
+      const probeable = [stalePid].filter(pid => Number.isInteger(pid) && pid > 0);
+      if (probeable.length) {
+        // untilNotRunning also gives back the 20s collectSurvivors used to spend
+        // waiting on a zombie that nothing in a container without an init can reap.
+        const { running, zombies } = await untilNotRunning(probeable, 20000);
+        if (running.length || zombies.length) {
+          console.log(`    FI-06 after SIGKILL of the runtime: ${JSON.stringify({ running, zombies })}`);
+        }
+        reap(running.map(entry => entry.pid));
+      } else {
+        // Reported rather than treated as gone, for the same reason the helper
+        // throws in the first place: silence here would look like a clean teardown.
+        console.log(`    FI-06 cannot probe stale pid ${JSON.stringify(stalePid)}; not claiming it is gone`);
       }
-      reap(running.map(entry => entry.pid));
     }
   }
 

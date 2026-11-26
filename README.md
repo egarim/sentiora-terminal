@@ -77,10 +77,13 @@ read out of the named CI job's own Node test-runner summary in run
 
 **The run cited above is green, and the run immediately before it was not.** In run
 [`45792413782`](https://github.com/egarim/sentiora-terminal/actions/runs/45792413782) (commit
-`2a8f9f2`) `test (windows-latest, 24)` failed: the native suite's process died inside
-`WIN-14 cleans up without orphaned processes` after 14 tests had passed, leaving no JavaScript error,
-no exit code and no exception in the log — only Node's own footer. The next commit changed only
-documentation and CI diagnostics, nothing `windows-native.test.js` imports, and the cell passed.
+`2a8f9f2`) `test (windows-latest, 24)` failed: the native suite's process died while
+`WIN-14 cleans up without orphaned processes` was in flight. Its summary read `tests 15, pass 14,
+fail 1` — `WIN-01`…`WIN-13` plus the one cross-platform test in `native.test.js`, with the single
+failure being the file-level entry Node records when a test file's process dies. There was no
+JavaScript error, no exit code and no exception in the log, only Node's own footer. The next commit
+changed only documentation and CI diagnostics, nothing `windows-native.test.js` imports, and the cell
+passed.
 
 That is **one more sample from a non-deterministic suite, not a fix**, and it is recorded here rather
 than dropped because a table of green cells that hides a red one is worse than no table. The crash is
@@ -103,11 +106,26 @@ native file `native.test.js` is **one test**. POSIX platforms do run 71 tests in
 PTY sessions across the server, environment and fault suites, but the native-scenario breadth is
 Windows-only. That is a gap, not a green tick.
 
-CI verifies that every native binary's architecture matches the runtime
-(`scripts/report-native-arch.mjs`), reading the container header directly — PE `Machine`, Mach-O
-`cputype`, ELF `e_machine` — so an x64 image running under emulation can never be reported as
-ARM64. It also fails when it finds **zero** binaries to inspect, because reporting a successful
-architecture check having checked nothing is the one way that gate could pass while proving nothing.
+Two gates back the architecture column, because one is not enough. Every cell asserts that
+`process.arch` and `process.platform` are what its runner label claims
+(`scripts/assert-runtime-env.mjs`), and `scripts/report-native-arch.mjs` then reads the container
+header of every native binary node-pty will load — PE `Machine`, Mach-O `cputype`, ELF `e_machine` —
+and fails the job if any belongs to a different architecture than the runtime.
+
+Both are needed. The binary check alone cannot catch a mislabelled runner: if an x64 machine served
+an `arm64` label, node-pty would install x64 binaries under an x64 runtime, everything would be
+self-consistent, and the job would still report ARM64 coverage. Only asserting `process.arch`
+directly closes that. Conversely the arch assertion says nothing about what was actually loaded,
+which is the binary check's job.
+
+The binary check also fails rather than passing when it has nothing to show: **zero** binaries
+inspected, or any matched file whose architecture it could not determine — truncated, unreadable,
+header-less, a universal Mach-O fat binary, or an unlisted machine code. Both cases used to print
+`OK … all consistent with <arch>`, which is the one thing a gate like this must never say without
+having checked. All four branches were exercised locally, not just reasoned about: a clean install
+(`OK, 9 of 9 binaries verified as arm64`), node-pty unresolvable (exit 1), an injected header-less
+`.node` (`ARCH CHECK INCONCLUSIVE`, naming the file), and a real x64 `pty.node` copied into the
+arm64 prebuilds directory (`ARCH MISMATCH`, naming the file and its architecture).
 
 The same step reports how many binaries each platform actually has, which is a measurement in its
 own right: **1** on Linux, **2** on macOS, **9** on Windows. Linux has 1 because node-pty 1.1.0

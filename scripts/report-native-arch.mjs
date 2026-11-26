@@ -68,8 +68,18 @@ console.log(`runtime: node ${process.version} arch=${process.arch} platform=${pr
 console.log(`node-pty: ${pkg.version}`);
 
 const roots = [join(root, 'build', 'Release'), join(root, 'prebuilds', `${process.platform}-${process.arch}`)];
+// Architectures this script can name from a header. Anything archOf returns that is
+// not in here means it could not determine an architecture at all.
+const KNOWN_ARCHES = new Set(['x86', 'x64', 'arm64', 'arm', 'arm-thumb2']);
+
+// Node calls 32-bit x86 "ia32" while PE and ELF headers call it "x86". Without this
+// a 32-bit runtime would report every one of its own binaries as a mismatch.
+const runtimeArch = process.arch === 'ia32' ? 'x86' : process.arch;
+
 let found = 0;
+let verified = 0;
 const mismatches = [];
+const unclassified = [];
 
 for (const dir of roots) {
   if (!existsSync(dir)) continue;
@@ -84,11 +94,26 @@ for (const dir of roots) {
     } catch (error) {
       detected = `unreadable (${error.code ?? error.message})`;
     }
+    const rel = file.slice(root.length + 1);
     found += 1;
-    console.log(`  ${file.slice(root.length + 1)}: ${detected}`);
-    // x64 images inside an arm64 runtime would mean emulation; flag them.
-    if (process.arch === 'arm64' && detected === 'x64') mismatches.push(file);
-    if (process.arch === 'x64' && detected === 'arm64') mismatches.push(file);
+    console.log(`  ${rel}: ${detected}`);
+    if (KNOWN_ARCHES.has(detected)) {
+      // Any classified architecture that is not the runtime's is a mismatch. This
+      // used to compare only the arm64/x64 pair, so an x86 or arm binary inside an
+      // arm64 runtime would have been counted as consistent.
+      if (detected === runtimeArch) verified += 1;
+      else mismatches.push(`${rel} (${detected})`);
+    } else {
+      // 'macho-fat', 'too-small', 'not-a-native-image', 'bad-pe-signature',
+      // 'elf-unknown-0x…', 'pe-unknown-0x…' and 'unreadable (…)': the architecture
+      // could not be determined, so nothing about this file has been verified. A
+      // universal Mach-O binary lands here too -- it may well contain the right
+      // slice, but this script does not parse fat headers, and guessing is worse
+      // than saying so. node-pty ships per-architecture prebuilds, so this branch
+      // is not expected to fire on any supported platform: the observed counts are
+      // 9 binaries on Windows, 2 on macOS and 1 on Linux, all classified.
+      unclassified.push(`${rel} (${detected})`);
+    }
   }
 }
 
@@ -101,8 +126,15 @@ if (found === 0) {
   console.error('ARCH CHECK INCONCLUSIVE: no native binary was inspected, so no architecture was verified');
   process.exit(1);
 }
-if (mismatches.length) {
-  console.log(`ARCH MISMATCH vs runtime ${process.arch}: ${mismatches.length} file(s)`);
+if (unclassified.length) {
+  // Same reasoning as above, one level down: "9 binaries, all consistent" would be a
+  // lie if some of the 9 could not be read. Counting an unclassifiable file toward
+  // `found` was how the summary line came to claim more than the script had checked.
+  console.error(`ARCH CHECK INCONCLUSIVE: could not determine the architecture of ${unclassified.length} of ${found} file(s): ${unclassified.join(', ')}`);
   process.exit(1);
 }
-console.log(`native architecture check: OK (${found} binaries, all consistent with ${process.arch})`);
+if (mismatches.length) {
+  console.error(`ARCH MISMATCH vs runtime ${runtimeArch}: ${mismatches.length} file(s): ${mismatches.join(', ')}`);
+  process.exit(1);
+}
+console.log(`native architecture check: OK (${verified} of ${found} binaries verified as ${runtimeArch})`);

@@ -36,10 +36,33 @@ node-pty: 1.1.0
 native architecture check: OK (1 binaries, all consistent with arm64)
 ```
 
-That check reads the ELF `e_machine` header rather than trusting the filename, and it fails the job
-on a mismatch, so an emulated x64 image cannot be reported as ARM64. It also fails if it finds
-**zero** binaries — it used to print `no native binaries found` and then `check: OK (0 binaries)`,
-which would have passed the one job whose entire purpose is catching that.
+That check reads the ELF `e_machine` header rather than trusting the filename, and fails the job on
+a mismatch. The summary line above is what it printed at the time; it has since been tightened to
+report how many binaries were actually *verified*, because three separate ways it could pass without
+having checked anything were found and closed:
+
+- **zero** binaries inspected — it used to print `no native binaries found` and then
+  `check: OK (0 binaries, all consistent with arm64)`, exiting 0, which would have passed the one
+  job whose entire purpose is catching that;
+- node-pty **unresolvable**, which exited 0 with `node-pty is not installed`;
+- any matched file whose architecture it **could not determine** — truncated, unreadable,
+  header-less, a universal Mach-O fat binary, an unlisted machine code — which still counted toward
+  the total and was then covered by the claim that every file was consistent.
+
+The third was found by review after the first two were fixed, which is worth recording: closing one
+false green does not close the class. Injecting a header-less `.node` into the local prebuilds
+directory now produces `ARCH CHECK INCONCLUSIVE: could not determine the architecture of 1 of 10
+file(s): prebuilds\win32-arm64\bogus.node (not-a-native-image)`, where the old code printed
+`OK (10 binaries, all consistent with arm64)`. Copying a real x64 `pty.node` into the arm64
+directory produces `ARCH MISMATCH vs runtime arm64: 1 file(s): … (x64)`. The comparison also used to
+handle only the `arm64`/`x64` pair, so an `x86` or 32-bit `arm` binary inside an arm64 runtime would
+have counted as consistent; any classified architecture that is not the runtime's is now a mismatch.
+
+What the binary check still cannot do on its own is catch a runner of the wrong architecture: if an
+x64 machine served the `ubuntu-24.04-arm` label, node-pty would compile x64 binaries under an x64
+runtime and the check would pass, self-consistently, while the job reported ARM64 coverage. That is
+why every cell now also runs `scripts/assert-runtime-env.mjs`, comparing `process.arch` and
+`process.platform` against what the label claims.
 
 ## What was measured
 
@@ -79,9 +102,13 @@ The 2 Windows skips are `FI-09` and `FI-10`, the #21 containment gate.
 ### One cell did not pass in that run
 
 `test (windows-latest, 24)` failed, and it is recorded here rather than omitted because a table of
-green cells that hides a red one is worse than no table. It died inside `windows-native.test.js` at
-`WIN-14 cleans up without orphaned processes`: 14 tests passed, then the file's process ended with no
-JavaScript error, no exit code and no exception in the log — only Node's own footer.
+green cells that hides a red one is worse than no table. The step summary read
+`tests 15, pass 14, fail 1`, which needs unpacking because it reads like a contradiction. `WIN-01`
+through `WIN-13` passed — 13 of `windows-native.test.js`'s 22 tests — plus the single cross-platform
+test in `native.test.js`, which is the 14th. The one failure is the file-level entry Node's test
+runner records when a test file's process dies. `WIN-14 cleans up without orphaned processes` was
+the test in flight and never reported a result. There was no JavaScript error, no exit code and no
+exception in the log — only Node's own footer.
 
 It is not caused by this branch. `windows-native.test.js` imports only `helpers/native.mjs`, and
 this PR changed `helpers/runtime.mjs`, `fault-injection.test.js` and added `proc-stat.test.js`; there
@@ -119,21 +146,23 @@ stays open.
 
 ## The container's PID 1 does not reap
 
-The container job passed every step up to fault injection, and failed there:
+The container job passed every step up to fault injection, and failed there. From run
+[`45789937818`](https://github.com/egarim/sentiora-terminal/actions/runs/45789937818) on `4b9bf53`,
+job `139806115694`, quoted verbatim — including the line lengths, because reformatting a log into
+something tidier is how a paraphrase starts passing as evidence:
 
 ```
-environment: {"node":"v24.22.3","arch":"arm64","platform":"linux","uid":1000,
-              "home":"/home/sentiora","stdinIsTTY":false,"stdoutIsTTY":false}
+environment: {"node":"v24.22.3","arch":"arm64","platform":"linux","uid":1000,"home":"/home/sentiora","stdinIsTTY":false,"stdoutIsTTY":false}
 ```
 
 `uid 1000` — genuinely non-root, asserted not assumed. Both streams report `isTTY: false`. Then
 `FI-05`, which SIGKILLs the runtime and checks that its shells do not outlive it:
 
 ```
-FI-05 survivor detail: [{"pid":4871,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"},
-                        {"pid":4879,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"},
-                        {"pid":4887,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"}]
-pid1 {"pid":1,"comm":"tail","state":"S"}
+    FI-05 survivors after SIGKILL of the runtime: 3 of 3 (linux, exit {"code":null,"signal":"SIGKILL"}, pid1 {"pid":1,"comm":"tail","state":"S","note":null})
+    FI-05 survivor detail: [{"pid":4871,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"},{"pid":4879,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"},{"pid":4887,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"}]
+✖ FI-05 killing the runtime outright leaves no orphaned shells (30257.616773ms)
+  AssertionError [ERR_ASSERTION]: killing the runtime orphaned shell pids 4871, 4879, 4887; kernel state […as above…]; pid1 {"pid":1,"comm":"tail","state":"S","note":null}
 ```
 
 Read that carefully, because the first version of this failure was ambiguous and the ambiguity was
@@ -156,15 +185,13 @@ one without measuring is how a real leak gets buried under a green re-run.
 ### What the test asserts now
 
 `FI-05` asserts that nothing is still **running**, and reports unreaped exit records separately
-rather than counting them as survivors. This is the actual output from the container job that
-passed:
+rather than counting them as survivors. Verbatim from run
+[`45792413782`](https://github.com/egarim/sentiora-terminal/actions/runs/45792413782) on `2a8f9f2`,
+job `139814502723` — the first run in which the container job went green:
 
 ```
-FI-05 after SIGKILL of the runtime: 0 running, 3 exited-but-unreaped, of 3
-  (linux, exit {"code":null,"signal":"SIGKILL"}, pid1 {"pid":1,"comm":"tail","state":"S","note":null})
-FI-05 unreaped exit records: [{"pid":4868,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"},
-                              {"pid":4876,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"},
-                              {"pid":4884,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"}]
+    FI-05 after SIGKILL of the runtime: 0 running, 3 exited-but-unreaped, of 3 (linux, exit {"code":null,"signal":"SIGKILL"}, pid1 {"pid":1,"comm":"tail","state":"S","note":null})
+    FI-05 unreaped exit records: [{"pid":4868,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"},{"pid":4876,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"},{"pid":4884,"killSaysAlive":true,"state":"Z","ppid":1,"comm":"MainThread"}]
 ✔ FI-05 killing the runtime outright leaves no orphaned shells (346.420718ms)
 ```
 
@@ -174,16 +201,25 @@ gave back 20 seconds the same way.
 
 This is not a weakened assertion. A shell that outlived the runtime would be state `S`, `R` or `D`
 and would still fail the test, so the SIGHUP-on-master-close mechanism is still fully under test.
-Only the exit-record case changed classification. Where the runtime is still alive the suite keeps
-the strict check — `untilGone` treats a zombie as a survivor, because there a zombie means the
-runtime failed to reap a child it owns. All 13 of those calls in `server.test.js` pass inside the
-container, so that path is clean and stays strict.
+Only the exit-record case changed classification.
+
+Where the runtime is still alive the suite keeps the strict check, because there a zombie means the
+runtime failed to reap a child it owns. Worth being precise about which function that is:
+`server.test.js` imports `untilGone` from `test/helpers/registry.mjs`, not from `runtime.mjs`, and
+that one is untouched — as is `runtime.mjs`'s own `untilGone`, which `FI-13` still uses. Only
+`FI-05` and `FI-06`, both after a SIGKILL of the runtime, moved to `untilNotRunning`. All 13 of
+`server.test.js`'s strict calls pass inside the container, so the path where Sentiora owns the
+reaping is clean.
 
 The classification lives in a pure `classifyLiveness()` with unit tests, including the case that
 matters most: an **unreadable** state counts as running. Windows and macOS have no `/proc`, so if
 "unknown" meant "gone" every leak assertion there would pass by asserting nothing. That test was
 verified non-vacuous by mutation — flipping the unknown-state branch to "gone" fails `PROC-11` and
 `PROC-13`, and the mutation was then reverted and the suite re-run at 40/40.
+
+`FI-06`'s call sits in a `finally`, where `untilNotRunning` would throw on a pid it cannot probe and
+mask the failure the test came to report — the exact hazard `collectSurvivors` exists to avoid. It
+filters unprobeable pids the same way and says so in the log rather than implying they are gone.
 
 ### Deployment guidance
 

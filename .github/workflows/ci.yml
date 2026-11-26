@@ -9,10 +9,8 @@ jobs:
       matrix:
         # windows-latest is x64 and windows-11-arm is ARM64; macos-latest is arm64
         # (Apple silicon) and ubuntu-24.04-arm is Linux ARM64. Keeping both
-        # architectures on both Windows and Linux is what makes the
-        # "Verify native binary architecture" step below meaningful -- it fails the
-        # job if any native binary belongs to a different architecture than the
-        # runtime, so an emulated x64 image can never be reported as ARM64.
+        # architectures on both Windows and Linux makes the two independently visible
+        # instead of assuming the x64 result speaks for ARM64.
         #
         # ubuntu-24.04-arm was added for issue #28: Vivarium runs sessions inside
         # build containers whose Docker engine reports linux/arm64, so that is the
@@ -20,13 +18,37 @@ jobs:
         #
         # Still NOT covered, so nothing may claim it: macOS x64. macos-latest is
         # arm64 and there is no macos-13 job, leaving Intel macOS unverified.
+        #
+        # expectArch/expectPlatform are what each label is supposed to select, and
+        # the "Assert the runtime environment" step compares them against what Node
+        # actually observes. That assertion -- not the binary check below -- is what
+        # makes an ARM64 claim safe: report-native-arch.mjs compares each binary
+        # against process.arch, so an x64 machine serving an arm64 label would
+        # produce x64 binaries under an x64 runtime, pass that check, and still be
+        # reported as ARM64 coverage. Only checking process.arch itself closes that.
         os:
-          - ubuntu-latest         # x64
-          - ubuntu-24.04-arm      # ARM64
-          - windows-latest        # x64
-          - windows-11-arm        # ARM64
-          - macos-latest          # arm64 (Apple silicon)
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-latest
         node: [22, 24]
+        include:
+          - os: ubuntu-latest
+            expectArch: x64
+            expectPlatform: linux
+          - os: ubuntu-24.04-arm
+            expectArch: arm64
+            expectPlatform: linux
+          - os: windows-latest
+            expectArch: x64
+            expectPlatform: win32
+          - os: windows-11-arm
+            expectArch: arm64
+            expectPlatform: win32
+          - os: macos-latest
+            expectArch: arm64
+            expectPlatform: darwin
     runs-on: ${{ matrix.os }}
     # A hanging native test must fail the job instead of running to the six hour
     # account limit: before the session teardown fix, the Windows job hung for
@@ -40,6 +62,9 @@ jobs:
 
       - name: Record runtime
         run: node -p "'node '+process.version+' arch='+process.arch+' platform='+process.platform+' abi='+process.versions.modules"
+
+      - name: Assert the runtime environment
+        run: node scripts/assert-runtime-env.mjs --expect-arch=${{ matrix.expectArch }} --expect-platform=${{ matrix.expectPlatform }}
 
       # npm ci refuses to run unless package-lock.json matches package.json, so a
       # dependency drift fails the build instead of silently testing something else.
@@ -62,7 +87,7 @@ jobs:
           node --check src/session.js
           node --check src/env.js
           node --check scripts/report-native-arch.mjs
-          node --check scripts/assert-container-env.mjs
+          node --check scripts/assert-runtime-env.mjs
 
       # Mocked, native and server suites run as separate steps so a failure is
       # attributable to one layer instead of hiding inside a single "npm test".
@@ -213,11 +238,19 @@ jobs:
       - name: Hand the workspace to the non-root user
         run: chown -R sentiora:sentiora "$GITHUB_WORKSPACE"
 
-      # If GitHub ever maps ubuntu-24.04-arm to an emulated x64 container, the
-      # architecture script alone would still pass: it compares the binaries against
-      # process.arch, so x64-on-x64 is self-consistent. This assertion is what makes
-      # the rest of the job mean "ARM64", and it is what turns "non-root, no TTY"
-      # from a description of the YAML into a measured property.
+      # Every matrix cell now asserts its own architecture, so what is unique to this
+      # job is the rest: that the process is not root, that neither stream is a TTY,
+      # and that HOME is the unprivileged user's rather than /root -- the last being
+      # what proves the `runuser -u sentiora -- env HOME=...` plumbing took effect.
+      #
+      # Honest scope: a GitHub Actions `run` step never has a TTY, so --expect-no-tty
+      # cannot fail here; it documents a property of the runner rather than testing
+      # this job. It is not vacuous in general -- run locally against an attached
+      # console it fails and reports stdinIsTTY:true -- and issue #28 asked for the
+      # no-TTY condition to be verified, so it is asserted rather than assumed even
+      # though the answer is predetermined. The load-bearing checks here are uid and
+      # arch. Same for --expect-home, which can only fail if the `env` prefix is
+      # dropped, which is exactly the plumbing worth pinning.
       #
       # It lives in a script rather than inline because the inline form needs
       # YAML -> bash -c '...' -> node -e "..." nesting, and at that depth a
@@ -233,7 +266,7 @@ jobs:
             echo "id: $(id)"
             echo "pwd: $(pwd)"
             echo "tty: $(tty || true)"
-            node scripts/assert-container-env.mjs \
+            node scripts/assert-runtime-env.mjs \
               --expect-arch=arm64 \
               --expect-platform=linux \
               --expect-non-root \
@@ -320,6 +353,25 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
+        # Same expectations as the runtime matrix: the desktop job also runs real
+        # PTY sessions and the same architecture check, so its ARM64 cell needs the
+        # same direct assertion on process.arch rather than trusting the label.
+        include:
+          - os: ubuntu-latest
+            expectArch: x64
+            expectPlatform: linux
+          - os: ubuntu-24.04-arm
+            expectArch: arm64
+            expectPlatform: linux
+          - os: windows-latest
+            expectArch: x64
+            expectPlatform: win32
+          - os: windows-11-arm
+            expectArch: arm64
+            expectPlatform: win32
+          - os: macos-latest
+            expectArch: arm64
+            expectPlatform: darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -327,6 +379,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+
+      - name: Assert the runtime environment
+        run: node scripts/assert-runtime-env.mjs --expect-arch=${{ matrix.expectArch }} --expect-platform=${{ matrix.expectPlatform }}
 
       - run: npm ci
 
