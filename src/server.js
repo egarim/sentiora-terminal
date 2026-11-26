@@ -4,6 +4,7 @@ import {createInterface} from 'node:readline';
 import {realpathSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {Session,dimensions} from './session.js';
+import {sessionEnv,envValidationError} from './env.js';
 const {Terminal}=xterm;
 export const sessions=new Map();
 export const SESSION_LIMIT=16;
@@ -45,12 +46,16 @@ const CREATE_OBSERVE_GRACE_MS=10000;
 // anything else.
 async function createSession(p){
   if(sessions.size+inflight.size>=SESSION_LIMIT)throw Error('Session limit');
-  const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll}=p;dimensions(cols,rows);
+  const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll,env}=p;dimensions(cols,rows);
   if(typeof command!=='string'||!command||!Array.isArray(args)||args.some(a=>typeof a!=='string'))throw Error('Invalid command');
   if(conptyDll!==undefined&&typeof conptyDll!=='boolean')throw Error('Invalid conptyDll');
+  // Validated before anything is spawned, and the message names no value: an error
+  // that quoted the offending entry would leak the secret it was rejecting into a
+  // JSON-RPC response and every log downstream of it.
+  const envError=envValidationError(env);if(envError)throw Error(envError);
   const terminal=new Terminal({cols,rows,scrollback:2000,allowProposedApi:true});
   let child;
-  try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:process.env,useConptyDll:conptyDll??conptyDllDefault});}
+  try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:sessionEnv(env),useConptyDll:conptyDll??conptyDllDefault});}
   catch(e){terminal.dispose();throw e;}
   let s;
   try{s=new Session(child,terminal);}catch(e){try{child.kill();}catch{}try{terminal.dispose();}catch{}throw e;}

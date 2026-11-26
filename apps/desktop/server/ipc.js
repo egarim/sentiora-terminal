@@ -46,6 +46,8 @@ const STATUS_BY_KIND = {
   'invalid-dimensions': 400,
   'invalid-input': 400,
   'invalid-command': 400,
+  'invalid-env': 400,
+  'invalid-conpty-dll': 400,
   'unknown-key': 400,
   'invalid-shell': 400,
   'no-shell': 400,
@@ -335,7 +337,11 @@ export class IpcServer {
       if (route === 'sessions' && method === 'GET') {
         return sendJson(response, 200, { sessions: this.#bridge.sessions });
       }
-      if (route === 'sessions' && method === 'POST') return this.#createSession(request, response);
+      // `await` matters here: without it a rejection from #createSession escapes this
+      // try/catch and lands in the outer handler, which has no kind-to-status
+      // mapping for it and answers 500. The sibling session route below already
+      // awaits; this one did not, so every typed create error was misreported.
+      if (route === 'sessions' && method === 'POST') return await this.#createSession(request, response);
       if (route === 'events' && method === 'GET') {
         const client = openEventStream(response, { onClose: () => this.#eventClients.delete(client) });
         this.#eventClients.add(client);
@@ -395,6 +401,33 @@ export class IpcServer {
     }
     if (!shell) return sendJson(response, 400, { error: 'no shell is available on this machine', kind: 'no-shell' });
 
+    // Rejected rather than coerced. `null` used to fall through as "not supplied",
+    // which made the bridge substitute its OWN environment -- so {"env":null}
+    // returned 201 carrying the user's full environment, from the one feature whose
+    // only purpose is narrowing. Ambiguity at a security boundary gets refused, and
+    // src/env.js treats null as "no request" (allowlist), so the two layers used to
+    // give the same value opposite meanings, with the HTTP one being the wide one.
+    //
+    // This duplicates src/env.js's rules on purpose: the bridge deliberately does
+    // not import from src/. The copy must stay EQUIVALENT, or a request passes here
+    // and is rejected by the runtime as a 500 with no kind instead of a 400. `=` and
+    // NUL are rejected because node-pty builds `key=value` and, on Windows, a
+    // NUL-terminated block -- either character lets one entry become two.
+    let env;
+    if (body.env !== undefined) {
+      const rejected = body.env === null
+        || typeof body.env !== 'object'
+        || Array.isArray(body.env)
+        || Object.entries(body.env).some(([k, v]) => typeof k !== 'string'
+          || k === '' || k.includes('=') || k.includes('\0')
+          || k === '__proto__' || k === 'constructor' || k === 'prototype'
+          || typeof v !== 'string' || v.includes('\0'));
+      if (rejected) {
+        return sendJson(response, 400, { error: 'env must be an object mapping names to string values', kind: 'invalid-env' });
+      }
+      env = body.env;
+    }
+
     const session = await this.#bridge.create({
       command: shell.command,
       args: shell.args,
@@ -403,6 +436,7 @@ export class IpcServer {
       rows: body.rows,
       label: typeof body.label === 'string' ? body.label.slice(0, 120) : shell.label,
       shell,
+      env,
     });
     return sendJson(response, 201, { session });
   }

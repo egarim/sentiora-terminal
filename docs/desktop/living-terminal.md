@@ -201,9 +201,16 @@ bridge". Concretely:
    after validation so a malformed request cannot consume the budget.
 7. **Static serving is contained.** The path is resolved and then containment-checked against the
    build directory; encoded traversals (`%2e%2e%2f`) are never decoded into a filesystem path.
-8. **Environment inheritance.** The runtime spawns children with `env: process.env`, so anything in
-   the bridge's environment is visible to every shell (telekinesis.md §11.1). `createDesktopBackend`
-   accepts an explicit `env` so a caller can narrow it; it never widens it silently.
+8. **Environment inheritance is scoped, and the desktop opts in deliberately.** The runtime no
+   longer spawns children with `env: process.env`; since issue #26 a session defaults to a small
+   allowlist (`PATH`, `HOME`/`USERPROFILE`, `TERM`, `LANG`, temp and locale, plus the Windows
+   essentials) and inherits nothing else unless the caller names it (telekinesis.md §11.1).
+   `RuntimeClient.createSession` passes the bridge's own `env` explicitly, so a desktop shell still
+   gets the user's environment. That is a deliberate opt-in rather than an oversight: the bridge
+   runs as the local user and its sessions *are* that user's shells, so narrowing them would drop
+   the user's own variables with no security gain — there is no privilege boundary to enforce
+   between the two. A caller can still narrow a single session by passing `env` in the create
+   params, which then wins over the bridge default.
 9. **Observations are unredacted.** `screen` can contain a password a child echoed. PR1 does not log
    observations. Redaction belongs to whatever starts auditing sessions (PR4's recording), and is
    called out here so it is not forgotten.
@@ -359,10 +366,11 @@ them being accepted; each has a working fallback today.
    distinguishes it. Already recommended in telekinesis.md §10. `bridge/errors.js` is the single
    place that would change.
 
-3. **Scoped environment for `terminal.create`.** Children currently inherit the host's full
-   environment (telekinesis.md §11.1), so the host process's credentials are visible to every
-   session. An optional `env` parameter with an explicit allow-list would let the desktop app run
-   shells with less than everything the bridge can see.
+3. ~~**Scoped environment for `terminal.create`.**~~ **Done (issue #26).** Children no longer
+   inherit the host's full environment: the runtime defaults a session to a small allowlist and
+   accepts an optional `env` object. This bridge opts into its own environment explicitly, and
+   `POST /api/sessions` forwards a caller-supplied `env` through `SessionBridge.create` — so the
+   narrowing described in §8 is reachable from the HTTP API, not only from in-process callers.
 
 4. **Cancellation for `terminal.wait`.** There is no request-id cancellation, so an in-flight wait
    can only be outlasted. The bridge polls at 250 ms to keep responsiveness, which means

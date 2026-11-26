@@ -183,6 +183,18 @@ async function dispatch(method, params = {}) {
     // (that is the RPC channel) and the bridge must never forward it to the UI;
     // the tests read stderr to learn what was issued so they can assert absence.
     process.stderr.write(`OWNER ${session.id} ${session.owner}\n`);
+    // Echoes what the bridge actually forwarded, so a test can prove the `env`
+    // parameter travelled the whole path (ipc.js -> SessionBridge.create ->
+    // RuntimeClient.createSession -> terminal.create) rather than being silently
+    // dropped somewhere. Conditional on probe keys, so no existing test's screen
+    // changes and no test that does not opt in is affected.
+    if (params.env && Object.hasOwn(params.env, 'SENTIORA_ENV_PROBE')) {
+      session.print(`FAKE ENV probe=${params.env.SENTIORA_ENV_PROBE} keys=${Object.keys(params.env).length}`);
+    } else if (params.env && Object.hasOwn(params.env, 'SENTIORA_BRIDGE_MARKER')) {
+      // RuntimeClient substitutes its own `env` when the caller omits one; this is
+      // how a test sees that substitution actually reach the runtime.
+      session.print(`FAKE ENV bridge=${params.env.SENTIORA_BRIDGE_MARKER}`);
+    }
     // autoboot:false leaves the session in 'spawned', which is how the tests
     // assert that 'spawned' is not treated as readiness.
     if (!NO_AUTOBOOT && params.autoboot !== false) session.print('FAKE READY');

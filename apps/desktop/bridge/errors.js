@@ -18,6 +18,10 @@ const KINDS = {
   'invalid-dimensions': { match: /^Invalid dimensions$/ },
   'invalid-command': { match: /^Invalid command$/ },
   'invalid-conpty-dll': { match: /^Invalid conptyDll$/ },
+  // The runtime rejects an env that is not an object of clean string values. Its
+  // message deliberately names no key and no value, so matching it cannot leak a
+  // secret into a log the way a message carrying the offending entry would.
+  'invalid-env': { match: /^Invalid env$/ },
   'resize-denied': { match: /^Resize denied$/, terminal: true },
   'session-limit': { match: /^Session limit$/, retryable: true },
   'invalid-wait': { match: /^Invalid wait$/ },
