@@ -29,7 +29,14 @@ function emulator(cols = 20, rows = 6) {
   return { terminal, write, screen };
 }
 
-const snapshotOf = emu => ({ screen: emu.screen(), cols: emu.terminal.cols, rows: emu.terminal.rows, cursor: { x: 0, y: 0 } });
+// Reads the emulator's REAL cursor. Hardcoding {x:0,y:0} here was what let a
+// missing cursor-restore in replayRecording go unnoticed: with a fabricated cursor,
+// replay happened to agree with the live screen for the one shape REC-10 used, and
+// the test passed for the wrong reason.
+const snapshotOf = emu => {
+  const b = emu.terminal.buffer.active;
+  return { screen: emu.screen(), cols: emu.terminal.cols, rows: emu.terminal.rows, cursor: { x: b.cursorX, y: b.cursorY } };
+};
 
 test('REC-01 numbers events from 1 and returns them in insertion order', () => {
   const r = new Recording({ cols: 20, rows: 6 });
@@ -154,33 +161,48 @@ test('REC-09 replays output into the same screen the live emulator shows', async
   assert.equal(replayed.screen, expected);
 });
 
-test('REC-10 a truncated recording replays to the same screen as an intact one', async () => {
+test('REC-10 a truncated recording replays to the same screen AND cursor as an intact one', async () => {
   // The acceptance criterion "a recording played back ends in the same screen" has
   // to hold *after* truncation, or the byte limit quietly buys itself by breaking
   // playback. Two rings see identical output; only one is allowed to keep it all.
-  // 120 lines against a 512-byte ring truncates several times over, which is what
-  // makes the comparison meaningful, while keeping the unit suite fast enough that
-  // nobody is tempted to skip it.
+  //
+  // The tail deliberately moves the cursor MID-SCREEN and then writes more output
+  // relative to it. The first version of this test wrote only whole lines, which
+  // left the cursor at the bottom-left -- exactly where writing a viewport-sized
+  // text snapshot also leaves it -- so replay's missing cursor restore was invisible
+  // and this test passed while the feature was broken. A shell prompt sits
+  // mid-screen; that is the common case, not the corner case.
   const lines = Array.from({ length: 120 }, (_, i) => `line-${String(i).padStart(3, '0')}\r\n`);
+  const tail = '\x1b[3;7HX';   // cursor to row 3 col 7 (1-based), write there
+  const after = 'Y\r\nZ';      // positioned relative to that cursor, not to row 0
 
   const full = new Recording({ cols: 20, rows: 6 });
   const ref = emulator();
-  for (const line of lines) { await ref.write(line); full.recordOutput(line); }
+  const feed = async (emu, rec) => {
+    for (const chunk of [...lines, tail, after]) { await emu.write(chunk); rec.recordOutput(chunk); }
+  };
+  await feed(ref, full);
   const expected = ref.screen();
+  const expectedCursor = snapshotOf(ref).cursor;
   ref.terminal.dispose();
   assert.equal(full.truncated, false);
+  // Precondition, asserted rather than assumed: if the cursor sat on the last row the
+  // test could not detect a lost cursor position, and would pass while broken.
+  assert.ok(expectedCursor.y < 5, `cursor must be above the last row to be diagnostic, got ${JSON.stringify(expectedCursor)}`);
 
   const live = emulator();
   const small = new Recording({ limit: 512, cols: 20, rows: 6, snapshotProvider: () => snapshotOf(live) });
-  for (const line of lines) { await live.write(line); small.recordOutput(line); }
+  await feed(live, small);
   assert.equal(small.truncated, true, 'the small ring must have truncated or this test proves nothing');
-  assert.ok(small.bytes <= 512 + 200, 'and it must still be inside its bound');
+  assert.ok(small.bytes <= 512, `retained ${small.bytes} bytes against a 512 cap`);
+  assert.deepEqual(snapshotOf(live).cursor, expectedCursor, 'both emulators saw the same input');
   live.terminal.dispose();
 
   const intact = await replayRecording({ events: full.eventsAfter(0).events, cols: 20, rows: 6, Terminal });
   const truncated = await replayRecording({ events: small.eventsAfter(0).events, cols: 20, rows: 6, Terminal });
   assert.equal(intact.screen, expected, 'sanity: the intact replay reproduces the live screen');
   assert.equal(truncated.screen, expected, 'a truncated recording must still replay to the same final screen');
+  assert.deepEqual(truncated.cursor, expectedCursor, 'and leave the cursor where the live session left it');
 });
 
 test('REC-11 replays a resize so the recording converges on the final geometry', async () => {
@@ -267,4 +289,71 @@ test('REC-16 an event larger than the whole cap is dropped, but the snapshot car
   assert.ok(events[0].screen.includes('B'), 'the snapshot must reflect what the dropped chunk rendered');
   assert.ok(r.bytes <= 1024);
   emu.terminal.dispose();
+});
+
+test('REC-17 a boundary snapshot restores its geometry and cursor, not just its text', async () => {
+  // Pinned directly with a synthetic pair rather than left to wherever truncation
+  // happens to land in a longer replay, because this is the property REC-10 depends
+  // on and it failed silently once already.
+  const events = [
+    { seq: 1, kind: 'snapshot', screen: 'prompt$ \n\n\n\n', cols: 40, rows: 5, cursor: { x: 8, y: 0 } },
+    { seq: 2, kind: 'output', data: Buffer.from('ls\r\n', 'utf8').toString('base64') },
+  ];
+  // Replay starts at the session's initial geometry, deliberately NOT the snapshot's:
+  // a resize from before the truncation was dropped with the prefix, so the snapshot
+  // is the only surviving record of the shape it was rendered in.
+  const replayed = await replayRecording({ events, cols: 20, rows: 6, Terminal });
+  assert.equal(replayed.cols, 40, 'the snapshot geometry must be restored');
+  assert.equal(replayed.rows, 5, 'the snapshot geometry must be restored');
+  const rows = replayed.screen.split('\n');
+  assert.equal(rows[0].trimEnd(), 'prompt$ ls', 'output after the boundary lands on the prompt row');
+  assert.equal(rows[1].trimEnd(), '', 'not on the last row, where writing the viewport text leaves the cursor');
+});
+
+test('REC-18 throws on a snapshot with no screen rather than replaying without it', async () => {
+  // Consistent with REC-12: an event replay cannot honour must fail loudly. Skipping
+  // it would produce a plausible but wrong screen, which is worse than refusing.
+  await assert.rejects(
+    replayRecording({ events: [{ seq: 1, kind: 'snapshot', cols: 20, rows: 5 }], cols: 20, rows: 6, Terminal }),
+    /snapshot event 1 carries no screen text/,
+  );
+});
+
+test('REC-19 timestamps are offsets from the start of the recording, not wall-clock times', () => {
+  // Uses the injected clock the constructor documents; a consumer correlating a
+  // recording against its own timeline needs to know these are relative.
+  let clock = 1000;
+  const r = new Recording({ now: () => clock });
+  clock += 25;
+  r.recordOutput('a');
+  clock += 75;
+  r.recordResize(30, 10);
+  const { events } = r.eventsAfter(0);
+  assert.deepEqual(events.map(e => e.at), [25, 100]);
+  assert.equal(r.toJSON().startedAt, 1000);
+});
+
+test('REC-20 survives a snapshot larger than the whole limit instead of overflowing the stack', () => {
+  // A 300x150 viewport is ~45 KB of screen text, far over a 1 KiB cap. Truncation
+  // re-enters the append path to store the re-anchoring snapshot, so without the
+  // re-entrancy guard this clears the ring, appends an over-cap snapshot, truncates
+  // again, and recurses until the stack goes. No minimum limit can prevent that,
+  // because no fixed floor bounds a viewport -- which is why the guard exists rather
+  // than a larger constructor minimum.
+  const big = 'x'.repeat(300);
+  const screen = Array.from({ length: 150 }, () => big).join('\n');
+  const r = new Recording({
+    limit: 1024,
+    snapshotProvider: () => ({ screen, cols: 300, rows: 150, cursor: { x: 0, y: 0 } }),
+  });
+  for (let i = 0; i < 50; i += 1) r.recordOutput('y'.repeat(200));
+  const { events } = r.eventsAfter(0);
+  assert.equal(events[0].kind, 'snapshot', 'the snapshot is retained even though it exceeds the cap');
+  assert.equal(r.truncated, true);
+  // Bounded by the cap plus the one snapshot that cannot be dropped. Degenerate but
+  // honest: a cap smaller than one viewport retains the viewport and nothing else,
+  // and reports it through truncated/droppedEvents rather than pretending otherwise.
+  assert.ok(r.bytes <= 1024 + screen.length + RECORD_EVENT_OVERHEAD,
+    `retained ${r.bytes} bytes, over the cap-plus-one-viewport bound`);
+  assert.ok(r.droppedEvents > 0);
 });

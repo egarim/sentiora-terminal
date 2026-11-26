@@ -112,23 +112,36 @@ longer knows. A failed teardown is reported on the runtime's **stderr** as
 child actually died has to watch stderr or check the pid itself; the close result no longer
 carries that distinction.
 
-## 4. The one mapping that does not work: push vs pull
+## 4. The mapping that used not to work: push vs pull
 
-`IConsoleSession` implementations **push raw output bytes** to a callback from a background
-reader. Sentiora has no push channel and never exposes raw bytes — it exposes the **rendered
-screen** after the emulator has applied escape sequences. That is the entire point of the design.
+`IConsoleSession` implementations **push raw output bytes** to a callback from a background reader.
+Sentiora still has no push channel — it never emits unsolicited lines on stdout, because WIN-15 pins
+that a child must never be able to put a line on the RPC channel. That half is unchanged, and an
+adapter still has to poll.
+
+What *has* changed (issue #27) is the other half of the old claim. The runtime now exposes the raw
+bytes: `terminal.stream {sessionId, afterSequence, timeoutMs}` returns the child's original output
+chunks, base64-encoded, each with a monotonic sequence number, from a bounded server-side ring.
+Colour, byte-level framing and escape sequences that produced no visible change are all preserved,
+because nothing is re-rendered — it is the original stream.
 
 Consequences for an adapter:
 
-- A faithful raw-byte stream **cannot** be reconstructed. Screen diffs are lossy: they cannot
-  recover scrollback that left the viewport, byte-level framing, or escape sequences that produced
-  no visible change.
-- The adapter can synthesise an approximation by running a background
-  `terminal.wait {afterRevision, timeoutMs}` loop per session and diffing consecutive screens.
-- **Recommendation:** the Sentiora backend should declare the raw-output callback unsupported and
-  have Telekinesis consume `console_read` (a screen snapshot) instead — which is already how
-  `console_read` is documented ("a snapshot, not a stream"). Anything in Telekinesis that depends
-  on raw incremental bytes needs identifying before this backend is enabled.
+- A faithful raw-byte stream **can** now be reconstructed: poll `terminal.stream`, concatenate the
+  `output` events in sequence order. Delivery granularity is the poll timeout, not the child's write
+  boundaries.
+- The stream is **live from the point of attach**. A cursor of 0 returns a snapshot of the current
+  screen and *no* events, and resumes from there; it does not replay history, because the snapshot
+  already accounts for it and returning both would make a consumer apply that output twice. If the
+  cursor falls behind the ring the response sets `resync: true` with a fresh snapshot — treat that as
+  a re-attach, not a continuation, and do not assume the missed bytes are recoverable from the stream.
+- History is a different call: `terminal.recording {sessionId, owner}`, owner-gated and replayable.
+  See [streaming and recording](../streaming-and-recording.md).
+- Screen-diffing `terminal.observe` is still available and still lossy in exactly the ways it always
+  was: it cannot recover scrollback that left the viewport, byte-level framing, or colour.
+- **Recommendation:** an adapter that needs Telekinesis's raw-output callback should drive it from
+  `terminal.stream` rather than from screen diffs. One that only needs `console_read` semantics can
+  keep using `terminal.observe`, which is unchanged.
 
 ## 5. Revision and ownership: the adapter's job, not the caller's
 

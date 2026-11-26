@@ -31,6 +31,11 @@ export class Session {
       cols: terminal?.cols, rows: terminal?.rows,
       snapshotProvider: ()=>this.screenSnapshot(),
     });
+    // Seed the ring with the initial screen. An empty ring would make an attach hand
+    // back cursor 0, so the consumer's next poll would attach again immediately
+    // instead of long-polling -- a busy loop for as long as the child stays quiet.
+    // It also gives a recording a defined starting state to replay from.
+    this.recording.recordSnapshot(this.screenSnapshot());
     this.subscriptions=[
       // A rejected emulator write must not poison `pending`: observe(), input(),
       // wait(), resize() and close() all await it, so one bad chunk would make the
@@ -84,7 +89,12 @@ export class Session {
   }
   async observe(){
     await this.pending;
-    return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,writeErrors:this.writeErrors,renderErrors:this.renderErrors,idleMilliseconds:Date.now()-this.lastActivity,...this.screenSnapshot()};
+    const snap=this.screenSnapshot();
+    // Field order is deliberately identical to the pre-#27 response. Nothing in tree
+    // depends on it, but "no existing method changed shape" ought to hold at the
+    // serialised-byte level and not only in the field-set sense, so a client
+    // comparing responses sees no difference at all.
+    return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,cols:snap.cols,rows:snap.rows,writeErrors:this.writeErrors,renderErrors:this.renderErrors,cursor:snap.cursor,screen:snap.screen,idleMilliseconds:Date.now()-this.lastActivity};
   }
   async input({owner,revision,text}){
     await this.pending;
@@ -126,13 +136,31 @@ export class Session {
     if(!Number.isSafeInteger(cursor)||cursor<0)throw Error('Invalid sequence');
     if(!Number.isFinite(timeout)||timeout<0)throw Error('Invalid stream');
     await this.pending;
+    const base=()=>({
+      sessionId:this.id,state:this.state,running:!this.exit&&!this.closed,exit:this.exit,
+      oldestSequence:this.recording.oldestSequence,
+      truncated:this.recording.truncated,droppedEvents:this.recording.droppedEvents,
+      inputRecorded:this.recording.inputRecorded,
+    });
     // Falling behind the ring is reported rather than papered over: a gap-free
-    // replay from a stale cursor is impossible, so the caller gets the current
-    // screen and a new cursor instead of a partial history that looks complete.
+    // replay from a stale cursor is impossible.
     const resync=this.recording.missedEvents(cursor);
-    const includeSnapshot=cursor===0||resync;
-    const from=resync?this.recording.latestSequence:cursor;
-    let selected=this.recording.eventsAfter(from,{includeInput:false});
+    // A snapshot response carries NO events, and nextSequence is the ring position
+    // the snapshot was taken at. Returning both would be self-contradictory: the
+    // snapshot is produced after the events would have been selected, so it already
+    // contains them, while a cursor pointing at the last returned event tells the
+    // consumer to apply them a second time. One snapshot, one cursor, no overlap.
+    // It also means an attach or a resync answers immediately instead of waiting out
+    // timeoutMs for events the caller has no use for.
+    if(cursor===0||resync){
+      const snapshot=await this.observe();
+      // Read after the observation resolves: the write chain records each chunk as it
+      // is rendered, so once observe() has settled, the ring holds everything the
+      // snapshot shows and this cursor is exactly the snapshot's position.
+      const at=this.recording.latestSequence;
+      return {...base(),resync,revision:snapshot.revision,snapshot,events:[],nextSequence:at,latestSequence:at};
+    }
+    let selected=this.recording.eventsAfter(cursor,{includeInput:false});
     // Waiting reuses the same waiter set as wait(), so a stream poll is woken by the
     // next change instead of spinning, and the bound is capped identically.
     if(!selected.events.length&&!this.exit&&!this.closed){
@@ -141,21 +169,13 @@ export class Session {
         const timer=setTimeout(wake,Math.min(timeout,30000));this.waiters.add(wake);
       });
       await this.pending;
-      selected=this.recording.eventsAfter(from,{includeInput:false});
+      selected=this.recording.eventsAfter(cursor,{includeInput:false});
     }
     const events=selected.events;
-    const latest=this.recording.latestSequence;
-    return {
-      sessionId:this.id,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,
-      // Never the owner token: a watcher must not be able to type. Pinned by test.
-      resync,
-      snapshot:includeSnapshot?await this.observe():null,
-      events,
-      nextSequence:events.length?events[events.length-1].seq:(resync?latest:cursor),
-      oldestSequence:this.recording.oldestSequence,latestSequence:latest,
-      truncated:this.recording.truncated,droppedEvents:this.recording.droppedEvents,
-      inputRecorded:this.recording.inputRecorded,
-    };
+    // Never the owner token: a watcher must not be able to type. Pinned by test.
+    return {...base(),resync:false,revision:this.revision,snapshot:null,events,
+      nextSequence:events.length?events[events.length-1].seq:cursor,
+      latestSequence:this.recording.latestSequence};
   }
   // Owner-gated: unlike the stream this can contain keystrokes, which is exactly
   // what may hold a secret. The ownership check lives in dispatch next to the other

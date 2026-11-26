@@ -16,6 +16,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import xterm from '@xterm/headless';
 import { startRuntime } from './helpers/runtime.mjs';
+import { replayRecording } from '../src/recording.js';
 import { FIXTURE } from './helpers/native.mjs';
 
 const { Terminal } = xterm;
@@ -54,19 +55,29 @@ async function drain(server, sessionId, { from = 0, marker, timeout = 30000 } = 
   const events = [];
   let cursor = from;
   let resync = false;
-  let snapshots = 0;
+  let snapshot = null;
+  let polls = 0;
   const deadline = Date.now() + timeout;
   for (;;) {
     const { result } = await server.call('terminal.stream', { sessionId, afterSequence: cursor, timeoutMs: 250 });
+    polls += 1;
     resync = resync || result.resync;
-    if (result.snapshot) snapshots += 1;
+    if (result.snapshot) snapshot = result.snapshot;
     events.push(...result.events);
     cursor = result.nextSequence;
     const text = outputText(events);
-    if (marker ? text.includes(marker) : result.events.length === 0) break;
+    if (marker) {
+      if (text.includes(marker)) break;
+    } else if (polls > 1 && result.events.length === 0) {
+      // The first response is the attach handshake: a snapshot and, by design, no
+      // events. Ending the drain there would return nothing at all and let every
+      // assertion about `events` pass vacuously, so only a *subsequent* empty poll
+      // means the stream has been drained.
+      break;
+    }
     if (Date.now() > deadline) throw new Error(`drain timed out after ${events.length} events; text so far:\n${text.slice(-500)}`);
   }
-  return { events, cursor, resync, snapshots };
+  return { events, cursor, resync, snapshot, polls };
 }
 
 const outputText = events => Buffer.concat(
@@ -86,39 +97,79 @@ async function replayBytes(buffer, cols, rows) {
   }
 }
 
-test('STR-01 two independent watchers converge on the same screen observe reports', opts, async () => {
+// Replays a watcher's view: the snapshot it attached with, plus the bytes it
+// received afterwards. This is the path a real consumer takes, and exercising it
+// through the shipped replayRecording means the test cannot pass on a replay
+// implementation that only works for the cases this file happens to construct.
+async function replayFromSnapshot(snapshot, events, cols, rows) {
+  return replayRecording({
+    events: [
+      {
+        seq: 0, kind: 'snapshot', screen: snapshot.screen,
+        cols: snapshot.cols, rows: snapshot.rows, cursor: snapshot.cursor,
+      },
+      ...events,
+    ],
+    cols, rows, Terminal,
+  });
+}
+
+test('STR-01 two watchers attaching at different times converge on the screen observe reports', opts, async () => {
   const server = startRuntime();
   try {
     const created = await server.create(spawnFixture());
     const { sessionId, owner } = created;
     await server.waitScreen(sessionId, 'FIXTURE READY');
 
-    // Two watchers attach separately and poll separately. Neither knows about the
-    // other, and neither holds the owner token.
-    for (const command of ['echo one', 'echo two', 'echo three']) {
-      await sendCommand(server, sessionId, owner, command);
-    }
+    // B attaches first, A attaches after two of the three commands. Both then receive
+    // only what follows their own attach point, so they converge on the same final
+    // screen by different routes -- B replaying more history, A less. If
+    // `afterSequence` were ignored, or if an attach replayed the whole ring instead of
+    // snapshotting, the divergent content assertions below would fail. The first
+    // version of this test attached both watchers at 0 against an already-quiesced
+    // session, so a server that ignored the cursor entirely would have passed it.
+    const { result: attachB } = await server.call('terminal.stream', { sessionId, afterSequence: 0, timeoutMs: 200 });
+    assert.ok(attachB.snapshot, 'attaching must yield a snapshot');
+    assert.deepEqual(attachB.events, [], 'a snapshot response carries no events, so the two views cannot overlap');
+    const cursorB = attachB.nextSequence;
+    assert.ok(cursorB > 0, 'the fixture banner must already have been recorded');
+
+    await sendCommand(server, sessionId, owner, 'echo one');
+    await sendCommand(server, sessionId, owner, 'echo two');
+    await server.waitScreen(sessionId, 'ECHO:two');
+
+    const { result: attachA } = await server.call('terminal.stream', { sessionId, afterSequence: 0, timeoutMs: 200 });
+    const cursorA = attachA.nextSequence;
+    assert.ok(cursorA > cursorB, 'a later attach resumes from a later cursor');
+    assert.match(attachA.snapshot.screen, /ECHO:two/, 'the later snapshot already contains the earlier output');
+
+    await sendCommand(server, sessionId, owner, 'echo three');
     await server.waitScreen(sessionId, 'ECHO:three');
 
-    const watcherA = await drain(server, sessionId, { marker: 'ECHO:three' });
-    const watcherB = await drain(server, sessionId, { marker: 'ECHO:three' });
-    const observed = await server.call('terminal.observe', { sessionId });
+    const watcherB = await drain(server, sessionId, { from: cursorB, marker: 'ECHO:three' });
+    const watcherA = await drain(server, sessionId, { from: cursorA, marker: 'ECHO:three' });
+    const { result: observed } = await server.call('terminal.observe', { sessionId });
 
-    // Same bytes, in the same order, for both watchers.
-    assert.equal(outputText(watcherA.events), outputText(watcherB.events), 'two watchers must see the same output');
-    assert.deepEqual(
-      watcherA.events.filter(e => e.kind === 'output').map(e => e.data),
-      watcherB.events.filter(e => e.kind === 'output').map(e => e.data),
-      'identical payload encoding, not merely identical decoded text',
-    );
+    // Different cursors must produce different event sets, or the cursor is decoration.
+    const textA = outputText(watcherA.events);
+    const textB = outputText(watcherB.events);
+    assert.ok(textB.includes('ECHO:one'), 'B attached before the first command, so it sees it');
+    assert.ok(!textA.includes('ECHO:one'), 'A attached after it, so it must not re-receive it');
+    assert.ok(textA.includes('ECHO:three') && textB.includes('ECHO:three'), 'both see what followed their attach');
+    for (const text of [textA, textB]) {
+      assert.ok(!text.includes('FIXTURE READY'), 'neither re-receives output from before the ring or its attach');
+    }
+    assert.ok(watcherB.events.length > watcherA.events.length, 'B saw strictly more events than A');
 
-    // And what they saw renders to the screen the runtime itself reports.
-    const replayed = await replayBytes(Buffer.from(outputText(watcherA.events), 'latin1'), observed.result.cols, observed.result.rows);
-    assert.equal(replayed, observed.result.screen, 'a watcher replaying the stream must land on observe()\'s screen');
+    // And both routes land on the screen the runtime itself reports.
+    const viaB = await replayFromSnapshot(attachB.snapshot, watcherB.events, observed.cols, observed.rows);
+    const viaA = await replayFromSnapshot(attachA.snapshot, watcherA.events, observed.cols, observed.rows);
+    assert.equal(viaB.screen, observed.screen, 'watcher B: early snapshot plus more bytes');
+    assert.equal(viaA.screen, observed.screen, 'watcher A: later snapshot plus fewer bytes');
 
-    // Sequences are strictly increasing with no gaps or repeats, which is what makes
-    // "you missed some" detectable at all.
-    const seqs = watcherA.events.map(e => e.seq);
+    // Sequences ascend without repeats, which is what makes "you missed some"
+    // detectable at all.
+    const seqs = watcherB.events.map(e => e.seq);
     assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), 'sequence numbers must ascend');
     assert.equal(new Set(seqs).size, seqs.length, 'sequence numbers must not repeat');
   } finally {
@@ -132,10 +183,16 @@ test('STR-02 the stream carries colour that observe cannot', opts, async () => {
     const created = await server.create(spawnFixture());
     const { sessionId, owner } = created;
     await server.waitScreen(sessionId, 'FIXTURE READY');
+    // Attach BEFORE the coloured output. The stream is live-from-attach: a consumer
+    // that attaches afterwards gets the current screen as a snapshot and no
+    // historical bytes, because the snapshot already accounts for them and returning
+    // both would make it apply that output twice. Recovering full history is
+    // terminal.recording's job, not the stream's.
+    const { result: attach } = await server.call('terminal.stream', { sessionId, afterSequence: 0, timeoutMs: 200 });
     await sendCommand(server, sessionId, owner, 'ansi');
     await server.waitScreen(sessionId, 'ANSI-DONE');
 
-    const { events } = await drain(server, sessionId, { marker: 'ANSI-DONE' });
+    const { events } = await drain(server, sessionId, { from: attach.nextSequence, marker: 'ANSI-DONE' });
     const raw = outputText(events);
     // The escape bytes are present in the stream: colour is preserved because the
     // original chunk is carried, not a rendering of it.
@@ -214,6 +271,13 @@ test('STR-05 opt-in input recording keeps keystrokes out of the watcher stream',
     const created = await server.create(spawnFixture({ recordInput: true }));
     const { sessionId, owner } = created;
     await server.waitScreen(sessionId, 'FIXTURE READY');
+    // Attach before typing, for the same reason as STR-02: the stream is
+    // live-from-attach. It also makes the test stronger -- the keystroke is typed
+    // while a watcher cursor is already open, so the filter is exercised on the path
+    // a real watcher is actually on rather than on a history read.
+    const { result: attach } = await server.call('terminal.stream', { sessionId, afterSequence: 0, timeoutMs: 200 });
+    // A credential-shaped string, so the assertion is about the secret and not merely
+    // about some text that might coincidentally be absent.
     await sendCommand(server, sessionId, owner, 'echo top-secret-value');
     await server.waitScreen(sessionId, 'ECHO:top-secret-value');
 
@@ -226,7 +290,7 @@ test('STR-05 opt-in input recording keeps keystrokes out of the watcher stream',
 
     // The watcher view is filtered at the source, so no cursor and no argument
     // reaches the keystrokes -- including ones recorded before it attached.
-    const { events } = await drain(server, sessionId, { marker: 'ECHO:top-secret-value' });
+    const { events } = await drain(server, sessionId, { from: attach.nextSequence, marker: 'ECHO:top-secret-value' });
     assert.deepEqual(events.filter(e => e.kind === 'input'), [], 'a stream must never carry input events');
     const streamedText = outputText(events);
     // The child echoes the secret back, so the assertion is on the event kind and on
@@ -332,7 +396,15 @@ test('STR-08 a watcher that never polls does not stall the session or grow the r
     // to prove, because there is no back-pressure to hide behind.
     for (let i = 0; i < 30; i += 1) await sendCommand(server, sessionId, owner, `echo unwatched-${i}`);
     const observed = await server.waitScreen(sessionId, 'ECHO:unwatched-29');
-    assert.match(observed.screen, /ECHO:unwatched-29/);
+    // NOT asserting the marker again: waitScreen only returns once the screen
+    // contains it, so re-checking it asserts nothing -- which is what this test
+    // originally did. What is worth asserting is that all 30 commands were rendered
+    // rather than only the last one, since each accepted input bumps the revision.
+    // A producer that STALLED is caught separately, by waitScreen exceeding its own
+    // budget and throwing. That, not a wall-clock threshold, is the "does not slow
+    // the program" half: a timing assertion here would be a guess about runner load,
+    // which is how WIN-02 became a flake (#30).
+    assert.ok(observed.revision >= 30, `revision ${observed.revision} after 30 typed commands`);
 
     const { result: recording } = await server.call('terminal.recording', { sessionId, owner });
     assert.ok(recording.bytes <= 8192 + 512, `an unwatched session must stay bounded, retained ${recording.bytes}`);
@@ -351,24 +423,32 @@ test('STR-09 streaming an exited session reports the exit and does not hang', op
 
     // waitScreen cannot help here: the child is going away. Poll the stream, which
     // is the thing under test, and let its own timeout bound the wait.
+    //
+    // With an ADVANCING cursor, as a consumer uses. The first response is the attach
+    // snapshot and carries no events by design, so breaking out on `running === false`
+    // at that point would assert on an empty event list and report that the exit was
+    // never recorded when it simply had not been asked for yet.
     const deadline = Date.now() + 20000;
-    let streamed = null;
+    let cursor = 0;
+    let exit = null;
+    let last = null;
     for (;;) {
-      const { result } = await server.call('terminal.stream', { sessionId, afterSequence: 0, timeoutMs: 500 });
-      streamed = result;
-      if (!result.running || result.events.some(e => e.kind === 'exit')) break;
+      const { result } = await server.call('terminal.stream', { sessionId, afterSequence: cursor, timeoutMs: 500 });
+      last = result;
+      cursor = result.nextSequence;
+      exit = result.events.find(e => e.kind === 'exit') ?? exit;
+      if (exit) break;
       assert.ok(Date.now() < deadline, 'streaming an exited session must settle, not block');
     }
-    assert.equal(streamed.running, false);
-    const exit = streamed.events.find(e => e.kind === 'exit');
-    assert.ok(exit, 'the recording must carry the exit event');
+    assert.equal(last.running, false, 'the session must be reported as no longer running');
     assert.equal(exit.exit?.exitCode ?? exit.exit?.exit, 3, 'the exit code must survive into the record');
 
     // Polling a dead session again must return immediately rather than waiting out
     // the timeout, or every consumer would pay the full poll interval on teardown.
     const started = Date.now();
-    await server.call('terminal.stream', { sessionId, afterSequence: streamed.nextSequence, timeoutMs: 5000 });
+    const { result: after } = await server.call('terminal.stream', { sessionId, afterSequence: cursor, timeoutMs: 5000 });
     assert.ok(Date.now() - started < 2000, 'a stream poll on an exited session must not block for its full timeout');
+    assert.deepEqual(after.events, [], 'and there is nothing further to deliver');
   } finally {
     await server.stop();
   }

@@ -34,6 +34,10 @@ export const RECORD_EVENT_OVERHEAD = 64;
 const defaultNow = () => Date.now();
 
 export class Recording {
+  // Re-entrancy guard for #enforceLimit; see the comment there for why it cannot be
+  // replaced by a minimum-limit check.
+  #truncating = false;
+
   // snapshotProvider is called only when truncation needs to replace the prefix, so
   // a session that never overflows never pays for a snapshot here.
   constructor({ limit = BYTES_LIMIT, inputRecorded = false, snapshotProvider = null, now = defaultNow, cols = null, rows = null } = {}) {
@@ -79,6 +83,13 @@ export class Recording {
     // exact, only non-zero, so that the limit bounds events as well as bytes.
     const overhead = RECORD_EVENT_OVERHEAD;
     if (event.kind === 'output' || event.kind === 'input') return overhead + event.data.length;
+    // A snapshot carries up to a whole viewport of screen text (~45 KB at 300x150),
+    // so charging it the flat overhead alone made `bytes` understate what was really
+    // retained. It is charged in full. Note the consequence: because a snapshot is
+    // appended *after* the ring is cleared and cannot itself be dropped without
+    // destroying replay fidelity, the true bound is the limit plus at most one
+    // viewport, not the limit exactly.
+    if (event.kind === 'snapshot') return overhead + (typeof event.screen === 'string' ? event.screen.length : 0);
     return overhead;
   }
 
@@ -92,29 +103,34 @@ export class Recording {
   }
 
   #enforceLimit() {
-    if (this.bytes <= this.limit) return;
-    // The screen is the only state a replay cannot reconstruct from a suffix, so it
-    // is the one thing that has to survive truncation. Without a provider there is
-    // nothing to snapshot and the log is dropped instead, reported as such.
-    //
-    // This re-enters #append for the snapshot, which re-enters here. It terminates
-    // because the constructor rejects any limit that could not hold one event, so
-    // the snapshot alone is always within bounds -- that check is the guard, and
-    // removing it would turn this into infinite recursion rather than a slow path.
-    //
-    // A single event larger than the whole limit is therefore dropped with the rest.
-    // That is not silent data loss in the way it looks: the snapshot is taken from
-    // the live screen, which already reflects the dropped chunk, so replay still ends
-    // on the right screen. What is lost is that chunk's raw bytes, and with them its
-    // colour -- the same limitation as any other truncation, and reported by the same
-    // truncated/droppedEvents counters.
-    const snapshot = this.snapshotProvider ? this.snapshotProvider() : null;
-    this.droppedEvents += this.events.length;
-    this.droppedBytes += this.bytes;
-    this.events = [];
-    this.bytes = 0;
-    this.truncated = true;
-    if (snapshot) this.#append({ kind: 'snapshot', ...snapshot });
+    // The guard is load-bearing, not defensive. Truncation re-enters #append to store
+    // the re-anchoring snapshot, and a snapshot is charged its screen text -- up to
+    // ~45 KB at 300x150 -- so with a small limit the snapshot alone can exceed the
+    // cap. Without #truncating that would clear the ring, append another snapshot,
+    // exceed the cap again, and recurse until the stack went. No minimum limit can
+    // prevent it, because no fixed floor bounds a viewport.
+    if (this.bytes <= this.limit || this.#truncating) return;
+    this.#truncating = true;
+    try {
+      // The screen is the only state a replay cannot reconstruct from a suffix, so it
+      // is the one thing that has to survive truncation. Without a provider there is
+      // nothing to snapshot and the log is dropped instead, reported as such.
+      //
+      // A single event larger than the whole limit is dropped with the rest. That is
+      // not the silent loss it looks like: the snapshot is taken from the live screen,
+      // which already reflects the dropped chunk, so replay still ends on the right
+      // screen. What is lost is that chunk's raw bytes, and with them its colour --
+      // the same limitation as any other truncation, reported by the same counters.
+      const snapshot = this.snapshotProvider ? this.snapshotProvider() : null;
+      this.droppedEvents += this.events.length;
+      this.droppedBytes += this.bytes;
+      this.events = [];
+      this.bytes = 0;
+      this.truncated = true;
+      if (snapshot) this.recordSnapshot(snapshot);
+    } finally {
+      this.#truncating = false;
+    }
   }
 
   recordOutput(data) {
@@ -133,6 +149,12 @@ export class Recording {
 
   recordResize(cols, rows) { return this.#append({ kind: 'resize', cols, rows }); }
   recordExit(exit) { return this.#append({ kind: 'exit', exit: exit ?? null }); }
+
+  // Also the re-anchoring event used on truncation. Exposed because a session seeds
+  // its ring with one at construction: an empty ring means an attach returns cursor
+  // 0, and the consumer's next poll would attach again immediately, spinning without
+  // ever reaching the long-poll.
+  recordSnapshot(snapshot) { return this.#append({ kind: 'snapshot', ...snapshot }); }
 
   // includeInput is false for watchers. Filtering here rather than in the caller
   // means there is no path by which a read-only stream can be handed keystrokes,
@@ -186,7 +208,7 @@ export class Recording {
 // The Terminal is injected: this module must not import @xterm/headless itself, or
 // replaying a recording would depend on the runtime's emulator rather than on
 // whatever the consumer uses to render it.
-export async function replayRecording({ events, cols, rows, Terminal, snapshotToScreen }) {
+export async function replayRecording({ events, cols, rows, Terminal }) {
   const terminal = new Terminal({ cols, rows, scrollback: 0, allowProposedApi: true });
   const write = data => new Promise(resolve => terminal.write(data, resolve));
   try {
@@ -195,8 +217,32 @@ export async function replayRecording({ events, cols, rows, Terminal, snapshotTo
         case 'snapshot': {
           // A snapshot is the truncation boundary: it replaces everything before it,
           // so replay starts from it rather than trying to merge it with prior output.
-          const screen = snapshotToScreen ? snapshotToScreen(event) : event.screen;
-          if (typeof screen === 'string') await write(screen.replace(/\n/g, '\r\n'));
+          if (typeof event.screen !== 'string') {
+            // Throwing rather than skipping, for the same reason an unknown kind
+            // throws: replay cannot proceed without the screen, and continuing would
+            // produce a plausible but wrong result.
+            throw Error(`snapshot event ${event.seq ?? '?'} carries no screen text`);
+          }
+          // Geometry first. A resize from before the truncation was dropped with the
+          // prefix, so the snapshot's own cols/rows are the only surviving record of
+          // the shape this screen was rendered in; writing it into the session's
+          // initial geometry would wrap and scroll it into something else.
+          if (Number.isInteger(event.cols) && Number.isInteger(event.rows)
+            && event.cols >= 2 && event.rows >= 2
+            && (event.cols !== terminal.cols || event.rows !== terminal.rows)) {
+            terminal.resize(event.cols, event.rows);
+          }
+          await write(event.screen.replace(/\n/g, '\r\n'));
+          // Then the cursor, and this is not cosmetic. Writing the viewport text
+          // leaves the cursor on the last row, but the live cursor was wherever the
+          // child had left it -- typically mid-screen, at a prompt. Every output
+          // event after the boundary is written relative to the cursor, so skipping
+          // this replays the rest of the session in the wrong place and lands on a
+          // different screen, which is the one thing a recording must not do.
+          const cursor = event.cursor;
+          if (cursor && Number.isInteger(cursor.x) && Number.isInteger(cursor.y)) {
+            await write(`\x1b[${cursor.y + 1};${cursor.x + 1}H`);
+          }
           break;
         }
         case 'output':

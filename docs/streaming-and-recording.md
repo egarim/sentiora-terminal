@@ -18,34 +18,57 @@ carries the child's **original bytes** instead, which is strictly more informati
 ## `terminal.stream` — read-only, sequence-numbered
 
 ```jsonc
-// request
+// request: attach
 {"jsonrpc":"2.0","id":7,"method":"terminal.stream",
  "params":{"sessionId":"…","afterSequence":0,"timeoutMs":250}}
 
-// first response: a snapshot, then everything retained
+// response: a snapshot and NO events -- the snapshot already accounts for everything
+// recorded so far, and nextSequence is the position it was taken at.
 {"jsonrpc":"2.0","id":7,"result":{
   "sessionId":"…","state":"operational","revision":12,"running":true,"exit":null,
   "resync":false,
   "snapshot":{"screen":"…","cols":60,"rows":20,"cursor":{"x":0,"y":3},"revision":12, …},
-  "events":[{"seq":1,"at":4,"kind":"output","data":"RklYNFVSRSBSRUFEWQ=="}],
-  "nextSequence":1,"oldestSequence":1,"latestSequence":1,
+  "events":[],
+  "nextSequence":9,"oldestSequence":1,"latestSequence":9,
+  "truncated":false,"droppedEvents":0,"inputRecorded":false}}
+
+// request: continue from the cursor handed back
+{"jsonrpc":"2.0","id":8,"method":"terminal.stream",
+ "params":{"sessionId":"…","afterSequence":9,"timeoutMs":250}}
+
+// response: events and NO snapshot
+{"jsonrpc":"2.0","id":8,"result":{
+  "sessionId":"…","state":"operational","revision":15,"running":true,"exit":null,
+  "resync":false,"snapshot":null,
+  "events":[{"seq":10,"at":904,"kind":"output","data":"RklYNFVSRSBSRUFEWQ=="}],
+  "nextSequence":10,"oldestSequence":1,"latestSequence":10,
   "truncated":false,"droppedEvents":0,"inputRecorded":false}}
 ```
 
 - **`events`** are the child's raw output chunks, base64 (`data`), each with a monotonic `seq` and an
   `at` in milliseconds since the session started. Base64 because a PTY emits arbitrary bytes — WIN-15
   deliberately feeds invalid UTF-8 — and JSON cannot carry them. This is also what preserves colour.
-- **`afterSequence`** is the cursor. Pass `0`, or omit it, to attach from the beginning of what is
-  retained; pass the previous `nextSequence` to continue. Gaps are detectable because `seq` never
-  repeats and never goes backwards.
+- **`afterSequence`** is the cursor. Pass the previous `nextSequence` to continue. Gaps are detectable
+  because `seq` never repeats and never goes backwards.
+- **The stream is live from the point of attach.** Pass `0` (or omit it) and the response carries a
+  `snapshot` of the current screen and **no events**, with `nextSequence` set to the ring position the
+  snapshot was taken at. It does *not* replay retained history. That is deliberate: the snapshot
+  already accounts for those bytes, so returning them as well would make a consumer that renders the
+  snapshot and then applies the events paint that output twice. A consumer that wants history wants
+  `terminal.recording`, not the stream.
+- **A response carries a snapshot or events, never both.** One or the other, so there is no overlap to
+  reason about and no double-application to guard against.
 - **`resync: true`** is the "you missed some" signal. It is set when the cursor is behind the retained
-  window, and the response then carries a fresh `snapshot` and a `nextSequence` at the end of the
-  ring. A consumer must treat a resync as a new attach, not as a continuation.
-- **`snapshot`** is present on the first poll and on every resync, and is a full `observe()` result —
-  so a watcher can always render a complete screen before applying any bytes.
-- **Long poll.** With nothing new, the call waits up to `timeoutMs` (capped at 30000, the same bound
-  as `terminal.wait`) and then returns an empty `events`. It returns immediately once the session has
-  exited, so consumers do not pay the full interval on teardown.
+  window, and the response is then shaped exactly like an attach: a fresh `snapshot`, no events, and a
+  `nextSequence` at the end of the ring. Treat a resync as a new attach, not a continuation, and do
+  not assume the missed bytes are recoverable from the stream — they may have been dropped, which is
+  what `truncated` and `droppedEvents` report.
+- **`snapshot`** is a full `observe()` result, so a watcher can always render a complete screen before
+  applying any bytes. It never contains the owner token.
+- **Long poll.** With a current cursor and nothing new, the call waits up to `timeoutMs` (capped at
+  30000, the same bound as `terminal.wait`) and then returns empty `events`. It returns immediately
+  once the session has exited, so consumers do not pay the full interval on teardown. An attach or a
+  resync also returns immediately: the snapshot *is* the answer, so there is nothing to wait for.
 
 ### Why a poll and not a server-initiated notification
 
@@ -100,34 +123,62 @@ them, including ones recorded before it attached. `terminal.recording` requires 
 answers `Ownership required` without it, the same gate as `terminal.close`.
 
 **Bounded.** The record is a ring capped by `recordBytes` at create (default 1 MiB, minimum 1024,
-maximum 16 MiB — a caller cannot ask the host for unbounded memory). On overflow the whole retained
-prefix is replaced by a single `snapshot` event of the screen at that instant, and `truncated`,
-`droppedEvents` and `droppedBytes` report what was lost.
+maximum 16 MiB — a caller cannot ask the host for unbounded memory). Every event is charged its
+payload **plus a 64-byte envelope**, so the cap bounds event count as well as bytes. Charging payload
+alone was the first implementation, and it let an owner spam `terminal.resize` to grow the ring
+forever while `bytes` stayed at zero — the cap looked enforced while doing nothing (`REC-15` pins the
+fix). On overflow the whole retained prefix is replaced by a single `snapshot` event of the screen at
+that instant, and `truncated`, `droppedEvents` and `droppedBytes` report what was lost.
+
+The precise bound is the cap **plus at most one viewport**: a snapshot is appended after the ring is
+cleared and cannot itself be dropped without destroying replay fidelity, so at 300×150 it can add
+roughly 45 KB over the configured cap. `bytes` charges the snapshot's screen text in full, so the
+reported figure reflects that rather than understating it.
 
 Replacing the prefix rather than dropping only the overflow is the part worth explaining: a prefix
 whose beginning is gone **cannot** be replayed to a correct answer, because replaying from the middle
 of a byte stream yields garbage rather than a slightly older screen. Losing the prefix and saying so
 is honest; quietly replaying a partial one is not. The snapshot is taken synchronously from the
 emulator, and output is recorded only *after* the emulator has accepted that chunk, so the snapshot
-never lags the events that follow it — an ordering that REC-10 tests by replaying a truncated ring
-against an intact one and requiring identical screens.
+never lags the events that follow it.
+
+Replay restores the snapshot's **geometry and cursor**, not only its text. Review found this after the
+first version passed its own tests: writing a viewport-sized screen leaves the cursor on the last row,
+while the live cursor was wherever the child had put it — typically mid-screen, at a prompt — so every
+output event after the boundary landed in the wrong place and the replay diverged from the session it
+was supposed to reproduce. `REC-10` passed anyway, because its content happened to leave the cursor at
+the bottom-left, which is exactly where the naive replay also put it. It now asserts a cursor
+mid-screen, and fails on the *screen* comparison if the restore is removed.
+
+**Recording is on by default for every session**, including those whose caller never reads it: the
+ring is what lets a watcher attach late and resync, so it cannot be lazy. The cost is up to
+`recordBytes` per session — 1 MiB by default — which a host running at the 16-session cap should
+budget for. Setting `recordBytes` lower is the lever.
 
 ## Guarantees, and the test that holds each one
 
 | #27 acceptance criterion | Test |
 | --- | --- |
-| Two watchers see the same final screen as `observe` | `STR-01` — two independent cursors, byte-identical payloads, replayed to `observe().screen` |
-| A slow watcher does not slow the program | `STR-08` — 30 commands typed with no watcher polling at all; the session keeps up |
-| A slow watcher does not grow memory without limit | `STR-07`, `STR-08` — retained `bytes` asserted against the configured cap |
-| A recording played back ends in the same screen | `STR-06` end to end through the real runtime; `REC-09`/`REC-10`/`REC-11` at unit level |
+| Two watchers see the same final screen as `observe` | `STR-01` — two watchers attaching at *different times*, converging by different routes (early snapshot + more bytes vs late snapshot + fewer bytes), both equal to `observe().screen`, with divergent content assertions that fail if the cursor is ignored |
+| A slow watcher does not slow the program | `STR-08` — 30 commands typed with no watcher polling at all. A stall is caught by `waitScreen`'s own budget throwing; the revision advance proves all 30 were rendered rather than only the last |
+| A slow watcher does not grow memory without limit | `STR-07`, `STR-08`, `REC-05`, `REC-15` — retained `bytes` *and* event count asserted against the configured cap |
+| A recording played back ends in the same screen | `STR-06` end to end through the real runtime; `REC-09`, `REC-10`, `REC-11`, `REC-17` at unit level |
 | Colours included | `STR-02` — `\x1b[31m` present in the stream and absent from `observe().screen` |
 | A watcher never gets the owner token and cannot type | `STR-03` — asserted on the serialised payload, not a field list, plus a refused `terminal.type` that must not reach the child |
 | Input off unless asked, and the record says so | `STR-04`, `STR-05`, `REC-03` |
-| Bounded, with a clear "you missed some" | `STR-07`, `REC-05`, `REC-07` |
+| Bounded, with a clear "you missed some" | `STR-07`, `REC-05`, `REC-07`, `REC-15` |
 
-`STR-05` and `REC-04` were verified non-vacuous by mutation: disabling the input filter in
-`eventsAfter` fails both. Replay rejects an event kind it does not know (`REC-12`) rather than
-skipping it, because silently ignoring an event would replay to a plausible but wrong screen.
+Non-vacuity was checked by mutation rather than assumed, in each place a test could have passed for
+the wrong reason:
+
+- Disabling the input filter in `eventsAfter` fails `STR-05` and `REC-04`.
+- Removing the cursor restore from replay fails `REC-10` on its **screen** assertion — the defect
+  review found, reproduced on demand.
+- Charging events zero overhead fails `REC-15` with `5000 events retained against a cap of 16`.
+
+Each mutation was reverted, and the absence of it confirmed, before the suite was re-run. Replay also
+rejects an event kind it does not know (`REC-12`) and a snapshot carrying no screen text (`REC-18`)
+rather than skipping either, because silently ignoring an event produces a plausible but wrong screen.
 
 ## Limits, stated rather than discovered later
 
@@ -141,6 +192,16 @@ skipping it, because silently ignoring an event would replay to a plausible but 
 - **A watcher must run its own emulator.** The stream delivers bytes, not pixels or cells; rendering
   is the consumer's problem. `replayRecording()` shows the shape of it and takes an injected
   `Terminal` so this module does not decide what a consumer renders with.
+- **The stream is live from attach, not a history read.** Attaching returns the current screen and
+  resumes from there; it does not replay what the ring already holds. A consumer that attaches after
+  output it cares about has that output in its snapshot but not as bytes, and cannot recover the
+  bytes from the stream. `terminal.recording` is the history call. This cost two test failures during
+  development before it was written down, which is why it is written down.
+- **Concurrent polls are not capped.** Each in-flight `terminal.stream` or `terminal.wait` registers a
+  waiter that is removed when it wakes or times out, so the set is bounded in *time* but not in
+  *count*. That is pre-existing behaviour for `terminal.wait`; `terminal.stream` makes it reachable
+  without an owner token. The transport is a single stdio pipe, so concurrency is bounded in practice
+  by the client, but a client that opens thousands of simultaneous polls is not defended against.
 - **No cancellation.** An in-flight `terminal.stream` can only be outlasted, exactly like
   `terminal.wait` (§9.4 of the desktop design doc). Granularity equals `timeoutMs`.
 - **The child's own echo of a secret still appears in output.** Input recording being off stops the

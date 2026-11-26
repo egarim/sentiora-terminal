@@ -23,3 +23,10 @@ test('close resolves even when kill, the write chain and dispose all throw',asyn
 // throws here, so hardening close() against rejection alone is not enough.
 function silentFixture(){let output;const disposable={dispose(){}};const p={pid:4242,onData:f=>(output=f,disposable),onExit:()=>disposable,write(){},kill(){},resize(){}};const t={cols:80,rows:2,buffer:{active:{baseY:0,cursorX:0,cursorY:0,getLine:()=>({translateToString:()=>''})}},onData:()=>disposable,write(){},dispose(){},resize(){}};return {s:new Session(p,t),output};}
 test('close settles when an emulator write never invokes its callback',async()=>{const {s,output}=silentFixture();output('hangs');const started=Date.now();await s.close();const elapsed=Date.now()-started;assert.equal(s.state,'released');assert.ok(elapsed<6000,`close hung for ${elapsed}ms instead of being bounded`);});
+// A brand-new session has produced no output, so an unseeded recording ring is empty
+// and `latestSequence` is 0. terminal.stream answers an attach with a snapshot and
+// `nextSequence = latestSequence`, so a consumer would be handed cursor 0 and its
+// next poll would attach again immediately, forever -- a busy loop that never reaches
+// the long-poll, for as long as the child stays quiet. Seeding one snapshot at
+// construction is what makes the cursor advance.
+test('a new session seeds its recording so a watcher cannot spin on an empty ring',()=>{const {s}=fixture();assert.ok(s.recording.latestSequence>0,'the ring must not start empty');assert.equal(s.recording.events.length,1);assert.equal(s.recording.events[0].kind,'snapshot');assert.equal(s.recording.truncated,false,'seeding is not truncation');});
