@@ -76,8 +76,13 @@ jobs:
       - name: Restore native executable permissions
         run: node scripts/fix-native-permissions.mjs
 
-      # Fails the job if any native binary belongs to a different architecture
-      # than the runtime, so an emulated x64 image can never be reported as ARM64.
+      # Fails the job if any native binary belongs to a different architecture than
+      # the runtime, if it cannot resolve node-pty at all, or if it matched a file
+      # whose architecture it could not determine -- so it never claims consistency
+      # it did not check. Note what it cannot do on its own: an x64 machine serving
+      # an arm64 label produces x64 binaries under an x64 runtime, which is entirely
+      # self-consistent. The "Assert the runtime environment" step above is what
+      # closes that, by comparing process.arch against what the label promised.
       - name: Verify native binary architecture
         run: node scripts/report-native-arch.mjs
 
@@ -86,6 +91,7 @@ jobs:
           node --check src/server.js
           node --check src/session.js
           node --check src/env.js
+          node --check src/recording.js
           node --check scripts/report-native-arch.mjs
           node --check scripts/assert-runtime-env.mjs
 

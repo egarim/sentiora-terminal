@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { Recording } from './recording.js';
 // Upper bound on how long close() waits for the emulator write chain to settle.
 // Normally the chain is already resolved and this timer is cleared immediately;
 // it only elapses when a write callback never fires.
@@ -13,13 +14,28 @@ export class Session {
   // There is deliberately no 'ready' state: whether the application is ready to
   // accept input is only knowable from an observable condition the caller
   // defines, such as a prompt appearing on screen. 'spawned' is not readiness.
-  constructor(pty, terminal) {
+  constructor(pty, terminal, options = {}) {
     this.id=randomUUID(); this.owner=randomUUID(); this.pty=pty; this.terminal=terminal;
     this.state='spawned';
     this.revision=0; this.pending=Promise.resolve(); this.exit=null; this.closed=false;
     this.lastActivity=Date.now(); this.waiters=new Set();
     this.writeErrors=0; this.lastWriteError=null;
     this.renderErrors=0; this.lastRenderError=null; this.closeError=null;
+    // The recording's snapshot provider must be synchronous: it is called from
+    // inside the write chain when the ring truncates, and awaiting this.pending
+    // there would wait on the very chain that is running, deadlocking close() and
+    // every observer with it.
+    this.recording=new Recording({
+      inputRecorded: options.recordInput === true,
+      limit: options.recordBytes,
+      cols: terminal?.cols, rows: terminal?.rows,
+      snapshotProvider: ()=>this.screenSnapshot(),
+    });
+    // Seed the ring with the initial screen. An empty ring would make an attach hand
+    // back cursor 0, so the consumer's next poll would attach again immediately
+    // instead of long-polling -- a busy loop for as long as the child stays quiet.
+    // It also gives a recording a defined starting state to replay from.
+    this.recording.recordSnapshot(this.screenSnapshot());
     this.subscriptions=[
       // A rejected emulator write must not poison `pending`: observe(), input(),
       // wait(), resize() and close() all await it, so one bad chunk would make the
@@ -28,9 +44,15 @@ export class Session {
       // rather than swallowed so a caller can see that output was dropped.
       pty.onData(data=>{if(!this.closed) this.pending=this.pending
         .then(()=>new Promise(resolve=>terminal.write(data,resolve)))
-        .then(()=>{if(this.state==='spawned')this.state='operational';},error=>{this.renderErrors++;this.lastRenderError={code:error?.code??null,message:error?.message??String(error)};})
+        // Recorded only once the emulator has accepted the chunk, and not on the
+        // error path. That ordering is what keeps the acceptance criterion true: a
+        // truncation snapshot is taken from the screen as it stands, so it must not
+        // be taken ahead of the chunk being recorded, and a chunk the emulator
+        // dropped is not on the screen either -- replaying it would diverge from
+        // observe(). renderErrors already reports what was dropped.
+        .then(()=>{if(this.state==='spawned')this.state='operational';this.recording.recordOutput(data);},error=>{this.renderErrors++;this.lastRenderError={code:error?.code??null,message:error?.message??String(error)};})
         .then(()=>this.changed())}),
-      pty.onExit(exit=>{this.exit=exit;if(this.state!=='released')this.state='exited';this.changed();}),
+      pty.onExit(exit=>{this.exit=exit;if(this.state!=='released')this.state='exited';this.recording.recordExit(exit);this.changed();}),
       terminal.onData(data=>{if(!this.closed&&!this.exit)pty.write(data);})
     ];
     const guard=this.guardInputSocket();
@@ -58,10 +80,27 @@ export class Session {
     return {dispose:()=>{socket.removeListener('error',onError);}};
   }
   changed(){this.revision++;this.lastActivity=Date.now();for(const wake of this.waiters)wake();}
+  // Synchronous screen read. observe() is this plus a wait for the write chain, and
+  // the recording's truncation path needs it without that wait -- see the note on
+  // snapshotProvider in the constructor.
+  screenSnapshot(){
+    const t=this.terminal,b=t.buffer.active;
+    return {cols:t.cols,rows:t.rows,cursor:{x:b.cursorX,y:b.cursorY},screen:Array.from({length:t.rows},(_,i)=>b.getLine(b.baseY+i)?.translateToString(true)??'').join('\n')};
+  }
+  // The full observation, synchronously. observe() is this after awaiting the write
+  // chain; stream() needs it WITHOUT a second await, because every await is a point
+  // where another request's continuation can run and change what gets reported.
+  observationSync(){
+    const snap=this.screenSnapshot();
+    // Field order is deliberately identical to the pre-#27 response. Nothing in tree
+    // depends on it, but "no existing method changed shape" ought to hold at the
+    // serialised-byte level and not only in the field-set sense, so a client
+    // comparing responses sees no difference at all.
+    return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,cols:snap.cols,rows:snap.rows,writeErrors:this.writeErrors,renderErrors:this.renderErrors,cursor:snap.cursor,screen:snap.screen,idleMilliseconds:Date.now()-this.lastActivity};
+  }
   async observe(){
     await this.pending;
-    const t=this.terminal,b=t.buffer.active;
-    return {sessionId:this.id,pid:this.pid,state:this.state,revision:this.revision,running:!this.exit&&!this.closed,exit:this.exit,cols:t.cols,rows:t.rows,writeErrors:this.writeErrors,renderErrors:this.renderErrors,cursor:{x:b.cursorX,y:b.cursorY},screen:Array.from({length:t.rows},(_,i)=>b.getLine(b.baseY+i)?.translateToString(true)??'').join('\n'),idleMilliseconds:Date.now()-this.lastActivity};
+    return this.observationSync();
   }
   async input({owner,revision,text}){
     await this.pending;
@@ -69,7 +108,10 @@ export class Session {
     if(owner!==this.owner)throw Error('Input ownership required');
     if(revision!==this.revision)throw Error('Stale observation');
     if(typeof text!=='string'||text.length>65536)throw Error('Invalid input');
-    this.pty.write(text);this.changed();return {revision:this.revision};
+    // Recorded only after every rejection above, so a refused keystroke is not
+    // recorded as though it had been typed. recordInput is a no-op unless the
+    // caller asked for input recording at create time.
+    this.pty.write(text);this.recording.recordInput(text);this.changed();return {revision:this.revision};
   }
   async wait(after,timeout=1000){
     if(!Number.isSafeInteger(after)||after<0||!Number.isFinite(timeout)||timeout<0)throw Error('Invalid wait');
@@ -83,7 +125,79 @@ export class Session {
   async resize(owner,cols,rows){
     await this.pending;
     if(owner!==this.owner||this.closed||this.exit)throw Error('Resize denied');
-    dimensions(cols,rows);this.pty.resize(cols,rows);this.terminal.resize(cols,rows);this.changed();return this.observe();
+    dimensions(cols,rows);this.pty.resize(cols,rows);this.terminal.resize(cols,rows);this.recording.recordResize(cols,rows);this.changed();return this.observe();
+  }
+  // Read-only live stream (issue #27). A watcher polls with the cursor it was last
+  // given; it never needs the owner token and never receives one, and there is no
+  // path from here to input().
+  //
+  // Deliberately a poll rather than a server-initiated notification: pushing
+  // unsolicited lines on stdout would break the framing invariant WIN-15 pins (a
+  // child must never be able to put a line on the RPC channel), and every existing
+  // client parses stdout as responses. docs/desktop/living-terminal.md §9.1 already
+  // flags the push variant as needing "a deliberate framing decision, not a
+  // drive-by change", so it stays a proposal.
+  async stream(afterSequence,timeout=1000){
+    const cursor=afterSequence===undefined||afterSequence===null?0:afterSequence;
+    if(!Number.isSafeInteger(cursor)||cursor<0)throw Error('Invalid sequence');
+    if(!Number.isFinite(timeout)||timeout<0)throw Error('Invalid stream');
+    await this.pending;
+    // Falling behind the ring is reported rather than papered over: a gap-free
+    // replay from a stale cursor is impossible.
+    const resync=this.recording.missedEvents(cursor);
+    // A snapshot response carries NO events, and nextSequence is the ring position the
+    // snapshot was taken at. Returning both would be self-contradictory: the snapshot
+    // already accounts for those bytes, so a consumer that rendered it and then
+    // applied the events would paint that output twice. One snapshot, one cursor, no
+    // overlap. It also means an attach or a resync answers immediately instead of
+    // waiting out timeoutMs for events the caller has no use for.
+    if(cursor===0||resync){
+      // The screen, the ring position and the lifecycle fields are all read in ONE
+      // synchronous block, with no await between them. That is load-bearing rather
+      // than tidy: resize() records outside the emulator write chain, so when its
+      // continuation is queued on the same `pending` it can run between an awaited
+      // screen read and a later cursor read. The consumer would then get a
+      // pre-resize snapshot with a cursor PAST the resize event it is never given --
+      // permanent geometry divergence, silently. The first version of this did
+      // `await this.observe()` and then read latestSequence, which is exactly that.
+      const snapshot=this.observationSync();
+      const at=this.recording.latestSequence;
+      return {
+        sessionId:this.id,state:snapshot.state,running:snapshot.running,exit:snapshot.exit,
+        oldestSequence:this.recording.oldestSequence,
+        truncated:this.recording.truncated,droppedEvents:this.recording.droppedEvents,
+        inputRecorded:this.recording.inputRecorded,
+        resync,revision:snapshot.revision,snapshot,events:[],nextSequence:at,latestSequence:at,
+      };
+    }
+    let selected=this.recording.eventsAfter(cursor,{includeInput:false});
+    // Waiting reuses the same waiter set as wait(), so a stream poll is woken by the
+    // next change instead of spinning, and the bound is capped identically.
+    if(!selected.events.length&&!this.exit&&!this.closed){
+      await new Promise(resolve=>{
+        const wake=()=>{clearTimeout(timer);this.waiters.delete(wake);resolve();};
+        const timer=setTimeout(wake,Math.min(timeout,30000));this.waiters.add(wake);
+      });
+      await this.pending;
+      selected=this.recording.eventsAfter(cursor,{includeInput:false});
+    }
+    const events=selected.events;
+    // Never the owner token: a watcher must not be able to type. Pinned by test.
+    return {
+      sessionId:this.id,state:this.state,running:!this.exit&&!this.closed,exit:this.exit,
+      oldestSequence:this.recording.oldestSequence,
+      truncated:this.recording.truncated,droppedEvents:this.recording.droppedEvents,
+      inputRecorded:this.recording.inputRecorded,
+      resync:false,revision:this.revision,snapshot:null,events,
+      nextSequence:events.length?events[events.length-1].seq:cursor,
+      latestSequence:this.recording.latestSequence};
+  }
+  // Owner-gated: unlike the stream this can contain keystrokes, which is exactly
+  // what may hold a secret. The ownership check lives in dispatch next to the other
+  // gated methods.
+  recordingPayload(){
+    const {events}=this.recording.eventsAfter(0,{byteCap:Infinity,includeInput:true});
+    return {...this.recording.toJSON(),sessionId:this.id,revision:this.revision,events};
   }
   // kill() is required even after a natural exit: on Windows node-pty only
   // disposes its ConPTY conout worker thread from kill(), and a live worker

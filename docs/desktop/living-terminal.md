@@ -39,12 +39,18 @@ testable.
 This is the single most consequential design fact in PR1, so it comes first.
 
 `terminal.observe` returns the **rendered viewport** — `screen` is built from
-`terminal.buffer.active` via `translateToString(true)` (`src/session.js`). The runtime never exposes
-raw PTY bytes and has no push channel. This was already identified as the one true semantic mismatch
-for a consumer in [`../integrations/telekinesis.md`](../integrations/telekinesis.md) section 4:
-"a faithful raw-byte stream cannot be reconstructed."
+`terminal.buffer.active` via `translateToString(true)` (`src/session.js`). The runtime has no push
+channel: it never emits unsolicited lines on stdout, and WIN-15 pins that it must not.
 
-So the bridge does what that document recommends: one pump per session runs a
+When PR1 landed that was the whole story, and
+[`../integrations/telekinesis.md`](../integrations/telekinesis.md) section 4 concluded that "a
+faithful raw-byte stream cannot be reconstructed." **That is no longer true.** Issue #27 added
+`terminal.stream`, which returns the child's original output chunks base64-encoded with monotonic
+sequence numbers from a bounded server-side ring. What has *not* changed is that this bridge still
+consumes `terminal.observe`, so everything below still describes the bridge as built rather than the
+runtime as it now is.
+
+So the bridge does what that document recommended at the time: one pump per session runs a
 `terminal.wait(afterRevision, 250ms)` long-poll and publishes **whole rendered screens**, keyed by
 revision. Consequences, stated plainly:
 
@@ -58,7 +64,9 @@ revision. Consequences, stated plainly:
 
 **What does not survive**
 - **Colour.** `translateToString()` returns plain text, so SGR attributes are lost. The UI applies
-  its own theme to a monochrome screen. This is a protocol limitation, not a UI choice.
+  its own theme to a monochrome screen. When PR1 landed this was a *protocol* limitation; it is now a
+  **bridge** limitation — `terminal.stream` carries the original bytes with their escape sequences
+  intact, and the bridge simply has not been migrated to it.
 - **Lines that scroll past between two observations.** The bridge recovers scrollback by exact
   pure-shift matching between consecutive screens: if the previous screen moved up by exactly *k*
   rows and the remainder is identical, those *k* rows are recovered. No confident match means no
@@ -73,7 +81,12 @@ revision. Consequences, stated plainly:
   sometimes nil. That gap between the two measurements is the concrete case for proposal 9.1.
 - **Byte-level framing.** One keystroke is not one child input event; ConPTY coalesces and splits.
 
-Section 9 proposes the protocol addition that would remove all three.
+All three are now addressable at the protocol level through `terminal.stream`, which carries every
+byte the child wrote rather than a periodic sampling of the screen: colour and byte framing arrive
+with the raw chunks, and output cannot scroll past unobserved because the ring retains the bytes
+between polls — up to its bound, beyond which it reports `resync: true` and hands over a fresh
+snapshot rather than pretending to be complete. What section 9.1 still proposes is the *push*
+transport, which would remove the polling interval rather than the loss.
 
 The bridge publishes `outputMode: 'snapshot'` and `outputModes: ['snapshot']` on `GET /api/info` so
 a future raw-output mode is *negotiated* rather than assumed.
@@ -351,16 +364,24 @@ The runtime was deliberately left untouched. These are proposals for coordinatio
 PRs, per issue #7's "coordinate schema changes with existing runtime PRs". Nothing in PR1 depends on
 them being accepted; each has a working fallback today.
 
-1. **Raw output notifications** — the highest-value change by a wide margin.
-   A server-initiated notification per PTY chunk, e.g.
-   `{"jsonrpc":"2.0","method":"terminal.output","params":{"sessionId":"…","revision":N,"data":"<base64>"}}`,
-   plus a `terminal.subscribe`/`terminal.replay(sessionId, fromRevision)` pair so a late consumer can
-   resync from a bounded server-side ring.
-   This would restore ANSI colour, exact byte framing, native xterm.js scrollback and mouse
-   reporting, and would make "no lost bytes" a byte-level guarantee instead of a viewport-level one.
-   The bridge already negotiates `outputModes`, so switching is a capability check rather than a
-   rewrite. Note this requires the runtime to emit unsolicited lines on stdout, which WIN-15
-   currently proves it never does — so it needs a deliberate framing decision, not a drive-by change.
+1. **Raw output notifications** — *half done by issue #27; the transport half is still open.*
+   The raw-byte channel now exists: `terminal.stream {sessionId, afterSequence, timeoutMs}` returns
+   the child's original chunks base64-encoded with monotonic sequence numbers from a bounded
+   server-side ring, with a snapshot on first attach and a `resync` flag plus a fresh snapshot when a
+   consumer falls behind. That is functionally the `subscribe`/`replay` pair described here, so ANSI
+   colour and exact byte framing are now available to a consumer that polls it. "No lost bytes" needs
+   care: within the ring's bound nothing is lost, and beyond it the stream says so (`resync: true`,
+   `truncated`, `droppedEvents`) rather than silently gapping — so what is on offer is *detection*,
+   not preservation, and preservation costs sizing `recordBytes` for the session. See [streaming and recording](../streaming-and-recording.md).
+   What remains unimplemented is the **push** half: a server-initiated
+   `{"jsonrpc":"2.0","method":"terminal.output",…}` line per chunk. It still requires the runtime to
+   emit unsolicited lines on stdout, which WIN-15 proves it never does, so it still needs a
+   deliberate framing decision rather than a drive-by change — every current client parses stdout as
+   responses to what it sent. `initialize` advertises `stream: 1`, which is where a `push: 1`
+   capability would go once that decision is made.
+   The bridge has **not** been migrated: it still long-polls `terminal.wait` and publishes rendered
+   snapshots, so colour still does not reach the UI. It already negotiates `outputModes`, so
+   switching is a capability check rather than a rewrite.
 
 2. **Distinct JSON-RPC error codes.** Every error is `-32000` and only the message string
    distinguishes it. Already recommended in telekinesis.md §10. `bridge/errors.js` is the single
@@ -412,7 +433,7 @@ and does not pretend to: `test/desktop-native.test.js` drives the real runtime.
 | U08 | Reduced motion / disabled animations | **PASS at the settings level** — the off switch beats every preset, and the OS preference beats an enabled preset, both asserted. No animation exists yet to disable visually. |
 | U09 | Animation state transitions from typed events | **NOT IMPLEMENTED — PR2 scope.** |
 | U10 | Pack rejection (malformed/oversized/traversal) | **NOT IMPLEMENTED — PR2 scope.** The analogous settings and static-serving hardening *is* tested. |
-| U11 | Burst output, no lost bytes | **PASS within its stated meaning** — a viewport-sized burst loses nothing; a 400-line flood stays ordered, bounded, de-duplicated and byte-faithful to the runtime's own screen. Recovered *history* from that flood is only 7 lines, because ConPTY batches output (section 2). A byte-level "no lost bytes" guarantee needs proposal 9.1. |
+| U11 | Burst output, no lost bytes | **PASS within its stated meaning** — a viewport-sized burst loses nothing; a 400-line flood stays ordered, bounded, de-duplicated and byte-faithful to the runtime's own screen. Recovered *history* from that flood is only 7 lines, because ConPTY batches output (section 2). A byte-level "no lost bytes" guarantee is now reachable via `terminal.stream` (issue #27), which retains the child's actual bytes rather than screen samples; the push transport in proposal 9.1 would additionally remove the polling interval. This bridge uses neither yet. |
 | U12 | Renderer crash / reconnect | **PARTIAL.** Backend death is tested end to end (`backend-lost`, no blind retry). A *webview* crash is **NOT TESTED** — needs Tauri, section 8. |
 | U13 | Persistent settings and theme contrast | **PASS** — round-trip, atomic write, corrupt-file quarantine, invalid/unknown value handling, patch semantics, plus 23 contrast pairs × 2 themes and the ANSI palette. |
 | U14 | 60-minute idle and workload memory/CPU | **NOT TESTED** — long-running by design; the existing stress harnesses cover the runtime side. |
@@ -426,10 +447,15 @@ report them as a UI failure. The replacement targets are below.
 #### Re-baselined performance targets
 
 The original "p95 added input latency under 10 ms" assumes per-frame delivery of terminal output.
-This runtime has no raw-output channel: the bridge long-polls `terminal.wait(afterRevision, 250ms)`
+This **bridge** does not use a raw-output channel: it long-polls `terminal.wait(afterRevision, 250ms)`
 and publishes whole rendered screens, so observation freshness is bounded by the poll interval and
-no implementation can beat it. A sub-10 ms target is therefore unreachable by construction, not by
-poor engineering. It is decomposed into components that can each be measured:
+no implementation of the bridge can beat it. A sub-10 ms target is therefore unreachable by
+construction, not by poor engineering. It is decomposed into components that can each be measured:
+
+The runtime *has* grown a raw-output channel since this was written — `terminal.stream`, issue #27 —
+but the bridge has not been migrated to it, so the budgets below still describe the bridge as built.
+Migrating would replace one poll interval with another of the same shape; only the server-initiated
+push variant in §9.1 would remove the interval entirely.
 
 | # | Target | Budget (p95) | Basis | Status |
 | --- | --- | --- | --- | --- |
@@ -570,13 +596,17 @@ twice, nothing arrives out of order.** All three are asserted against the real r
 recovered is not asserted, because it depends on how ConPTY batches output: when more rows scroll
 past between two observations than there is overlap left to verify, the heuristic declines rather
 than guessing. A duplicated or fabricated history line would be a defect; an incomplete one is the
-documented cost of a protocol that exposes a rendered screen instead of a byte stream.
+documented cost of *this bridge* consuming a rendered screen. The runtime now also exposes a byte
+stream (`terminal.stream`, issue #27), from which nothing scrolls past unobserved within the ring's
+bound; the bridge does not use it yet.
 
 ---
 
 ## 11. Known limitations
 
-1. No colour in terminal output (protocol).
+1. No colour in terminal output — a **bridge** limitation, not a protocol one. `terminal.stream`
+   (issue #27) carries the child's original bytes with their SGR sequences intact; this bridge still
+   consumes `terminal.observe`, which is text-only by design and pinned that way by test.
 2. Scrollback is a best-effort reconstruction and on a real console it recovers very little: measured
    7 distinct lines from a 400-line flood and 6 from 20 line-at-a-time echoes through an 8-row
    viewport. It never invents, duplicates or reorders — but it is not a transcript, and the history

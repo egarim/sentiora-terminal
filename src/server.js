@@ -5,9 +5,14 @@ import {realpathSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {Session,dimensions} from './session.js';
 import {sessionEnv,envValidationError} from './env.js';
+import {SESSION_SCROLLBACK} from './recording.js';
 const {Terminal}=xterm;
 export const sessions=new Map();
 export const SESSION_LIMIT=16;
+// Ceiling on a per-session recording cap. A caller may ask for less; it may not ask
+// for more, because an unbounded recording is precisely the unbounded memory growth
+// issue #27 requires be impossible.
+export const RECORD_BYTES_MAX=16*1024*1024;
 // Creates whose response has not been confirmed delivered yet. They count against
 // SESSION_LIMIT, because readline emits every complete line of a chunk
 // synchronously: a client that pipelines creates runs all of their handlers to the
@@ -46,19 +51,34 @@ const CREATE_OBSERVE_GRACE_MS=10000;
 // anything else.
 async function createSession(p){
   if(sessions.size+inflight.size>=SESSION_LIMIT)throw Error('Session limit');
-  const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll,env}=p;dimensions(cols,rows);
+  const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll,env,recordInput,recordBytes}=p;dimensions(cols,rows);
   if(typeof command!=='string'||!command||!Array.isArray(args)||args.some(a=>typeof a!=='string'))throw Error('Invalid command');
   if(conptyDll!==undefined&&typeof conptyDll!=='boolean')throw Error('Invalid conptyDll');
+  // Keystrokes can carry secrets, so recording them is opt-in and the default is
+  // off. Validated like conptyDll rather than coerced: a caller passing "false" as a
+  // string must be told it was wrong, not silently given input recording.
+  if(recordInput!==undefined&&typeof recordInput!=='boolean')throw Error('Invalid recordInput');
+  // Per-session recording cap. Configurable rather than fixed for two reasons: a
+  // caller keeping long sessions as evidence wants more history than a caller
+  // watching a short one, and the truncation path -- the one that decides whether a
+  // replay is still exact -- cannot be tested end to end through a real PTY at the
+  // default 1 MiB without pushing a megabyte of output through ConPTY in CI.
+  // Capped so a caller cannot ask the host for unbounded memory, which is the thing
+  // issue #27 explicitly requires be impossible.
+  if(recordBytes!==undefined){
+    if(!Number.isSafeInteger(recordBytes)||recordBytes<1024)throw Error('Invalid recordBytes');
+    if(recordBytes>RECORD_BYTES_MAX)throw Error('Invalid recordBytes');
+  }
   // Validated before anything is spawned, and the message names no value: an error
   // that quoted the offending entry would leak the secret it was rejecting into a
   // JSON-RPC response and every log downstream of it.
   const envError=envValidationError(env);if(envError)throw Error(envError);
-  const terminal=new Terminal({cols,rows,scrollback:2000,allowProposedApi:true});
+  const terminal=new Terminal({cols,rows,scrollback:SESSION_SCROLLBACK,allowProposedApi:true});
   let child;
   try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:sessionEnv(env),useConptyDll:conptyDll??conptyDllDefault});}
   catch(e){terminal.dispose();throw e;}
   let s;
-  try{s=new Session(child,terminal);}catch(e){try{child.kill();}catch{}try{terminal.dispose();}catch{}throw e;}
+  try{s=new Session(child,terminal,{recordInput:recordInput===true,recordBytes});}catch(e){try{child.kill();}catch{}try{terminal.dispose();}catch{}throw e;}
   const record={
     session:s,settled:false,
     commit(){
@@ -93,7 +113,11 @@ async function createSession(p){
 export async function dispatch(method,p,deferred){
   if(!Array.isArray(deferred))throw Error('dispatch requires a deferred sink');
   if(closing)throw Error('Server shutting down');
-  if(method==='initialize')return {protocolVersion:1,platform:process.platform,arch:process.arch,conptyDll:conptyDllDefault};
+  // `stream` advertises the sequence-numbered read-only subscription added for
+  // issue #27, so a client can feature-detect it instead of probing for an Unknown
+  // method error. Additive: protocolVersion stays 1 because nothing existing
+  // changed shape.
+  if(method==='initialize')return {protocolVersion:1,platform:process.platform,arch:process.arch,conptyDll:conptyDllDefault,stream:1,recording:1};
   if(method==='terminal.create'){const created=await createSession(p);deferred.push(created);return created.result;}
   if(method==='terminal.list')return Promise.all([...sessions.values()].map(s=>s.observe()));
   const s=sessions.get(p.sessionId);if(!s)throw Error('Unknown session');
@@ -102,6 +126,13 @@ export async function dispatch(method,p,deferred){
     case 'terminal.type':return s.input(p);
     case 'terminal.key':if(!Object.hasOwn(keys,p.key))throw Error('Unknown key');return s.input({...p,text:keys[p.key]});
     case 'terminal.wait':return s.wait(p.afterRevision,p.timeoutMs);
+    // Read-only, so ungated exactly like observe and wait: a watcher does not hold
+    // the owner token and must not need one. It receives events with input filtered
+    // out at the source, so there is no path from here to keystrokes either.
+    case 'terminal.stream':return s.stream(p.afterSequence,p.timeoutMs);
+    // Gated, unlike the stream: a recording can contain what was typed, which is
+    // precisely what may hold a secret.
+    case 'terminal.recording':if(p.owner!==s.owner)throw Error('Ownership required');return s.recordingPayload();
     case 'terminal.resize':return s.resize(p.owner,p.cols,p.rows);
     case 'terminal.close':if(p.owner!==s.owner)throw Error('Ownership required');await abandon(s);return true;
     default:throw Error('Unknown method');
