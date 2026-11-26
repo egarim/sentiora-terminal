@@ -112,6 +112,56 @@ export async function untilGone(pids, timeout = 30000) {
   }
 }
 
+// Splits probed pids into those still RUNNING and those that have exited but were
+// never reaped. Pure, and exported, so the one decision that matters is tested
+// rather than reasoned about: `Z` means not running, while a null state means there
+// is no /proc to ask and the kill probe is all we have.
+//
+// Getting the second half wrong would silently weaken every platform without /proc,
+// because "unknown" would be treated as "gone" and the check would pass by asserting
+// nothing. Unknown is therefore treated as running, which keeps Windows and macOS
+// exactly as strict as they are today.
+export function classifyLiveness(described) {
+  const running = [];
+  const zombies = [];
+  for (const entry of described) {
+    if (!entry.killSaysAlive) continue;      // gone: kill(pid, 0) threw ESRCH
+    if (entry.state === 'Z') zombies.push(entry);
+    else running.push(entry);                // R/S/D/T, or a state we could not read
+  }
+  return { running, zombies };
+}
+
+// Waits until no pid is still running, and reports separately what exited without
+// being reaped.
+//
+// This exists for exactly one situation: the runtime was killed outright, so it can
+// never reap its own children and responsibility passes to PID 1 of the pid
+// namespace. On a runner image PID 1 is systemd and reaps them. In a plain container
+// it is whatever the runner started -- measured as `tail` on debian:bookworm-slim,
+// which never calls wait() -- so exited children remain in the process table as
+// zombies for as long as the container lives.
+//
+// A zombie is not a leaked process. It holds no PTY, no memory and no CPU, only a
+// pid slot and an exit status, and it cannot be signalled away. Counting it as a
+// survivor makes the test assert on the container's choice of init rather than on
+// anything in this repository. Dropping it silently would be worse, because a
+// long-lived container that kills runtimes does leak pid slots, so it is reported
+// loudly and the caller decides what that means.
+//
+// Where the runtime is still alive, use untilGone instead: there a zombie means the
+// runtime failed to reap a child it owns, which is a genuine defect and must fail.
+export async function untilNotRunning(pids, timeout = 30000) {
+  const list = Array.isArray(pids) ? pids : [pids];
+  assertProvable(list);
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const { running, zombies } = classifyLiveness(list.map(describePid));
+    if (!running.length || Date.now() > deadline) return { running, zombies };
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
 export function reap(pids) {
   for (const pid of Array.isArray(pids) ? pids : [pids]) {
     if (!Number.isInteger(pid) || pid <= 0) continue;

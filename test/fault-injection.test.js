@@ -26,7 +26,7 @@
 //     already carries the #14 fix, so it guards that fix rather than proving it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startRuntime, expectGone, collectSurvivors, untilGone, reap, describePid, describeInit, rpcLine } from './helpers/runtime.mjs';
+import { startRuntime, expectGone, collectSurvivors, untilGone, untilNotRunning, reap, describeInit, rpcLine } from './helpers/runtime.mjs';
 import { FIXTURE } from './helpers/native.mjs';
 
 const opts = { timeout: 180000 };
@@ -287,20 +287,26 @@ test('FI-05 killing the runtime outright leaves no orphaned shells', opts, async
     const info = await server.exited();
     assert.ok(info, 'the runtime survived SIGKILL');
 
-    // Described BEFORE reaping. expectGone signals survivors as it returns them, and
-    // a process that was running turns into one that is dying, which is precisely the
-    // distinction this test has to report: a leaked running shell and an unreaped
-    // exit record are different defects with different owners.
-    const survivors = await untilGone(pids);
-    const detail = survivors.map(describePid);
+    // The runtime is SIGKILLed, so it cannot reap its own children and PID 1 of the
+    // pid namespace inherits that job. Hence untilNotRunning rather than untilGone:
+    // a child that exited and was never reaped is a pid-table entry, not a leaked
+    // shell, and in a container whose PID 1 is not an init it would otherwise fail
+    // this test forever while measuring nothing about this repository.
+    //
+    // Everything is described before anything is signalled, because reaping turns a
+    // running process into a dying one and destroys the distinction being reported.
+    const { running, zombies } = await untilNotRunning(pids);
     const pid1 = describeInit();
-    console.log(`    FI-05 survivors after SIGKILL of the runtime: ${survivors.length} of ${pids.length} `
+    console.log(`    FI-05 after SIGKILL of the runtime: ${running.length} running, `
+      + `${zombies.length} exited-but-unreaped, of ${pids.length} `
       + `(${process.platform}, exit ${JSON.stringify(info)}, pid1 ${JSON.stringify(pid1)})`);
-    if (detail.length) console.log(`    FI-05 survivor detail: ${JSON.stringify(detail)}`);
-    // Reaped before asserting, so a failure cannot leak into the next test.
-    reap(survivors);
-    assert.deepEqual(survivors, [], `killing the runtime orphaned shell pids ${survivors.join(', ')}; `
-      + `kernel state ${JSON.stringify(detail)}; pid1 ${JSON.stringify(pid1)}`);
+    if (zombies.length) console.log(`    FI-05 unreaped exit records: ${JSON.stringify(zombies)}`);
+    // Signalled before asserting, so a failure cannot leak a live shell into the next
+    // test. A zombie cannot be reaped from here -- we are not its parent, PID 1 is.
+    reap(running.map(entry => entry.pid));
+    assert.deepEqual(running.map(entry => entry.pid), [],
+      `killing the runtime left ${running.length} shell(s) STILL RUNNING: ${JSON.stringify(running)}; `
+      + `pid1 ${JSON.stringify(pid1)}`);
   } finally {
     if (!server.hasExited) { server.killHard(); await server.exited(10000); }
     await collectSurvivors(pids, 0);
@@ -338,16 +344,15 @@ test('FI-06 a restarted runtime rejects the previous one\'s session ids', opts, 
     await first.exited();
     if (stalePid !== null) {
       // Logged, not asserted: this is a `finally`, where throwing would mask the
-      // failure the test actually came to report. But the wait costs 20s whether or
-      // not anything is printed, so it may as well leave behind the same
-      // live-versus-zombie evidence FI-05 does instead of spending the budget and
-      // reporting nothing. Before this, a container where the orphan never cleared
-      // showed up only as an unexplained 20s in the job timeline.
-      const { survivors } = await collectSurvivors([stalePid], 20000);
-      if (survivors.length) {
-        console.log('    FI-06 orphan still present 20s after SIGKILL of the runtime: '
-          + `${JSON.stringify(survivors.map(describePid))}`);
+      // failure the test actually came to report. It used to call collectSurvivors,
+      // which never asserts either but does wait out its whole budget on a zombie --
+      // 20s of the container job spent learning nothing. untilNotRunning returns as
+      // soon as nothing is running and says what is left.
+      const { running, zombies } = await untilNotRunning([stalePid], 20000);
+      if (running.length || zombies.length) {
+        console.log(`    FI-06 after SIGKILL of the runtime: ${JSON.stringify({ running, zombies })}`);
       }
+      reap(running.map(entry => entry.pid));
     }
   }
 
