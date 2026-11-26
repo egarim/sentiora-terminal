@@ -146,22 +146,47 @@ jobs:
 
       # The native suites drive ConPTY in-process, so a native crash takes the test
       # file's own process with it and `node --test` reports only the file as failed:
-      # no exit code, no exception, no faulting module. That is exactly what a
-      # windows-latest/node-24 failure at WIN-14 looked like -- 14 tests passed, the
-      # process died, and the log could not say why, so the cause could not be named.
+      # no exit code, no exception, no faulting module. That is what a
+      # windows-latest/node-24 failure at WIN-14 looked like, and the log could not
+      # say why, so the cause could not be named.
       #
-      # The Windows event log does record it. EventID 1000 (Application Error)
-      # carries the faulting module and the exception code, where 0xc0000005 is the
-      # STATUS_ACCESS_VIOLATION that #21 describes, and 1001 carries the WER report.
-      # Capturing it here means the next occurrence is diagnosable from the job log
-      # alone instead of needing a local reproduction. Best effort: it runs only
-      # after a failure and must not be able to fail the job a second time.
+      # The Windows event log does record it: the `Application Error` provider logs
+      # EventID 1000 ("Application Crashing Events") with the faulting application,
+      # the faulting module and the exception code, where 0xc0000005 is the
+      # STATUS_ACCESS_VIOLATION that #21 describes.
+      #
+      # Two filters that are not optional, both learned by running the first version
+      # of this step and reading what it actually produced:
+      #
+      #   - PROVIDER. Querying EventID 1000/1001 alone returned four
+      #     Microsoft-Windows-LoadPerf performance-counter messages and no crash
+      #     record, because LoadPerf reuses those ids for something unrelated. That
+      #     reproduced the observability failure this step was added to fix.
+      #   - TIME. `Windows Error Reporting` EventID 1001 was then tried and returned
+      #     fifteen LiveKernelEvent and BlueScreen records dating back months, each
+      #     with a multi-line dump listing -- enough to bury a real crash. Restricting
+      #     to the last hour also stops a stale event left on the runner image from
+      #     being read as this job's.
+      #
+      # An empty result is reported explicitly rather than printing nothing, because
+      # "no crash event" and "the step did not run" must be distinguishable, and
+      # because a timeout leaves no crash event at all -- ST14-05, the other recorded
+      # #21 signature, is exactly that case and produced none.
+      #
+      # Verified locally on both branches: the time-bounded query on a machine whose
+      # newest crash was two days old printed the explicit no-crash line, while the
+      # same query unbounded returned eight historical crashes with faulting module
+      # and exception code.
+      #
+      # Best effort: it runs only after a failure and must not fail the job twice.
       - name: Windows crash evidence after failure
         if: failure() && startsWith(matrix.os, 'windows')
         shell: pwsh
         continue-on-error: true
         run: |
-          wevtutil qe Application /q:"*[System[(EventID=1000 or EventID=1001)]]" /c:25 /rd:true /f:text
+          $q = "*[System[Provider[@Name='Application Error'] and (EventID=1000) and TimeCreated[timediff(@SystemTime) <= 3600000]]]"
+          $out = & wevtutil qe Application "/q:$q" /c:15 /rd:true /f:text 2>&1
+          if ($out) { $out } else { 'no Application Error event in the last hour: this failure was not a process crash (a timeout produces no such event)' }
 
   # Issue #28: the matrix above proves the suites pass on a GitHub-hosted ARM64
   # *runner image*. That is not the deployment shape. Vivarium runs sessions inside
