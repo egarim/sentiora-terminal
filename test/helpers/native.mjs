@@ -23,8 +23,32 @@ export function createSession({ command = process.execPath, args = [FIXTURE], co
   return { session, terminal, child };
 }
 
+// Ceiling for waits on an EXTERNAL process starting up -- PowerShell, cmd.exe -- as
+// opposed to waits on this repository's own fixture.
+//
+// The distinction is the whole point. A wait on our own Node fixture measures our
+// code, so a tight budget there is a real assertion. A wait on PowerShell's cold
+// start measures the machine: how loaded the runner is, whether the DLL cache is
+// warm, whether Defender is scanning. No budget on that is an assertion about the
+// code under test, and a tight one is an assertion about GitHub's fleet.
+//
+// WIN-02 failed at the previous 15s default on windows-11-arm, on both node 22 and
+// node 24, with "timed out ... waiting for powershell one-shot output" -- while the
+// sibling run of the same commit passed. That is the signature of a budget set
+// against machine load rather than against the thing being tested, and re-running it
+// green would have proved nothing (issue #30).
+//
+// 120s is roughly 8x the observed failure point and ~24x a typical cold start, which
+// makes it a hang guard rather than a performance budget: a genuinely wedged shell
+// still fails, a slow machine no longer does.
+export const COLD_START_MS = 120000;
+
 // Polls wait() until predicate holds. wait() is the production wake-up path, so
 // this also exercises revision-based waiting rather than sleeping blindly.
+//
+// The default timeout is sized for this repository's own fixture. Anything waiting on
+// an external process to start must pass COLD_START_MS explicitly, because the
+// default is a statement about our code and external startup time is not ours.
 export async function until(session, predicate, { timeout = 15000, label = 'condition' } = {}) {
   const deadline = Date.now() + timeout;
   let snapshot = await session.observe();

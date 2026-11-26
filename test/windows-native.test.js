@@ -9,7 +9,7 @@ import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import {
-  FIXTURE, SIGINT_FIXTURE, alivePidsAmong, ask, conhostBaseline, createSession,
+  COLD_START_MS, FIXTURE, SIGINT_FIXTURE, alivePidsAmong, ask, conhostBaseline, createSession,
   forceKill, handleKinds, isPidAlive, pidsOf, rawHex, screenHas, send, sendLine,
   until, untilTrue,
 } from './helpers/native.mjs';
@@ -42,6 +42,11 @@ async function probeProvider(provider) {
 const windows = process.platform === 'win32';
 const skip = windows ? false : 'native ConPTY scenario: Windows only';
 const opts = { skip, timeout: 60000 };
+// Tests that start an external shell get their own budget. `opts` is sized for this
+// repository's own Node fixture, whose startup we control; PowerShell's cold start on
+// a shared runner we do not, and WIN-02 alone starts two of them. See COLD_START_MS
+// in helpers/native.mjs for why the number is what it is.
+const shellOpts = { skip, timeout: 300000 };
 
 test('WIN-01 creates a native ConPTY session backed by a real TTY', opts, async () => {
   const { session, child } = createSession();
@@ -64,15 +69,15 @@ test('WIN-01 creates a native ConPTY session backed by a real TTY', opts, async 
   }
 });
 
-test('WIN-02 executes PowerShell commands and reports their output', opts, async () => {
+test('WIN-02 executes PowerShell commands and reports their output', shellOpts, async () => {
   const oneShot = createSession({
     command: 'powershell.exe',
     args: ['-NoProfile', '-NonInteractive', '-Command', "Write-Output 'PS-ONE-SHOT-OK'; Write-Output ('PS-MAJOR=' + $PSVersionTable.PSVersion.Major)"],
   });
   try {
-    const done = await until(oneShot.session, s => s.screen.includes('PS-ONE-SHOT-OK') && s.screen.includes('PS-MAJOR='), { label: 'powershell one-shot output' });
+    const done = await until(oneShot.session, s => s.screen.includes('PS-ONE-SHOT-OK') && s.screen.includes('PS-MAJOR='), { timeout: COLD_START_MS, label: 'powershell one-shot output' });
     assert.match(done.screen, /PS-MAJOR=\d+/);
-    await until(oneShot.session, s => !s.running, { label: 'powershell exit' });
+    await until(oneShot.session, s => !s.running, { timeout: COLD_START_MS, label: 'powershell exit' });
     assert.equal((await oneShot.session.observe()).exit.exitCode, 0);
   } finally {
     await oneShot.session.close();
@@ -82,21 +87,21 @@ test('WIN-02 executes PowerShell commands and reports their output', opts, async
   // which only holds if keystrokes really reach a persistent PowerShell.
   const interactive = createSession({ command: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-NoLogo'] });
   try {
-    await until(interactive.session, s => s.screen.length > 0, { label: 'powershell prompt' });
+    await until(interactive.session, s => s.screen.length > 0, { timeout: COLD_START_MS, label: 'powershell prompt' });
     await sendLine(interactive.session, '$sentiora = 6 * 7');
     await sendLine(interactive.session, 'Write-Output "PS-INTERACTIVE=$sentiora"');
-    const seen = await until(interactive.session, screenHas('PS-INTERACTIVE=42'), { label: 'powershell interactive result' });
+    const seen = await until(interactive.session, screenHas('PS-INTERACTIVE=42'), { timeout: COLD_START_MS, label: 'powershell interactive result' });
     assert.match(seen.screen, /PS-INTERACTIVE=42/);
   } finally {
     await interactive.session.close();
   }
 });
 
-test('WIN-03 executes CMD commands and reports their output', opts, async () => {
+test('WIN-03 executes CMD commands and reports their output', shellOpts, async () => {
   const oneShot = createSession({ command: 'cmd.exe', args: ['/c', 'echo CMD-ONE-SHOT-OK'] });
   try {
-    await until(oneShot.session, screenHas('CMD-ONE-SHOT-OK'), { label: 'cmd one-shot output' });
-    await until(oneShot.session, s => !s.running, { label: 'cmd exit' });
+    await until(oneShot.session, screenHas('CMD-ONE-SHOT-OK'), { timeout: COLD_START_MS, label: 'cmd one-shot output' });
+    await until(oneShot.session, s => !s.running, { timeout: COLD_START_MS, label: 'cmd exit' });
     assert.equal((await oneShot.session.observe()).exit.exitCode, 0);
   } finally {
     await oneShot.session.close();
@@ -104,10 +109,10 @@ test('WIN-03 executes CMD commands and reports their output', opts, async () => 
 
   const interactive = createSession({ command: 'cmd.exe', args: [] });
   try {
-    await until(interactive.session, s => s.screen.trim().length > 0, { label: 'cmd prompt' });
+    await until(interactive.session, s => s.screen.trim().length > 0, { timeout: COLD_START_MS, label: 'cmd prompt' });
     await sendLine(interactive.session, 'set SENTIORA_VAR=cmd-state-ok');
     await sendLine(interactive.session, 'echo CMD-INTERACTIVE=%SENTIORA_VAR%');
-    const seen = await until(interactive.session, screenHas('CMD-INTERACTIVE=cmd-state-ok'), { label: 'cmd interactive result' });
+    const seen = await until(interactive.session, screenHas('CMD-INTERACTIVE=cmd-state-ok'), { timeout: COLD_START_MS, label: 'cmd interactive result' });
     assert.match(seen.screen, /CMD-INTERACTIVE=cmd-state-ok/);
   } finally {
     await interactive.session.close();
@@ -355,7 +360,7 @@ test('WIN-12 rejects input from an unauthorised owner', opts, async () => {
   }
 });
 
-test('WIN-13 reports the real child exit status', opts, async () => {
+test('WIN-13 reports the real child exit status', shellOpts, async () => {
   for (const code of [0, 3, 42]) {
     const { session } = createSession();
     try {
@@ -373,7 +378,7 @@ test('WIN-13 reports the real child exit status', opts, async () => {
   // A real shell exit code must survive ConPTY too, not just the fixture's.
   const { session } = createSession({ command: 'cmd.exe', args: ['/c', 'exit 7'] });
   try {
-    const exited = await until(session, s => !s.running, { label: 'cmd exit 7' });
+    const exited = await until(session, s => !s.running, { timeout: COLD_START_MS, label: 'cmd exit 7' });
     assert.equal(exited.exit.exitCode, 7);
   } finally {
     await session.close();
