@@ -25,6 +25,9 @@ export const BYTES_LIMIT = 1 << 20;
 // Per-response payload cap, so one stream call cannot return the entire ring in a
 // single line and stall the transport on a huge write.
 export const RESPONSE_BYTES_LIMIT = 1 << 18;
+// Charged against the limit for every event, so that the cap bounds event COUNT and
+// not only payload bytes. See #cost.
+export const RECORD_EVENT_OVERHEAD = 64;
 
 // Monotonic clock for event timestamps. Injected in tests so ordering and elapsed
 // times can be asserted exactly instead of slept through.
@@ -34,7 +37,11 @@ export class Recording {
   // snapshotProvider is called only when truncation needs to replace the prefix, so
   // a session that never overflows never pays for a snapshot here.
   constructor({ limit = BYTES_LIMIT, inputRecorded = false, snapshotProvider = null, now = defaultNow, cols = null, rows = null } = {}) {
-    if (!Number.isFinite(limit) || limit <= 0) throw Error('Invalid recording limit');
+    // A limit that could not hold a single event is not a usable limit: #enforceLimit
+    // would clear the ring, append a re-anchoring snapshot that is itself over the
+    // limit, and truncate again forever. Rejecting it here turns that into a clear
+    // error at construction instead of a stack overflow during a session.
+    if (!Number.isFinite(limit) || limit <= RECORD_EVENT_OVERHEAD) throw Error('Invalid recording limit');
     this.limit = limit;
     this.inputRecorded = Boolean(inputRecorded);
     this.snapshotProvider = snapshotProvider;
@@ -61,10 +68,18 @@ export class Recording {
   get latestSequence() { return this.sequence; }
 
   #cost(event) {
-    // Only the payload is charged. The envelope is a fixed few dozen bytes and
-    // charging it would make the limit depend on field names rather than on data.
-    if (event.kind === 'output' || event.kind === 'input') return event.data.length;
-    return 0;
+    // Every event is charged at least its envelope, and payload-bearing events their
+    // payload on top. Charging zero for the envelope -- the obvious simplification,
+    // and what this did first -- makes the byte limit blind to event COUNT: an owner
+    // calling terminal.resize in a loop records an event that costs nothing, so
+    // #enforceLimit never fires and the ring grows without bound. That defeats the
+    // one property issue #27 requires of a slow or absent watcher, and it is
+    // reachable with an owner token, which is not a privileged position to trust.
+    // 64 bytes is an estimate of the seq/at/kind envelope; it does not need to be
+    // exact, only non-zero, so that the limit bounds events as well as bytes.
+    const overhead = RECORD_EVENT_OVERHEAD;
+    if (event.kind === 'output' || event.kind === 'input') return overhead + event.data.length;
+    return overhead;
   }
 
   #append(event) {
@@ -81,6 +96,18 @@ export class Recording {
     // The screen is the only state a replay cannot reconstruct from a suffix, so it
     // is the one thing that has to survive truncation. Without a provider there is
     // nothing to snapshot and the log is dropped instead, reported as such.
+    //
+    // This re-enters #append for the snapshot, which re-enters here. It terminates
+    // because the constructor rejects any limit that could not hold one event, so
+    // the snapshot alone is always within bounds -- that check is the guard, and
+    // removing it would turn this into infinite recursion rather than a slow path.
+    //
+    // A single event larger than the whole limit is therefore dropped with the rest.
+    // That is not silent data loss in the way it looks: the snapshot is taken from
+    // the live screen, which already reflects the dropped chunk, so replay still ends
+    // on the right screen. What is lost is that chunk's raw bytes, and with them its
+    // colour -- the same limitation as any other truncation, and reported by the same
+    // truncated/droppedEvents counters.
     const snapshot = this.snapshotProvider ? this.snapshotProvider() : null;
     this.droppedEvents += this.events.length;
     this.droppedBytes += this.bytes;

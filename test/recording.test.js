@@ -11,7 +11,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import xterm from '@xterm/headless';
-import { Recording, replayRecording } from '../src/recording.js';
+import { Recording, replayRecording, RECORD_EVENT_OVERHEAD } from '../src/recording.js';
 
 const { Terminal } = xterm;
 
@@ -215,6 +215,11 @@ test('REC-13 refuses a nonsensical limit at construction rather than at overflow
   assert.throws(() => new Recording({ limit: -1 }), /Invalid recording limit/);
   assert.throws(() => new Recording({ limit: NaN }), /Invalid recording limit/);
   assert.throws(() => new Recording({ limit: Infinity }), /Invalid recording limit/);
+  // A limit that cannot hold one event would make #enforceLimit append a snapshot
+  // that is itself over the limit and recurse forever. Rejecting it at construction
+  // is what keeps that a clear error instead of a stack overflow mid-session.
+  assert.throws(() => new Recording({ limit: RECORD_EVENT_OVERHEAD }), /Invalid recording limit/);
+  assert.doesNotThrow(() => new Recording({ limit: RECORD_EVENT_OVERHEAD + 1 }));
 });
 
 test('REC-14 works without a snapshot provider, dropping history rather than inventing it', () => {
@@ -226,4 +231,40 @@ test('REC-14 works without a snapshot provider, dropping history rather than inv
   // written after the last truncation. Reported, not papered over.
   assert.ok(events.every(e => e.kind === 'output'));
   assert.ok(r.bytes <= 256);
+});
+
+test('REC-15 bounds a flood of payload-free events, which a byte-only limit would not', () => {
+  // Regression for a real hole in the first version of this file. Resize and exit
+  // events carry no payload, so while the envelope cost nothing, an owner calling
+  // terminal.resize in a loop grew the ring forever: `bytes` stayed at zero, the
+  // limit never fired, and memory grew without bound -- the exact failure issue #27
+  // requires be impossible. Only an owner token is needed to do it, which is not a
+  // privileged position to trust.
+  const emu = emulator();
+  const r = new Recording({ limit: 1024, snapshotProvider: () => snapshotOf(emu) });
+  for (let i = 0; i < 5000; i += 1) r.recordResize(60 + (i % 10), 20);
+  emu.terminal.dispose();
+  const maxEvents = Math.ceil(1024 / RECORD_EVENT_OVERHEAD);
+  assert.ok(r.events.length <= maxEvents, `${r.events.length} events retained against a cap of ${maxEvents}`);
+  assert.ok(r.bytes <= 1024, `retained ${r.bytes} bytes against a 1024 cap`);
+  assert.equal(r.truncated, true);
+  assert.ok(r.droppedEvents > 4000, 'the flood must be reported as dropped, not silently absorbed');
+});
+
+test('REC-16 an event larger than the whole cap is dropped, but the snapshot carries its effect', async () => {
+  // A chunk bigger than the entire ring cannot be retained, and pretending otherwise
+  // would mean an unbounded ring. What must survive is the screen, because that is
+  // what replay is promised to reproduce -- the snapshot is taken from the live
+  // emulator, so it already reflects the bytes that were dropped.
+  const emu = emulator();
+  const r = new Recording({ limit: 1024, snapshotProvider: () => snapshotOf(emu) });
+  const big = 'B'.repeat(4000);
+  await emu.write(big);
+  r.recordOutput(big);
+  assert.equal(r.truncated, true);
+  const { events } = r.eventsAfter(0);
+  assert.deepEqual(events.map(e => e.kind), ['snapshot'], 'the oversized chunk is dropped and re-anchored');
+  assert.ok(events[0].screen.includes('B'), 'the snapshot must reflect what the dropped chunk rendered');
+  assert.ok(r.bytes <= 1024);
+  emu.terminal.dispose();
 });
