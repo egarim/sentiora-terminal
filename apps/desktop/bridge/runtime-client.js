@@ -22,7 +22,8 @@ export class RuntimeClient extends EventEmitter {
 
   // `env` is the environment of the runtime HOST process. Since issue #26 it is no
   // longer also the environment of every session: the runtime now defaults a
-  // session to a small allowlist (PATH, HOME/USERPROFILE, TERM, LANG, TMP and the
+  // session to a small allowlist (PATH, HOME or USERPROFILE, TERM, LANG, the
+  // platform temp variable -- TMPDIR on POSIX, TEMP/TMP on Windows -- and the
   // Windows essentials) and inherits nothing else unless the caller names it.
   // createSession below opts this bridge in explicitly, because the desktop runs as
   // the local user and its sessions are that user's own shells -- see the comment

@@ -33,18 +33,24 @@ const opts = { timeout: 180000 };
 const spawnFixture = extra => ({ command: process.execPath, args: [FIXTURE], cols: 60, rows: 20, ...extra });
 
 // FI-09 and FI-10 repeatedly fill the registry to its 16-session limit and drain
-// it. On windows-latest (x64) with node 22 that reliably enough kills the host with
-// STATUS_ACCESS_VIOLATION (exit 3221225477) to make them unusable as CI gates --
-// observed twice on that cell, and never on windows-11-arm, node 24, ubuntu or
-// macos. It is the crash documented in issue #21, and notably it needs NO external
-// kill: plain fill-and-drain at the session limit is enough.
+// it. On Windows that reliably enough kills the host with STATUS_ACCESS_VIOLATION
+// (exit 3221225477) to make them unusable as CI gates. It is the crash documented
+// in issue #21, and notably it needs NO external kill: plain fill-and-drain at the
+// session limit is enough.
+//
+// Observed on windows-latest + node 22 (FI-09, FI-10), windows-latest + node 24
+// (ST14-05) and windows-11-arm + node 24 (FI-10) -- both Windows runners and both
+// Node majors, never on ubuntu or macos. The gate was first scoped to
+// windows-latest + node 22 alone on the strength of two occurrences; that scoping
+// was wrong and only moved the failure to the next cell, so it now covers all of
+// Windows.
 //
 // They are gated rather than deleted or relaxed, because the capacity invariant
-// they assert is the one issue #14 was about. CI sets SENTIORA_FAULT_FILL=0 and
-// says why; run them locally, or set SENTIORA_FAULT_FILL=1, to exercise them.
-// Un-gating them is the acceptance test for a fix to #21.
+// they assert is the one issue #14 was about. CI sets SENTIORA_FAULT_FILL=0 on
+// Windows and says why; run them locally, or set SENTIORA_FAULT_FILL=1, to
+// exercise them. Un-gating them is the acceptance test for a fix to #21.
 const FILL_GATE = process.env.SENTIORA_FAULT_FILL === '0'
-  ? 'fill-to-limit churn crashes the host on windows-latest/node 22 (STATUS_ACCESS_VIOLATION); see issue #21. Set SENTIORA_FAULT_FILL=1 to run it anyway.'
+  ? 'fill-to-limit churn crashes the host on Windows (STATUS_ACCESS_VIOLATION); see issue #21. Set SENTIORA_FAULT_FILL=1 to run it anyway.'
   : false;
 const fillOpts = { ...opts, skip: FILL_GATE };
 

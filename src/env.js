@@ -18,15 +18,40 @@
 // cmd.exe cannot be located, and PATHEXT governs which extensions are executable.
 // Omitting them produces a session that spawns and then cannot run anything, which
 // is a worse outcome than the leak this file exists to close.
+//
+// The same reasoning extends to the program-location and shell variables: git, npm,
+// PowerShell module auto-loading, MSBuild and most installers read APPDATA and
+// LOCALAPPDATA, and `%ProgramFiles%` expanding to nothing breaks ordinary scripts.
+// A list narrow enough that cmd.exe starts but the usual tooling misbehaves is on
+// the wrong side of the bar this file sets for itself.
 const POSIX_NAMES = [
   'PATH', 'HOME', 'TERM', 'LANG', 'LC_ALL', 'LC_CTYPE',
   'SHELL', 'USER', 'LOGNAME', 'TMPDIR', 'TZ',
 ];
 const WINDOWS_NAMES = [
   'PATH', 'SystemRoot', 'SystemDrive', 'windir', 'ComSpec', 'PATHEXT',
-  'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'USERNAME',
+  'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'USERNAME', 'USERDOMAIN',
+  'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)',
+  'CommonProgramFiles', 'PSModulePath', 'PROCESSOR_ARCHITECTURE',
+  'NUMBER_OF_PROCESSORS', 'OS', 'PUBLIC',
   'TERM', 'LANG', 'TZ',
 ];
+
+// node-pty builds `key=value` and, on Windows, concatenates the block as `K=V\0`.
+// An `=` in a name therefore produces a differently-named variable than the caller
+// asked for, and a NUL in either half injects extra entries into the child's
+// environment. No privilege is gained today -- everything injected is
+// caller-supplied and a caller may name any variable anyway -- but this is the file
+// that defines the boundary, so its encoding should not be able to disagree with
+// its intent. The prototype keys are rejected rather than silently dropped so a
+// caller can tell "set" from "ignored".
+const REJECTED_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+
+function nameIsUsable(name) {
+  return typeof name === 'string' && name !== ''
+    && !name.includes('=') && !name.includes('\0')
+    && !REJECTED_NAMES.has(name);
+}
 
 export const POSIX_ENV_NAMES = POSIX_NAMES;
 export const WINDOWS_ENV_NAMES = WINDOWS_NAMES;
@@ -52,8 +77,10 @@ export function sessionEnv(requested, options = {}) {
   const canonical = new Map();
   const key = name => (caseInsensitive ? name.toUpperCase() : name);
   const put = (name, value) => {
-    if (typeof name !== 'string' || name === '') return;
-    if (typeof value !== 'string') return;
+    if (!nameIsUsable(name)) return;
+    // A NUL in a value would terminate the Windows environment block early and
+    // inject whatever follows it as further entries.
+    if (typeof value !== 'string' || value.includes('\0')) return;
     canonical.set(key(name), { name, value });
   };
 
@@ -68,18 +95,24 @@ export function sessionEnv(requested, options = {}) {
     for (const [name, value] of Object.entries(requested)) put(name, value);
   }
 
+  // Always returns a plain object, never undefined or null. That is load-bearing:
+  // node-pty does `opt.env = opt.env || process.env` in both unixTerminal.js and
+  // windowsTerminal.js, so a falsy return here would silently restore the exact
+  // leak this module exists to close, with no test failing. `{}` is truthy.
   const out = {};
   for (const { name, value } of canonical.values()) out[name] = value;
   return out;
 }
 
-// Validates the caller-supplied env without ever putting a value in the message.
+// Validates the caller-supplied env without ever putting a name or a value in the
+// message. An error that echoed either would put a secret into a JSON-RPC response
+// and every log downstream of it -- a wider leak than the one being closed.
 export function envValidationError(value) {
   if (value === undefined || value === null) return null;
   if (typeof value !== 'object' || Array.isArray(value)) return 'Invalid env';
   for (const [name, entry] of Object.entries(value)) {
-    if (typeof name !== 'string' || name === '') return 'Invalid env';
-    if (typeof entry !== 'string') return 'Invalid env';
+    if (!nameIsUsable(name)) return 'Invalid env';
+    if (typeof entry !== 'string' || entry.includes('\0')) return 'Invalid env';
   }
   return null;
 }

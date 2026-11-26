@@ -395,6 +395,20 @@ export class IpcServer {
     }
     if (!shell) return sendJson(response, 400, { error: 'no shell is available on this machine', kind: 'no-shell' });
 
+    // Validated here rather than left to the runtime, so a malformed env is a 400
+    // with a kind the UI can act on instead of a failed create. The message names
+    // no key and no value: this endpoint is reachable over loopback HTTP, and an
+    // error that echoed the offending entry would put a secret into a response body
+    // and into any log that captures it.
+    let env;
+    if (body.env !== undefined && body.env !== null) {
+      const entries = typeof body.env === 'object' && !Array.isArray(body.env) ? Object.entries(body.env) : null;
+      if (!entries || entries.some(([k, v]) => typeof k !== 'string' || k === '' || typeof v !== 'string')) {
+        return sendJson(response, 400, { error: 'env must be an object mapping names to string values', kind: 'invalid-env' });
+      }
+      env = body.env;
+    }
+
     const session = await this.#bridge.create({
       command: shell.command,
       args: shell.args,
@@ -403,6 +417,7 @@ export class IpcServer {
       rows: body.rows,
       label: typeof body.label === 'string' ? body.label.slice(0, 120) : shell.label,
       shell,
+      env,
     });
     return sendJson(response, 201, { session });
   }

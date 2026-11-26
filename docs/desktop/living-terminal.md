@@ -366,10 +366,11 @@ them being accepted; each has a working fallback today.
    distinguishes it. Already recommended in telekinesis.md §10. `bridge/errors.js` is the single
    place that would change.
 
-3. **Scoped environment for `terminal.create`.** Children currently inherit the host's full
-   environment (telekinesis.md §11.1), so the host process's credentials are visible to every
-   session. An optional `env` parameter with an explicit allow-list would let the desktop app run
-   shells with less than everything the bridge can see.
+3. ~~**Scoped environment for `terminal.create`.**~~ **Done (issue #26).** Children no longer
+   inherit the host's full environment: the runtime defaults a session to a small allowlist and
+   accepts an optional `env` object. This bridge opts into its own environment explicitly, and
+   `POST /api/sessions` forwards a caller-supplied `env` through `SessionBridge.create` — so the
+   narrowing described in §8 is reachable from the HTTP API, not only from in-process callers.
 
 4. **Cancellation for `terminal.wait`.** There is no request-id cancellation, so an in-flight wait
    can only be outlasted. The bridge polls at 250 ms to keep responsiveness, which means

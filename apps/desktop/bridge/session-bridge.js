@@ -148,11 +148,17 @@ export class SessionBridge extends EventEmitter {
     return record;
   }
 
-  async create({ command, args = [], cwd, cols, rows, label, conptyDll, shell = null } = {}) {
+  async create({ command, args = [], cwd, cols, rows, label, conptyDll, shell = null, env } = {}) {
     if (typeof command !== 'string' || command === '') throw new SentioraError('invalid-command', 'command must be a non-empty string');
     if (!Array.isArray(args) || args.some(a => typeof a !== 'string')) throw new SentioraError('invalid-command', 'args must be an array of strings');
     const size = clampDimensions(cols, rows);
     const params = { command, args, cwd, cols: size.cols, rows: size.rows, conptyDll };
+    // Forwarded only when supplied. RuntimeClient.createSession substitutes its own
+    // `env` when the param is undefined, so passing an explicit undefined here would
+    // be harmless -- but omitting the key keeps "the caller did not ask" and "the
+    // caller asked for nothing" distinguishable all the way down to the runtime,
+    // where the difference is the allowlist versus an empty environment.
+    if (env !== undefined) params.env = env;
     // The pool picks the host and moves on if the runtime reports 'Session limit',
     // so this never has to reason about capacity itself.
     const { host, result: created } = await this.#pool.runCreate(client => client.createSession(params));

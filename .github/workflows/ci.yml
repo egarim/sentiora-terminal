@@ -45,6 +45,7 @@ jobs:
         run: |
           node --check src/server.js
           node --check src/session.js
+          node --check src/env.js
 
       # Mocked, native and server suites run as separate steps so a failure is
       # attributable to one layer instead of hiding inside a single "npm test".
@@ -82,10 +83,16 @@ jobs:
       # macOS still run all ten tests.
       #
       # They stay in the suite and run by default locally. Removing this variable
-      # and getting Windows green is the acceptance test for a fix to #21. Capacity
-      # accounting is still covered on every cell by ST14-05 (fill, drain, refill),
-      # ST14-12 (pipelined creates cannot exceed the limit) and ST14-03 (a rejected
-      # create leaves nothing registered, in-flight included).
+      # and getting Windows green is the acceptance test for a fix to #21.
+      #
+      # What still covers capacity on every cell: ST14-12 (a pipelined burst of
+      # limit+8 creates cannot register more than the limit) and ST14-03 (a rejected
+      # create leaves nothing registered, in-flight set included). Both fill the
+      # registry once rather than repeatedly, which is the pattern that crashes.
+      # ST14-05 also fills and drains, but only once per test, and it has itself
+      # been an intermittent #21 victim -- so it is not cited here as a reliable
+      # substitute, and listing it both as coverage and as a casualty would be
+      # self-contradictory.
       - name: Fault injection tests
         env:
           SENTIORA_FAULT_FILL: ${{ startsWith(matrix.os, 'windows') && '0' || '1' }}

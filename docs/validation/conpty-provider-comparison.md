@@ -712,12 +712,15 @@ Node 24 result in §6.
    ~500-session ceiling are ConPTY-specific and untested against Unix PTY.
 10. **`useConptyDll:true` is exposed but not recommended** and is not covered by the long-running
     stress phases, since it cannot shut down.
-11. **Environment inheritance is not controllable through the protocol.** `src/server.js` spawns
-    children with `env: process.env`, so every child inherits the Sentiora host's full environment,
-    including any secrets in it. Screen content is also returned verbatim with no redaction, so a
-    child that prints a credential puts it into an observation. Both matter for any integration
-    that logs observations. Neither is addressed here; both are flagged in
-    [`../integrations/telekinesis.md`](../integrations/telekinesis.md).
+11. **Environment inheritance — fixed for the environment half (issue #26); the screen half is
+    still open.** `src/server.js` used to spawn children with `env: process.env`, so every child
+    inherited the host's full environment including any secrets in it. It now defaults a session to
+    a small allowlist and accepts an optional `env` object (see `src/env.js` and
+    [`../integrations/telekinesis.md`](../integrations/telekinesis.md) §11.1). Screen content,
+    however, is still returned verbatim with no redaction, so a child that *prints* a credential
+    still puts it into an observation. That matters for any integration that logs observations, and
+    it is the subject of issue #27 rather than #26 — scoping the environment stops a child reading
+    the host's secrets, not a child echoing its own.
 
 ## 9. Recommendations
 

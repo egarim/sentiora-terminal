@@ -115,6 +115,61 @@ test('envValidationError accepts an object of strings and nothing else', () => {
   }
 });
 
+test('names and values that would corrupt the environment block are rejected', () => {
+  // node-pty builds `key=value`, and on Windows concatenates the block as `K=V\0`.
+  // An `=` in a name yields a differently-named variable than the caller asked for,
+  // and a NUL in either half injects extra entries into the child's environment.
+  for (const bad of [
+    { 'A=B': 'x' },
+    { 'A\0B': 'x' },
+    { A: 'x\0INJECTED=y' },
+    // `{__proto__: ...}` as a literal sets the prototype and creates no own
+    // property, so it would test nothing. Real requests arrive through JSON.parse,
+    // which DOES create an own `__proto__` key -- that is the case worth rejecting.
+    JSON.parse('{"__proto__":"x"}'),
+    { constructor: 'x' },
+    { prototype: 'x' },
+  ]) {
+    assert.equal(envValidationError(bad), 'Invalid env', `should reject ${JSON.stringify(bad)}`);
+  }
+  assert.ok(Object.hasOwn(JSON.parse('{"__proto__":"x"}'), '__proto__'),
+    'precondition: JSON.parse must yield an own __proto__ key for the case above to mean anything');
+  // And sessionEnv drops them rather than passing them through, so a caller that
+  // bypasses validation cannot get them into the child either.
+  const env = sessionEnv({ 'A=B': 'x', GOOD: 'y', A: 'v\0BAD=z' },
+    { hostEnv: {}, caseInsensitive: false, names: [] });
+  assert.deepEqual(env, { GOOD: 'y' }, `sanitisation let something through: ${JSON.stringify(env)}`);
+});
+
+test('the allowlist covers what ordinary Windows tooling needs', () => {
+  // cmd.exe starting is the floor, not the bar: git, npm, PowerShell module
+  // auto-loading, MSBuild and most installers read APPDATA/LOCALAPPDATA, and
+  // `%ProgramFiles%` expanding to nothing breaks ordinary scripts. A list narrow
+  // enough that the shell starts but the tooling misbehaves is on the wrong side of
+  // the standard src/env.js sets for itself.
+  for (const required of [
+    'PATH', 'SystemRoot', 'SystemDrive', 'windir', 'ComSpec', 'PATHEXT',
+    'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ProgramData',
+    'ProgramFiles', 'ProgramFiles(x86)', 'PSModulePath', 'PROCESSOR_ARCHITECTURE',
+    'NUMBER_OF_PROCESSORS', 'OS', 'PUBLIC', 'USERDOMAIN',
+  ]) {
+    assert.ok(WINDOWS_ENV_NAMES.includes(required), `windows allowlist is missing ${required}`);
+  }
+});
+
+test('every allowlisted name survives a round trip from a fully populated host', () => {
+  // Guards the list against a name that is declared but never actually copied,
+  // which would silently narrow sessions on that platform.
+  for (const [label, names] of [['posix', POSIX_ENV_NAMES], ['windows', WINDOWS_ENV_NAMES]]) {
+    const host = Object.fromEntries(names.map(n => [n, `v-${n}`]));
+    const env = sessionEnv(undefined, { hostEnv: host, caseInsensitive: false, names });
+    for (const n of names) {
+      assert.equal(env[n], `v-${n}`, `${label}: ${n} was declared but not inherited`);
+    }
+    assert.equal(Object.keys(env).length, names.length, `${label}: unexpected extra or missing names`);
+  }
+});
+
 test('no validation message echoes a value', () => {
   // The whole point of the allowlist is that secrets do not travel. An error that
   // quoted the offending entry would put one into a JSON-RPC response and every log
