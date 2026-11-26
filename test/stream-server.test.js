@@ -321,6 +321,19 @@ test('STR-06 a recording of a real session replays to the screen it ended on', o
       .map(e => Buffer.from(e.data, 'base64')));
     const replayed = await replayBytes(bytes, recording.initialCols, recording.initialRows);
     assert.equal(replayed, observed.screen, 'replaying the recording must end on the live screen');
+
+    // And the way a real consumer does it: the WHOLE event list through the shipped
+    // replayer, including the snapshot the ring is seeded with at construction and any
+    // resize. Filtering to `output` alone, as above, would skip the seed snapshot and
+    // so would not test what a consumer actually receives.
+    const full = await replayRecording({
+      events: recording.events,
+      cols: recording.initialCols,
+      rows: recording.initialRows,
+      Terminal,
+    });
+    assert.equal(full.screen, observed.screen, 'replaying every recorded event must end on the live screen');
+    assert.equal(recording.events[0].kind, 'snapshot', 'the ring is seeded so an attach cannot spin on an empty ring');
   } finally {
     await server.stop();
   }
