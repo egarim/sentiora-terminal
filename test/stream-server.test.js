@@ -22,13 +22,26 @@ const { Terminal } = xterm;
 const opts = { timeout: 180000 };
 const spawnFixture = extra => ({ command: process.execPath, args: [FIXTURE], cols: 60, rows: 20, ...extra });
 
-// terminal.type requires the revision the caller last observed, so every keystroke
-// has to be armed with a fresh observation. Doing that inline in each test would
-// bury the assertion under bookkeeping.
+// terminal.type requires the revision the caller last observed, and any output
+// landing between the observation and the write makes that write stale -- so retry,
+// exactly as a real agent and the desktop bridge both do (and as `armed()` in
+// test/windows-server.test.js already did).
+//
+// Not retrying is a race rather than a simplification, and a platform-dependent one:
+// this passed on Windows, where ConPTY batches output into fewer larger chunks and
+// the window between observe and type is narrow, and failed on every Linux and macOS
+// cell in CI with `Stale observation`, where a pty delivers the same output in more,
+// smaller chunks. The tests that happened to pass there were latently racy too.
 async function type(server, sessionId, owner, text) {
-  const { result: obs } = await server.call('terminal.observe', { sessionId });
-  const { result } = await server.call('terminal.type', { sessionId, owner, revision: obs.revision, text });
-  return result;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const { result: obs } = await server.call('terminal.observe', { sessionId });
+    const { response } = await server.request('terminal.type', { sessionId, owner, revision: obs.revision, text });
+    if (response.result !== undefined) return response.result;
+    if (!/Stale observation/.test(response.error?.message ?? '')) {
+      throw new Error(`terminal.type failed: ${JSON.stringify(response.error)}`);
+    }
+  }
+  throw new Error('terminal.type kept hitting stale observations');
 }
 
 async function sendCommand(server, sessionId, owner, command) {
