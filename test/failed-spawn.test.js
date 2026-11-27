@@ -16,6 +16,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('../src/server.js', import.meta.url));
@@ -120,4 +123,33 @@ test('WIN-22 a command that exists but cannot be executed does not strand the ho
   assert.ok(failed.error, 'a create whose command cannot be executed must be answered with an error');
 
   await assertHostStillExits(t, runtime, 'unexecutable command');
+});
+
+// The case no pre-check can decide: an absolute path carrying an image extension, so it
+// passes every check this runtime makes, and CreateProcess still refuses it. It is the
+// reason scripts/patch-node-pty.mjs exists -- without the patch the host never exits.
+test('WIN-23 a spawn that fails inside connect() releases its ConPTY worker', windowsOnly, async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'sentiora-win23-'));
+  t.after(() => { try { rmSync(directory, { recursive: true, force: true }); } catch { /* gone */ } });
+  // Zero bytes: a file, an image extension, and not a loadable image.
+  const truncated = join(directory, 'truncated.exe');
+  writeFileSync(truncated, Buffer.alloc(0));
+
+  const runtime = startRuntime();
+  t.after(() => { try { runtime.child.kill('SIGKILL'); } catch { /* gone */ } });
+
+  const failed = await runtime.request('terminal.create', {
+    command: truncated,
+    cols: 40,
+    rows: 10,
+    cwd: REPO,
+  });
+  assert.ok(failed.error, 'a create whose command cannot be loaded must be answered with an error');
+  // 193 is ERROR_BAD_EXE_FORMAT from CreateProcess, i.e. this reached node-pty's connect()
+  // rather than the pre-spawn checks above it. Without that, the test would prove nothing
+  // about the constructor cleanup.
+  assert.match(failed.error.message, /error code: 193/u,
+    `expected the CreateProcess failure from connect(), got: ${failed.error.message}`);
+
+  await assertHostStillExits(t, runtime, 'truncated image');
 });
