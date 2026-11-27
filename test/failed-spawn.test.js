@@ -1,0 +1,123 @@
+// Regression tests for the failed-spawn host leak.
+//
+// node-pty's WindowsTerminal constructor creates the ConPTY and starts its
+// ConoutConnection worker BEFORE the native connect() spawns the child. When connect()
+// fails, the constructor throws, the caller never receives a terminal, and so nothing
+// ever disposes that worker. The host then cannot exit: measured at 20 s (the client's
+// dispose cap) with the process tree killed, versus a ~5 s normal ConPTY shutdown tail.
+//
+// Two inputs reach that path and neither is exotic: a cwd that does not exist (WIN-21)
+// and a command that exists but that CreateProcess cannot execute (WIN-22). Both are
+// decided before anything is spawned, so both are answered as errors and the host
+// still exits.
+//
+// These drive the real runtime over its real stdio transport and assert both halves:
+// the create is an error, and the host still exits promptly afterwards.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const SERVER = fileURLToPath(new URL('../src/server.js', import.meta.url));
+const REPO = fileURLToPath(new URL('..', import.meta.url));
+const FIXTURE = fileURLToPath(new URL('./fixtures/interactive.mjs', import.meta.url));
+const EXIT_BUDGET_MS = 8000;
+
+function startRuntime() {
+  const child = spawn(process.execPath, [SERVER], { cwd: REPO, stdio: ['pipe', 'pipe', 'pipe'] });
+  let buffered = '';
+  const responses = [];
+  const idle = [];
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  child.stdin.on('error', () => {});
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    buffered += chunk;
+    let newline;
+    while ((newline = buffered.indexOf('\n')) !== -1) {
+      const line = buffered.slice(0, newline);
+      buffered = buffered.slice(newline + 1);
+      if (!line.trim()) continue;
+      responses.push(JSON.parse(line));
+      for (const wake of idle.splice(0)) wake();
+    }
+  });
+  let nextId = 0;
+  return {
+    child,
+    get stderr() { return stderr; },
+    async request(method, params, timeoutMs = 30000) {
+      const id = ++nextId;
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const found = responses.find(response => response.id === id);
+        if (found) return found;
+        if (Date.now() > deadline) throw new Error(`no response for ${method} within ${timeoutMs}ms; stderr:\n${stderr}`);
+        await Promise.race([new Promise(resolve => idle.push(resolve)), new Promise(resolve => setTimeout(resolve, 50))]);
+      }
+    },
+    async exited(timeoutMs) {
+      return new Promise(resolve => {
+        const timer = setTimeout(() => resolve(null), timeoutMs);
+        child.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+      });
+    },
+  };
+}
+
+// The second half of every case: a host that leaked its ConPTY worker stays alive after
+// stdin closes. The budget is the assertion, not the wall clock -- a clean host exits on
+// ConPTY teardown, a leaking one waits forever.
+async function assertHostStillExits(t, runtime, label) {
+  const listed = await runtime.request('terminal.list', {});
+  assert.equal(listed.result.length, 0, `${label}: a failed create must not register a session`);
+
+  const closedAt = Date.now();
+  runtime.child.stdin.end();
+  const exit = await runtime.exited(EXIT_BUDGET_MS + 7000);
+  const elapsed = Date.now() - closedAt;
+
+  assert.ok(exit, `${label}: the host was still alive ${EXIT_BUDGET_MS + 7000}ms after stdin closed; stderr:\n${runtime.stderr}`);
+  assert.ok(elapsed < EXIT_BUDGET_MS,
+    `${label}: the host took ${elapsed}ms to exit after a failed spawn; budget is ${EXIT_BUDGET_MS}ms. ` +
+    `A leaked ConoutConnection worker is the usual cause. stderr:\n${runtime.stderr}`);
+  assert.equal(exit.code, 0, `${label}: the host should exit cleanly, got ${JSON.stringify(exit)}`);
+}
+
+const windowsOnly = { skip: process.platform !== 'win32' ? 'Windows ConPTY only' : false, timeout: 60000 };
+
+test('WIN-21 a failed spawn does not leave the host unable to exit', windowsOnly, async t => {
+  const runtime = startRuntime();
+  t.after(() => { try { runtime.child.kill('SIGKILL'); } catch { /* gone */ } });
+
+  const failed = await runtime.request('terminal.create', {
+    command: process.execPath,
+    args: [FIXTURE],
+    cols: 40,
+    rows: 10,
+    cwd: 'Z:/definitely/not/here',
+  });
+  assert.ok(failed.error, 'a create whose cwd does not exist must be answered with an error');
+
+  await assertHostStillExits(t, runtime, 'bad cwd');
+});
+
+test('WIN-22 a command that exists but cannot be executed does not strand the host', windowsOnly, async t => {
+  const runtime = startRuntime();
+  t.after(() => { try { runtime.child.kill('SIGKILL'); } catch { /* gone */ } });
+
+  // A real file, an absolute path, and not an executable image: CreateProcess would fail
+  // inside connect(), after the ConoutConnection worker has already started.
+  const notAnExecutable = fileURLToPath(new URL('./failed-spawn.test.js', import.meta.url));
+  const failed = await runtime.request('terminal.create', {
+    command: notAnExecutable,
+    cols: 40,
+    rows: 10,
+    cwd: REPO,
+  });
+  assert.ok(failed.error, 'a create whose command cannot be executed must be answered with an error');
+
+  await assertHostStillExits(t, runtime, 'unexecutable command');
+});

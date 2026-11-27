@@ -1,7 +1,8 @@
 import * as pty from 'node-pty';
 import xterm from '@xterm/headless';
 import {createInterface} from 'node:readline';
-import {realpathSync} from 'node:fs';
+import {existsSync,realpathSync,statSync} from 'node:fs';
+import {isAbsolute} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {Session,dimensions} from './session.js';
 import {sessionEnv,envValidationError} from './env.js';
@@ -43,6 +44,20 @@ async function abandonAll(deferred){for(const d of deferred??[])await d.rollback
 // still holding a slot. Only teardown could reclaim it. Bounded for the same
 // reason close() is -- a failure must not permanently consume capacity.
 const CREATE_OBSERVE_GRACE_MS=10000;
+// CreateProcess resolves an image by extension -- .exe, .com, .bat, .cmd -- and never by
+// file association. A path whose file exists but carries another extension is therefore a
+// spawn that must fail, and on Windows a failed spawn leaks the ConPTY worker. Only the
+// absolute case is judged: a bare command is resolved from PATH by CreateProcess itself,
+// which is the normal way to launch a shell, and statSync cannot judge it.
+const WIN32_IMAGE_EXTENSIONS=new Set(['.exe','.com','.bat','.cmd']);
+function win32Executable(command){
+  try{if(!statSync(command).isFile())return false;}catch{return false;}
+  const dot=command.lastIndexOf('.');
+  const separator=Math.max(command.lastIndexOf('\\'),command.lastIndexOf('/'));
+  if(dot>separator&&WIN32_IMAGE_EXTENSIONS.has(command.slice(dot).toLowerCase()))return true;
+  // An extensionless path is still spawnable, because CreateProcess appends .exe.
+  try{return statSync(`${command}.exe`).isFile();}catch{return false;}
+}
 // terminal.create is the only method that registers state, so it is the only one
 // that can strand a session: the owner token travels in the create response, and a
 // caller that never receives it can never close the session or free its slot. The
@@ -73,6 +88,18 @@ async function createSession(p){
   // that quoted the offending entry would leak the secret it was rejecting into a
   // JSON-RPC response and every log downstream of it.
   const envError=envValidationError(env);if(envError)throw Error(envError);
+  // A spawn that fails inside node-pty's Windows connect() leaks its ConPTY worker: the
+  // worker is started before CreateProcess runs, and on failure the caller never receives
+  // a terminal to kill, so the host can never exit (WIN-21: measured 20s forced shutdown
+  // after a bad cwd; WIN-22: the same leak from a command that exists but is not an
+  // executable image). Both cases are decidable here, before anything is created, so
+  // both are refused here. The message names no value for the same reason as above.
+  if(process.platform==='win32'){
+    let usableCwd=false;
+    try{usableCwd=statSync(cwd).isDirectory();}catch{}
+    if(!usableCwd)throw Error('Invalid cwd');
+    if(isAbsolute(command)&&!win32Executable(command))throw Error('Invalid command');
+  }
   const terminal=new Terminal({cols,rows,scrollback:SESSION_SCROLLBACK,allowProposedApi:true});
   let child;
   try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:sessionEnv(env),useConptyDll:conptyDll??conptyDllDefault});}
