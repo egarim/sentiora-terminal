@@ -615,6 +615,26 @@ Eight consecutive runs on Windows 11 ARM64 build 26200, Node v24.18.1, after the
 109 = the 37 pre-existing runtime tests plus 72 desktop tests, 0 skipped. The two new CI jobs have
 **never run on GitHub Actions** — this table is local evidence only and does not imply CI validation.
 
+### Interaction tests in a real browser (E2E-01..04)
+
+`npm --prefix apps/desktop run test:e2e` builds the UI, boots the real loopback IPC server with a
+**scriptable fake runtime** standing in for a shell, and drives the built page in Chromium. The fake is
+deliberate: the question is what the UI does with a session, not whether ConPTY works — that is
+`test:native`'s job on the Windows cells.
+
+| test | what it proves |
+| --- | --- |
+| E2E-01 | an unlaunched page makes **no API call at all**: the token gate is not a UI suggestion |
+| E2E-02 | a fragment token opens the shell picker, with the detected shells selectable |
+| E2E-03 | launching from onboarding opens a tab, the status bar reports the session state, and the onboarding dialog is gone |
+| E2E-04 | a wrong token shows the refusal instead of falling through to a picker it cannot use |
+
+It runs as its own `desktop-e2e` CI job on Ubuntu only: the behaviour under test is the UI's, and a
+browser is the same everywhere. A failure uploads the Playwright traces and screenshots, because "it
+failed on CI" without an artifact is not a bug report.
+
+The token is delivered in the URL **fragment**, exactly as the real launcher does, so the tests walk
+the bootstrap path a user walks rather than a test-only shortcut.
 ### Scrollback recovery on a real console is partial, and that is expected
 
 After those fixes the invariant that always holds is: **nothing is invented, nothing is recovered
