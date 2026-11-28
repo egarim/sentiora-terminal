@@ -11,7 +11,7 @@
     "postinstall": "node scripts/patch-node-pty.mjs",
     "patch:node-pty": "node scripts/patch-node-pty.mjs",
     "fix:native-permissions": "node scripts/fix-native-permissions.mjs",
-    "test": "npm run test:unit && npm run test:native && npm run test:server && npm run test:fault && npm run test:desktop",
+    "test": "npm run test:unit && npm run test:native && npm run test:server && npm run test:fault && npm run test:agent && npm run test:desktop",
     "test:unit": "node --test --test-timeout=60000 test/session.test.js test/env.test.js test/proc-stat.test.js test/recording.test.js",
     "test:native": "node --test --test-timeout=180000 test/native.test.js test/windows-native.test.js test/deferred-kill.test.js",
     "test:server": "node --test --test-timeout=180000 --test-concurrency=1 test/server.test.js test/session-env.test.js test/stream-server.test.js test/windows-server.test.js test/failed-spawn.test.js test/node-pty-patch.test.js test/mailbox.test.js test/parent-edge.test.js test/handover.test.js test/cancellation.test.js test/mcp-server.test.js test/python-client.test.js test/identity.test.js",
