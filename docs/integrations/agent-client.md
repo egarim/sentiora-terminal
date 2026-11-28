@@ -12,6 +12,7 @@ Two implementations exist, both dependency-free, and both speak the same
 | --- | --- | --- | --- |
 | `agent-client` | ESM JavaScript, zero deps | `packages/agent-client/index.mjs` | JS/Node hosts, CI harnesses, the reference for other ports |
 | `Sentiora.Client` | C# / .NET, zero package refs | `clients/dotnet/Sentiora.Client` | Creatura's World adapter and any .NET host |
+| `sentiora_client` | Python 3, standard library only | `clients/python/sentiora_client.py` | hosts that cannot install packages; a self-check (`clients/python/selfcheck.py`) runs under `test:server` |
 
 ## The contract, in one table
 
