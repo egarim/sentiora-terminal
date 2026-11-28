@@ -390,7 +390,17 @@ test('STR-07 a small cap truncates, stays bounded, and tells a stale watcher to 
     assert.equal(late.resync, true, 'a cursor behind the ring must be reported as stale');
     assert.ok(late.snapshot, 'a resync must carry a fresh snapshot');
     const { result: observed } = await server.call('terminal.observe', { sessionId });
-    assert.equal(late.snapshot.screen, observed.screen, 'the resync snapshot is the current screen');
+    // Two reads of a live terminal are two points in time, so requiring exact equality across a
+    // separate observe() asserts on the scheduler rather than on the resync: it failed on
+    // windows-latest twice (runs 46133534991 and 46133972528) when a trailing ConPTY repaint
+    // landed between the two calls. The resync contract is "a real screen at or after your
+    // cursor", so assert that — and still require exact equality when the revisions coincide,
+    // which is the case where the comparison actually means something.
+    assert.ok(observed.revision >= late.snapshot.revision,
+      `the snapshot cannot be from the future (snapshot ${late.snapshot.revision}, observed ${observed.revision})`);
+    if (late.snapshot.revision === observed.revision) {
+      assert.equal(late.snapshot.screen, observed.screen, 'at the same revision the snapshot and the observation must agree');
+    }
     assert.ok(late.nextSequence >= staleCursor, 'the cursor must move forward so the watcher cannot spin');
     // The snapshot is a real observation, not a placeholder: it carries the marker
     // that was on screen, and the sequence it hands back is the ring's latest.
