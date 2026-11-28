@@ -292,6 +292,23 @@ then open `http://localhost:5173/#token=<token>`.
 
 ---
 
+### Cascade close is declared at creation, not at close
+
+`terminal.create { parent, closeChildren: true }` is what registers "when this parent closes, close
+my children": the runtime keeps that in `childCascade`, keyed by the parent. There is **no close-time
+flag**, and a `?closeChildren=1` on `DELETE` would have nothing to read.
+
+That cost a round. The first attempt passed the flag on close, so the DELETE returned `200
+{"closed":true}` while the child's process stayed alive — the parent closed, the cascade was never
+registered. `E2E-11` now declares it at creation and asserts the **pid** is gone, which is the only
+assertion that cannot be satisfied by a bookkeeping change.
+
+Two traps in that test worth knowing:
+
+- the app opens its own first tab on boot, so **row counts are not stable** — the assertions are by
+  session id, not by count;
+- a `locator.filter({ has })` looks for a **descendant**; a row carrying the attribute itself is
+  matched with a plain attribute selector.
 ### The log after a reload
 
 Reopening the app replays the log from the mailbox, because the viewer starts at cursor 0 on every

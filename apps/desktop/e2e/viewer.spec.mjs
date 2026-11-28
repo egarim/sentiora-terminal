@@ -148,3 +148,43 @@ test('E2E-12 the message log survives a reload, replayed from the mailbox', asyn
     await app.stop();
   }
 });
+
+test('E2E-11 closing a parent with children leaves no child process behind', async ({ page }) => {
+  // Real runtime, because the assertion is about a process.
+  //
+  // Asserted by IDENTITY, not by count: the app opens its own first tab on boot, so the number of
+  // rows is not a stable thing to assert while a tab is being created. A count assertion here fails
+  // for a reason that has nothing to do with the close.
+  const app = await startApp({ real: true, settingsPatch: ONBOARDED });
+  const auth = { authorization: 'Bearer ' + app.token };
+  const rows = page.getByTestId('session-row');
+  try {
+    await page.goto(app.launchUrl);
+    // Let the app's own first tab settle before creating anything, so the ids below are ours.
+    await expect(rows).toHaveCount(1, { timeout: 20000 });
+
+    const parent = await app.backend.bridge.create({ command: process.execPath, args: [FIXTURE], cols: 60, rows: 16 });
+    const child = await app.backend.bridge.create({ command: process.execPath, args: [FIXTURE], cols: 60, rows: 16, parentSessionId: parent.sessionId, closeChildren: true });
+    await expect(page.locator('[data-session-id="' + child.sessionId + '"]')).toHaveCount(1, { timeout: 20000 });
+
+    const observed = await page.request.get(app.url + '/api/sessions/' + child.sessionId, { headers: auth });
+    const { session } = await observed.json();
+    expect(session.pid).toBeGreaterThan(0);
+
+    const closed = await page.request.delete(app.url + '/api/sessions/' + parent.sessionId, { headers: auth });
+    expect(closed.ok()).toBe(true);
+    expect((await closed.json()).closed).toBe(true);
+
+    // The parent's row goes; the cascade-closed child stays as an exited session -- the user just
+    // watched it die, and hiding it would be a different lie from showing it.
+    await expect(page.locator('[data-session-id="' + parent.sessionId + '"]')).toHaveCount(0, { timeout: 20000 });
+    await expect(page.locator('[data-session-id="' + child.sessionId + '"]')).toHaveCount(1);
+
+    // The half that matters: a child process that the runtime believed it closed.
+    await expect.poll(() => {
+      try { process.kill(session.pid, 0); return 'alive'; } catch { return 'gone'; }
+    }, { timeout: 20000 }).toBe('gone');
+  } finally {
+    await app.stop();
+  }
+});

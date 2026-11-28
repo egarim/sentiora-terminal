@@ -152,7 +152,7 @@ export class SessionBridge extends EventEmitter {
     return record;
   }
 
-  async create({ command, args = [], cwd, cols, rows, label, conptyDll, shell = null, env, parentSessionId = null } = {}) {
+  async create({ command, args = [], cwd, cols, rows, label, conptyDll, shell = null, env, parentSessionId = null, closeChildren = false } = {}) {
     if (typeof command !== 'string' || command === '') throw new SentioraError('invalid-command', 'command must be a non-empty string');
     if (!Array.isArray(args) || args.some(a => typeof a !== 'string')) throw new SentioraError('invalid-command', 'args must be an array of strings');
     const size = clampDimensions(cols, rows);
@@ -169,6 +169,9 @@ export class SessionBridge extends EventEmitter {
     if (parentSessionId !== null) {
       parent = this.#get(parentSessionId);
       params.parent = parent.runtimeSessionId;
+      // Declared at creation, not at close: the runtime registers "when I close, close my children"
+      // against the parent's id (childCascade). A close-time flag has nothing to read.
+      if (closeChildren) params.closeChildren = true;
     }
     // The pool picks the host and moves on if the runtime reports 'Session limit',
     // so this never has to reason about capacity itself.
@@ -659,7 +662,9 @@ export class SessionBridge extends EventEmitter {
     let closed = true;
     if (!record.backendLost) {
       try {
-        await record.host.client.call('terminal.close', { sessionId: record.runtimeSessionId, owner: record.owner });
+        await record.host.client.call('terminal.close', {
+          sessionId: record.runtimeSessionId, owner: record.owner,
+        });
       } catch (error) {
         // An already-exited session can refuse to close; that is not a failure of
         // the bridge, but it is reported rather than swallowed.

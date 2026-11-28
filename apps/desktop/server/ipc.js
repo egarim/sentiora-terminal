@@ -437,6 +437,10 @@ export class IpcServer {
       label: typeof body.label === 'string' ? body.label.slice(0, 120) : shell.label,
       shell,
       env,
+      // Declared at creation: the runtime registers "when this parent closes, close my children"
+      // then. A close-time flag would have nothing to read (issue #35).
+      ...(typeof body.parentSessionId === 'string' ? { parentSessionId: body.parentSessionId } : {}),
+      ...(body.closeChildren === true ? { closeChildren: true } : {}),
     });
     return sendJson(response, 201, { session });
   }
