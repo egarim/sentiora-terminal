@@ -337,6 +337,14 @@ Guarantees, each held by `test/parent-edge.test.js`:
 | the capability cannot open a session that is not one of its ends | PE-04 |
 | an unknown or malformed `parent` is refused before anything spawns | PE-05 |
 | closing either end drops the edge and its capability | PE-06 |
+| a message to a closed edge answers `Edge closed`, not `Mailbox capability required` | PE-10 |
+| an edge reaches its own two ends and nothing else, including a grandchild | PE-11 |
+
+**Three answers that used to be one.** `Unknown session` means the target is not registered.
+`Edge closed` means the capability was real and its edge has since closed (PE-10) — a lifecycle
+event, not a bug. `Mailbox capability required` means anything else, including a capability that
+never existed. Closed edges are remembered 512 deep; past that an old capability reads as a wrong
+token again, which is the correct answer once the edge is long gone.
 
 **Lifecycle, chosen explicitly:** closing either end drops the edge. Closing a parent **detaches**
 its children by default, because killing processes a caller did not name is the more surprising
