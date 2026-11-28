@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, bootstrapFromLocation, subscribeEvents } from './lib/api';
+import { api, bootstrapFromLocation, hasToken, subscribeEvents } from './lib/api';
+import { SessionTree } from './components/SessionTree';
+import { useSessionTree } from './lib/useSessionTree';
 import {
   insertSplit, leaf, leafIdsInOrder, leavesOf, newLeafId, removeLeaf, setRatio,
   type LayoutNode, type SplitDirection,
@@ -34,6 +36,10 @@ let tabCounter = 0;
 type FocusDirection = 'up' | 'down' | 'left' | 'right';
 
 export function App() {
+  // Called unconditionally, above every early return: a hook invoked only on the final render path
+  // changes the hook count between renders, and React throws as soon as the app reaches the
+  // workspace. `enabled` is what keeps it quiet before a token exists.
+  const viewer = useSessionTree({ enabled: hasToken() });
   const [boot, setBoot] = useState<Boot>({ stage: 'loading' });
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsWarnings, setSettingsWarnings] = useState<string[]>([]);
@@ -517,6 +523,17 @@ export function App() {
       {error ? <p className="banner banner--fatal app__error" role="alert">{error}</p> : null}
 
       <div className="app__body">
+        {/* The viewer (#35): every session the bridge knows, with the parent links that make the
+            tree, and the selected session's message log. Reads only -- input still goes through the
+            focused pane. */}
+        <aside className="viewer" aria-label="Sessions">
+          <SessionTree
+            sessions={viewer.sessions}
+            selectedId={viewer.selectedId}
+            log={viewer.log}
+            onSelect={viewer.select}
+          />
+        </aside>
         <main
           className="workspace"
           id={activeTab ? `tabpanel-${activeTab.id}` : undefined}

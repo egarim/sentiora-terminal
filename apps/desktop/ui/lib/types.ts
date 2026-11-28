@@ -33,6 +33,8 @@ export interface SessionDescriptor {
   command: { command: string; args: string[] };
   shellId: string | null;
   promptPattern: string | null;
+  /** Bridge session id of the parent, or null for a root (issue #35). */
+  parent?: string | null;
   state: LifecycleState;
   revision: number;
   cols: number;

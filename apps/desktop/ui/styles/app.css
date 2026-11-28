@@ -562,3 +562,39 @@ kbd {
   .settings { position: absolute; right: 0; top: 0; bottom: 0; z-index: 5; box-shadow: 0 0 24px rgb(0 0 0 / 40%); }
   .app__body { position: relative; }
 }
+
+/* The session viewer (#35): a fixed-width tree beside the workspace. It scrolls on its own so a
+   deep tree never shrinks the terminal. */
+.viewer {
+  width: 260px;
+  flex: 0 0 260px;
+  min-height: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+  font-size: 12px;
+}
+
+.viewer [data-testid='session-row'] {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.viewer [data-testid='session-row'][aria-current='true'] {
+  background: rgba(127, 127, 127, 0.18);
+}
+
+.viewer [data-testid='session-rows'],
+.viewer [data-testid='log-messages'] {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.viewer [data-testid='log-gap'],
+.viewer [data-testid='tree-orphans'] {
+  margin: 4px 8px;
+  opacity: 0.85;
+}
