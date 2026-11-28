@@ -14,7 +14,7 @@
     "test": "npm run test:unit && npm run test:native && npm run test:server && npm run test:fault && npm run test:desktop",
     "test:unit": "node --test --test-timeout=60000 test/session.test.js test/env.test.js test/proc-stat.test.js test/recording.test.js",
     "test:native": "node --test --test-timeout=180000 test/native.test.js test/windows-native.test.js",
-    "test:server": "node --test --test-timeout=180000 --test-concurrency=1 test/server.test.js test/session-env.test.js test/stream-server.test.js test/windows-server.test.js test/failed-spawn.test.js test/node-pty-patch.test.js",
+    "test:server": "node --test --test-timeout=180000 --test-concurrency=1 test/server.test.js test/session-env.test.js test/stream-server.test.js test/windows-server.test.js test/failed-spawn.test.js test/node-pty-patch.test.js test/mailbox.test.js",
     "test:fault": "node --test --test-timeout=180000 --test-concurrency=1 test/fault-injection.test.js",
     "test:agent": "node --test --test-timeout=180000 test/agent-client.test.js",
     "test:desktop": "node --test --test-timeout=180000 test/desktop-bridge.test.js test/desktop-settings.test.js test/desktop-ipc.test.js test/desktop-native.test.js",

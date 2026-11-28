@@ -1,6 +1,7 @@
 import * as pty from 'node-pty';
 import xterm from '@xterm/headless';
 import {createInterface} from 'node:readline';
+import {randomBytes} from 'node:crypto';
 import {existsSync,realpathSync,statSync} from 'node:fs';
 import {isAbsolute} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -35,6 +36,7 @@ const conptyDllDefault=process.env.SENTIORA_CONPTY_DLL==='1';
 // flattened so one failure stays one line.
 async function abandon(session){
   await session.close();
+  mailboxes.delete(session.id);
   if(session.closeError)process.stderr.write(`sentiora: cleanup failed for session ${session.id}: ${String(session.closeError).replace(/[\r\n]+/g,' ')}\n`);
   sessions.delete(session.id);
 }
@@ -56,6 +58,59 @@ const CREATE_OBSERVE_GRACE_MS=10000;
 function win32Executable(command){
   try{if(statSync(command).isFile())return true;}catch{}
   try{return statSync(`${command}.exe`).isFile();}catch{return false;}
+}
+// Cross-session messaging (issue #34): a sequenced entry in a bounded, host-relayed queue --
+// never keystrokes in the target's PTY. Keeping it off the PTY is the whole point: a message
+// must not be rendered into scrollback or the recording, must not be erased by an ANSI
+// repaint, and must never be mistakable for human input.
+//
+// The capability is minted per session and is deliberately NOT the owner token: holding it
+// authorises messages only. There is no path from either method below to s.input(), so a
+// session cannot type into another session just because it can send it a message.
+const MAILBOX_MAX_BYTES=64*1024;      // one message, measured as its JSON encoding
+const MAILBOX_DEPTH=256;              // queued per session; the oldest is dropped past this
+const MAILBOX_POSTS_PER_SECOND=100;   // one sender cannot exhaust another's memory
+const MAILBOX_MAX_WAIT_MS=30000;
+const mailboxes=new Map();
+function newMailbox(){return {capability:randomBytes(24).toString('hex'),queue:[],next:1,dropped:0,waiters:new Set(),recent:[]};}
+function mailboxFor(p){
+  const mailbox=mailboxes.get(p?.sessionId);
+  if(!mailbox)throw Error('Unknown session');
+  if(typeof p.capability!=='string'||p.capability!==mailbox.capability)throw Error('Mailbox capability required');
+  return mailbox;
+}
+function mailboxDrain(mailbox,after){
+  return {messages:mailbox.queue.filter(m=>m.sequence>after),nextSequence:mailbox.next-1,dropped:mailbox.dropped};
+}
+function mailboxPost(mailbox,payload){
+  let encoded;
+  try{encoded=JSON.stringify(payload);}catch{throw Error('Invalid message');}
+  if(typeof encoded!=='string')throw Error('Invalid message');
+  if(encoded.length>MAILBOX_MAX_BYTES)throw Error('Message too large');
+  const now=Date.now();
+  mailbox.recent=mailbox.recent.filter(at=>now-at<1000);
+  if(mailbox.recent.length>=MAILBOX_POSTS_PER_SECOND)throw Error('Too many messages');
+  mailbox.recent.push(now);
+  const sequence=mailbox.next++;
+  mailbox.queue.push({sequence,payload});
+  // Dropped, never reordered: the gap is reported through `dropped`, the same way a
+  // stream reports resync rather than silently losing bytes.
+  if(mailbox.queue.length>MAILBOX_DEPTH){mailbox.queue.shift();mailbox.dropped+=1;}
+  for(const wake of [...mailbox.waiters])wake();
+  return {sequence,dropped:mailbox.dropped};
+}
+function mailboxWait(mailbox,afterSequence,timeoutMs){
+  const after=Number.isSafeInteger(afterSequence)&&afterSequence>0?afterSequence:0;
+  if(mailbox.queue.some(m=>m.sequence>after))return Promise.resolve(mailboxDrain(mailbox,after));
+  const wait=Math.max(0,Math.min(Number.isSafeInteger(timeoutMs)?timeoutMs:0,MAILBOX_MAX_WAIT_MS));
+  return new Promise(resolve=>{
+    let timer;
+    const finish=()=>{mailbox.waiters.delete(finish);clearTimeout(timer);resolve(mailboxDrain(mailbox,after));};
+    timer=setTimeout(finish,wait);
+    // Unref'd so a pending long poll can never be the reason the host cannot exit.
+    if(typeof timer.unref==='function')timer.unref();
+    mailbox.waiters.add(finish);
+  });
 }
 // terminal.create is the only method that registers state, so it is the only one
 // that can strand a session: the owner token travels in the create response, and a
@@ -105,6 +160,7 @@ async function createSession(p){
   catch(e){terminal.dispose();throw e;}
   let s;
   try{s=new Session(child,terminal,{recordInput:recordInput===true,recordBytes});}catch(e){try{child.kill();}catch{}try{terminal.dispose();}catch{}throw e;}
+  const mailbox=newMailbox();
   const record={
     session:s,settled:false,
     commit(){
@@ -114,13 +170,13 @@ async function createSession(p){
       // would put the session somewhere nothing will ever drain it, so the
       // delivery guarantee yields to the shutdown guarantee.
       if(closing){void abandon(s);return null;}
-      sessions.set(s.id,s);return s;
+      sessions.set(s.id,s);mailboxes.set(s.id,mailbox);return s;
     },
     rollback(){if(this.settled)return;this.settled=true;inflight.delete(this);return abandon(s);},
   };
   inflight.add(record);
   let result;
-  const observation=(async()=>({...await s.observe(),owner:s.owner}))();
+  const observation=(async()=>({...await s.observe(),owner:s.owner,mailbox:mailbox.capability}))();
   // If the race below times out, the observation is still pending; swallow its
   // eventual rejection so it cannot surface as an unhandled one.
   observation.catch(()=>{});
@@ -143,7 +199,7 @@ export async function dispatch(method,p,deferred){
   // issue #27, so a client can feature-detect it instead of probing for an Unknown
   // method error. Additive: protocolVersion stays 1 because nothing existing
   // changed shape.
-  if(method==='initialize')return {protocolVersion:1,platform:process.platform,arch:process.arch,conptyDll:conptyDllDefault,stream:1,recording:1};
+  if(method==='initialize')return {protocolVersion:1,platform:process.platform,arch:process.arch,conptyDll:conptyDllDefault,stream:1,recording:1,mailbox:1};
   if(method==='terminal.create'){const created=await createSession(p);deferred.push(created);return created.result;}
   if(method==='terminal.list')return Promise.all([...sessions.values()].map(s=>s.observe()));
   const s=sessions.get(p.sessionId);if(!s)throw Error('Unknown session');
@@ -156,6 +212,10 @@ export async function dispatch(method,p,deferred){
     // the owner token and must not need one. It receives events with input filtered
     // out at the source, so there is no path from here to keystrokes either.
     case 'terminal.stream':return s.stream(p.afterSequence,p.timeoutMs);
+    // Messaging, not input: mailboxFor() checks a capability minted for messages alone, so
+    // neither case can reach s.input() and neither returns the owner token.
+    case 'terminal.post':return mailboxPost(mailboxFor(p),p.payload);
+    case 'terminal.mailbox':return mailboxWait(mailboxFor(p),p.afterSequence,p.timeoutMs);
     // Gated, unlike the stream: a recording can contain what was typed, which is
     // precisely what may hold a secret.
     case 'terminal.recording':if(p.owner!==s.owner)throw Error('Ownership required');return s.recordingPayload();

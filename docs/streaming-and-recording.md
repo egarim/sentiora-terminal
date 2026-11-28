@@ -250,3 +250,52 @@ rather than skipping either, because silently ignoring an event produces a plaus
   rather than a rewrite, but it is a separate change with its own UI consequences and is not bundled
   here.
 - **Disk persistence, redaction, and a playback tool.** Out of scope for the runtime.
+
+## Cross-session messages — `terminal.post` and `terminal.mailbox`
+
+Issue #34, transport slice only. A message is a sequenced entry in a bounded, host-relayed queue;
+it is **not** keystrokes in the target's PTY. That distinction is the whole design: writing into the
+target with `terminal.type` and scraping it with `observe` is not a protocol — a prompt, an echo and
+a progress bar are the same bytes, an ANSI repaint can erase the answer, interleaving with human
+input is undefined, and whatever is sent becomes part of scrollback and the recording.
+
+`initialize` advertises `"mailbox": 1`. `terminal.create` returns a `mailbox` capability beside the
+owner token. **They are different tokens on purpose:** the capability authorises messages only, and
+there is no path from either method below to `terminal.type`, so a session cannot type into another
+just because it can send it a message. MB-04 pins that a mailbox capability used as an owner is
+refused with `{"error":{"message":"Input ownership required"}}`.
+
+```jsonc
+// post: enqueue for a session
+{"jsonrpc":"2.0","id":8,"method":"terminal.post",
+ "params":{"sessionId":"…","capability":"…","payload":{"kind":"task","text":"run the suite"}}}
+{"jsonrpc":"2.0","id":8,"result":{"sequence":1,"dropped":0}}
+
+// mailbox: drain after a cursor; long-polls like terminal.wait
+{"jsonrpc":"2.0","id":9,"method":"terminal.mailbox",
+ "params":{"sessionId":"…","capability":"…","afterSequence":0,"timeoutMs":5000}}
+{"jsonrpc":"2.0","id":9,"result":{
+  "messages":[{"sequence":1,"payload":{"kind":"task","text":"run the suite"}}],
+  "nextSequence":1,"dropped":0}}
+```
+
+Guarantees, each held by a test in `test/mailbox.test.js`:
+
+| guarantee | test |
+| --- | --- |
+| messages arrive in sequence, with a cursor that returns only later ones | MB-01, MB-02 |
+| a wrong, missing or foreign capability is refused; `Unknown session` for a closed one | MB-03 |
+| a capability is not an input right | MB-04 |
+| an unencodable payload and one over the size limit are refused, not silently dropped | MB-05 |
+| overflow drops the **oldest** and reports the gap through `dropped` | MB-06 |
+| a waiting mailbox wakes when a message is posted | MB-07 |
+
+Limits, stated rather than discovered later: **64 KiB** per message (its JSON encoding), **256**
+queued per session with the oldest dropped past that, **100** posts per second per session, and a
+long poll capped at **30 s**. The poll timer is unref'd, so a pending mailbox can never be the reason
+the host cannot exit.
+
+Not delivered by this slice: parent/child or pair capabilities (#35), payload recording (deliberately
+off by default, and it follows the same opt-in rule as input recording if it is ever added), and
+server-push notifications — the poll matches the rest of the protocol, and a push variant still needs
+the framing decision in `docs/desktop/living-terminal.md` §9.
