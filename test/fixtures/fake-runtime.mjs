@@ -220,14 +220,24 @@ async function dispatch(method, params = {}) {
     // autoboot:false leaves the session in 'spawned', which is how the tests
     // assert that 'spawned' is not treated as readiness.
     if (!NO_AUTOBOOT && params.autoboot !== false) session.print('FAKE READY');
-    return { ...session.observe(), owner: session.owner, mailbox: session.mailbox };
+    // A parented create mints an edge capability, exactly as the real runtime does: the bridge needs
+    // it to post *as* the parent, which is what makes direction attributable (issue #35).
+    return {
+      ...session.observe(),
+      owner: session.owner,
+      mailbox: session.mailbox,
+      ...(parent ? { childMailbox: `edge-${n}` } : {}),
+    };
   }
   if (method === 'terminal.list') return [...sessions.values()].map(s => s.observe());
   if (method === 'terminal.post' || method === 'terminal.mailbox') {
     const target = sessions.get(params.sessionId);
     if (!target) throw Error('Unknown session');
-    // Same capability rule as the runtime: the mailbox token, never the owner token.
-    if (params.capability !== target.mailbox) throw Error('Mailbox capability required');
+    // Same capability rule as the runtime: the mailbox token, never the owner token. An edge
+    // capability is also accepted -- the bridge posts *as* a session through it so direction can be
+    // attributed (#35). The fake does not attribute: PE-15 covers that against the real runtime.
+    const capability = String(params.capability ?? '');
+    if (capability !== target.mailbox && !capability.startsWith('edge-')) throw Error('Mailbox capability required');
     return method === 'terminal.post'
       ? target.post(params.payload)
       : target.drain(params.afterSequence ?? 0);

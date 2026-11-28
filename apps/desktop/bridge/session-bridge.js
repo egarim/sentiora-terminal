@@ -49,7 +49,7 @@ function publicView(record, observation) {
 }
 
 class Record {
-  constructor({ sessionId, runtimeSessionId, hostId, owner, host, label, command, shell, parent = null, mailbox = null }) {
+  constructor({ sessionId, runtimeSessionId, hostId, owner, host, label, command, shell, parent = null, mailbox = null, edge = null }) {
     // The id the UI uses. The runtime's own id is only unique within one host
     // process, and the bridge pools several hosts, so it cannot be handed out
     // directly: two hosts would collide. The runtime id stays internal and is used
@@ -61,6 +61,7 @@ class Record {
     this.host = host;           // {id, client} from the pool
     this.parent = parent;       // bridge session id of the parent, or null: the viewer's tree
     this.mailbox = mailbox;     // capability for messages only; the owner token stays separate
+    this.edge = edge;           // this child's edge capability; shared with its parent, from the parent's end
     this.label = label;
     this.command = command;     // remembered locally; the runtime does not echo it
     this.shell = shell ?? null; // catalog entry, so the UI can gate Ctrl+C on its prompt
@@ -177,7 +178,7 @@ export class SessionBridge extends EventEmitter {
       sessionId: randomUUID(),
       runtimeSessionId: created.sessionId,
       hostId: host.id,
-      owner: created.owner, host, parent: parent?.sessionId ?? null, mailbox: created.mailbox ?? null,
+      owner: created.owner, host, parent: parent?.sessionId ?? null, mailbox: created.mailbox ?? null, edge: created.childMailbox ?? null,
       label: label ?? command, command: { command, args }, shell,
     });
     this.#records.set(record.sessionId, record);
@@ -601,12 +602,24 @@ export class SessionBridge extends EventEmitter {
    * Enqueues a message for a session (issue #34). Uses the mailbox capability, which authorises
    * messages only: neither this method nor `mailbox` below can reach terminal.type.
    */
-  async post(sessionId, payload) {
+  async post(sessionId, payload, { from = null } = {}) {
     const record = this.#get(sessionId);
-    if (!record.mailbox) throw new SentioraError('no-mailbox', 'this session has no mailbox capability');
+    // Posting *from* a session uses the pair's edge capability, which is what lets the runtime
+    // attribute a direction instead of seeing an anonymous host post. An edge exists only between a
+    // parent and its own child, so this cannot be turned into a broadcast or a sibling channel.
+    let capability = record.mailbox;
+    if (from !== null) {
+      const sender = this.#get(from);
+      const pair = record.parent === sender.sessionId ? record
+        : sender.parent === record.sessionId ? sender
+          : null;
+      if (!pair?.edge) throw new SentioraError('no-edge', `no edge between ${from} and ${sessionId}`);
+      capability = pair.edge;
+    }
+    if (!capability) throw new SentioraError('no-mailbox', 'this session has no mailbox capability');
     return record.host.client.call('terminal.post', {
       sessionId: record.runtimeSessionId,
-      capability: record.mailbox,
+      capability,
       payload,
     });
   }
@@ -615,12 +628,22 @@ export class SessionBridge extends EventEmitter {
   async mailbox(sessionId, { afterSequence = 0, timeoutMs = 1000 } = {}) {
     const record = this.#get(sessionId);
     if (!record.mailbox) throw new SentioraError('no-mailbox', 'this session has no mailbox capability');
-    return record.host.client.call('terminal.mailbox', {
+    const frame = await record.host.client.call('terminal.mailbox', {
       sessionId: record.runtimeSessionId,
       capability: record.mailbox,
       afterSequence,
       timeoutMs,
     }, { timeoutMs: timeoutMs + 30000 });
+    // The runtime attributes a sender by its own session id; the UI must never see one. Translate to
+    // bridge ids here, the same way every other id is namespaced, and leave null as null (the host).
+    const byRuntime = new Map([...this.#records.values()].map(r => [r.runtimeSessionId, r.sessionId]));
+    return {
+      ...frame,
+      messages: frame.messages.map(message => ({
+        ...message,
+        from: message.from ? (byRuntime.get(message.from) ?? null) : null,
+      })),
+    };
   }
   async close(sessionId) {
     const record = this.#records.get(sessionId);

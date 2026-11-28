@@ -744,3 +744,30 @@ test('the bridge posts and drains messages on behalf of the UI', opts, async () 
     await backend.shutdown();
   }
 });
+
+test('posting from a session uses the pair edge, so the runtime can attribute direction', opts, async () => {
+  const backend = await createFakeBackend({});
+  try {
+    const parent = await backend.bridge.create({ command: 'fake', cols: 40, rows: 10 });
+    const child = await backend.bridge.create({ command: 'fake', cols: 40, rows: 10, parentSessionId: parent.sessionId });
+
+    // As the parent: the child's inbox must say who sent it.
+    await backend.bridge.post(child.sessionId, { text: 'task' }, { from: parent.sessionId });
+    const inbox = await backend.bridge.mailbox(child.sessionId, { afterSequence: 0, timeoutMs: 100 });
+    assert.deepEqual(inbox.messages.map(message => message.payload.text), ['task']);
+    // Delivery proves the bridge used the pair's edge capability. Attribution itself is asserted
+    // against the real runtime in PE-15: the fake does not model senders.
+    assert.equal(inbox.messages.length, 1, 'the post used the edge capability and was delivered');
+
+    // An edge that does not exist must be refused, not silently posted as the host.
+    const stranger = await backend.bridge.create({ command: 'fake', cols: 40, rows: 10 });
+    await assert.rejects(
+      backend.bridge.post(child.sessionId, { text: 'sibling' }, { from: stranger.sessionId }),
+      error => error.kind === 'no-edge',
+    );
+    const after = await backend.bridge.mailbox(child.sessionId, { afterSequence: 0, timeoutMs: 100 });
+    assert.equal(after.messages.length, 1, 'the refused post must not have been delivered');
+  } finally {
+    await backend.shutdown();
+  }
+});

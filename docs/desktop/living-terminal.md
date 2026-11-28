@@ -292,6 +292,26 @@ then open `http://localhost:5173/#token=<token>`.
 
 ---
 
+### The exchange view, and who sent what
+
+A mailbox belongs to its **recipient**, so "what the parent said to the child" only exists in the
+child's inbox. Two additions make the exchange legible without inventing a timeline:
+
+- `terminal.post` now records **`from`** when the post used an *edge* capability. That is
+  attribution by construction rather than by trust: only the two ends of an edge hold it, so a post
+  into the child can only be the parent. A post made with a session's own mailbox capability is the
+  host speaking and stays `null` rather than being guessed at (`PE-15`).
+- `SessionBridge.post(sessionId, payload, { from })` resolves that pair's edge, and
+  `SessionBridge.mailbox` **translates the runtime's sender id back to a bridge id** — the UI must
+  never see a runtime id, for the same reason it never sees one anywhere else.
+
+The viewer then shows two lists, deliberately not merged: **Received** (this session's inbox, each
+entry labelled with its sender) and **Sent to children** (gathered from their inboxes and filtered by
+`from`). Sequence numbers belong to a mailbox, so a single merged timeline across two inboxes would
+be an invented order; two lists in their own orders is what can be stated truthfully.
+
+`E2E-10` covers it end to end against a **real runtime**: a parent sends a task, the child answers,
+both appear in the parent's view, and a third session with no edge is refused rather than delivered.
 ### The viewer is mounted
 
 The workspace now renders the session viewer beside the terminal: `aside.viewer` holds

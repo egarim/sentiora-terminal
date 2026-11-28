@@ -304,3 +304,30 @@ test('PE-14 closing a child leaves the parent listed as a root', opts, async t =
   assert.equal(listed[0].sessionId, parent.sessionId);
   assert.equal(listed[0].parent, null, 'the parent was a root before and is one after');
 });
+
+test('PE-15 a message is attributed to the end that sent it', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+  const child = await runtime.createWith({ parent: parent.sessionId });
+
+  // The host posts with the child's own mailbox capability: nobody else is speaking.
+  await runtime.call('terminal.post', { sessionId: child.sessionId, capability: child.mailbox, payload: 'from the host' });
+  // Through the edge, a post into the child can only be the parent.
+  await runtime.call('terminal.post', { sessionId: child.sessionId, capability: child.childMailbox, payload: 'from the parent' });
+  // And into the parent, only the child.
+  await runtime.call('terminal.post', { sessionId: parent.sessionId, capability: child.childMailbox, payload: 'from the child' });
+
+  const down = await runtime.call('terminal.mailbox', {
+    sessionId: child.sessionId, capability: child.childMailbox, afterSequence: 0, timeoutMs: 0,
+  });
+  assert.deepEqual(down.messages.map(message => message.payload), ['from the host', 'from the parent']);
+  assert.equal(down.messages[0].from, null, 'the host is not a session and has no id to attribute');
+  assert.equal(down.messages[1].from, parent.sessionId, 'a post through the edge comes from the parent');
+
+  const up = await runtime.call('terminal.mailbox', {
+    sessionId: parent.sessionId, capability: child.childMailbox, afterSequence: 0, timeoutMs: 0,
+  });
+  assert.deepEqual(up.messages.map(message => message.payload), ['from the child']);
+  assert.equal(up.messages[0].from, child.sessionId, 'and into the parent it comes from the child');
+});

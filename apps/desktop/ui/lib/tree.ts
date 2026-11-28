@@ -68,7 +68,14 @@ export function flattenSessionTree(tree: SessionTree): Array<{ entry: SessionEnt
   return flat;
 }
 
-export type MailboxMessage = { sequence: number; payload: unknown };
+export type MailboxMessage = {
+  sequence: number;
+  payload: unknown;
+  /** Sending session id, when the runtime could attribute it; null when the host posted. */
+  from?: string | null;
+  /** Set only on aggregated outbound views, where the recipient is known. */
+  to?: string | null;
+};
 
 export type MailboxLog = {
   messages: MailboxMessage[];

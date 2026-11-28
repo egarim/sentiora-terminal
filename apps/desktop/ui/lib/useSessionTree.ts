@@ -6,13 +6,17 @@
 // appendMailbox, which deduplicates if a poll overlaps.
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api';
-import { appendMailbox, emptyMailboxLog, type MailboxLog } from './tree';
+import { appendMailbox, emptyMailboxLog, type MailboxLog, type MailboxMessage } from './tree';
 import type { SessionDescriptor } from './types';
 
 export type SessionTreeState = {
   sessions: SessionDescriptor[];
   selectedId: string | null;
   log: MailboxLog;
+  /** Messages the selected session sent to its children, gathered from their inboxes. */
+  sent: MailboxMessage[];
+  /** session id -> label, so a `from` id is shown as something a person recognises. */
+  labels: Record<string, string>;
   error: string | null;
   select: (sessionId: string) => void;
 };
@@ -22,6 +26,11 @@ export function useSessionTree({ intervalMs = 1500, enabled = true } = {}): Sess
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [log, setLog] = useState<MailboxLog>(emptyMailboxLog);
   const [error, setError] = useState<string | null>(null);
+  // What the selected session sent to its children, gathered from their inboxes: the mailbox is
+  // per-recipient, so outbound messages only exist there. Filtered by "from", which the runtime
+  // attributes through the pair's edge capability.
+  const [sent, setSent] = useState<MailboxMessage[]>([]);
+  const [labels, setLabels] = useState<Record<string, string>>({});
   const selectedRef = useRef<string | null>(null);
   const cursor = useRef(0);
 
@@ -59,6 +68,18 @@ export function useSessionTree({ intervalMs = 1500, enabled = true } = {}): Sess
           setLog(emptyMailboxLog());
         }
         if (chosen) {
+          // Outbound: messages the selected session sent to each of its children. Reading the
+          // children's inboxes and filtering by sender is the only way to see this direction -- the
+          // mailbox belongs to the recipient.
+          const children = next.filter(entry => entry.parent === chosen).slice(0, 8);
+          const outbound: MailboxMessage[] = [];
+          for (const child of children) {
+            const frame = await api.mailbox(child.sessionId, 0, 0);
+            if (cancelled) return;
+            outbound.push(...frame.messages.filter(message => message.from === chosen));
+          }
+          setSent(outbound);
+          setLabels(Object.fromEntries(next.map(entry => [entry.sessionId, entry.label])));
           const frame = await api.mailbox(chosen, cursor.current, 0);
           if (cancelled) return;
           cursor.current = frame.nextSequence;
@@ -76,5 +97,5 @@ export function useSessionTree({ intervalMs = 1500, enabled = true } = {}): Sess
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
   }, [enabled, intervalMs]);
 
-  return { sessions, selectedId, log, error, select };
+  return { sessions, selectedId, log, sent, labels, error, select };
 }
