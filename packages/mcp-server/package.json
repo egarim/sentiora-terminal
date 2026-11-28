@@ -1,0 +1,13 @@
+{
+  "name": "@sentiora/mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP adapter over the Sentiora runtime (issue #4, M4 slice 3). A thin mapping onto the existing JSON-RPC, with no protocol of its own.",
+  "bin": {
+    "sentiora-mcp": "./index.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
