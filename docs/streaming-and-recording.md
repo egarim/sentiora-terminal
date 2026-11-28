@@ -340,6 +340,11 @@ Guarantees, each held by `test/parent-edge.test.js`:
 | a message to a closed edge answers `Edge closed`, not `Mailbox capability required` | PE-10 |
 | an edge reaches its own two ends and nothing else, including a grandchild | PE-11 |
 
+**The tree, for a viewer.** `terminal.list` returns each session's `parent` — the parent's session
+id, or `null` for a root — and a parented create names its parent in its own response. The link is
+cleared wherever the edge is retired: a child that outlives a closed parent reports `null`, because a
+viewer must not be told a link exists to a session it can no longer address (`PE-12`, `PE-13`,
+`PE-14`). No capability is included in the listing: the tree is shape, never authority.
 **Three answers that used to be one.** `Unknown session` means the target is not registered.
 `Edge closed` means the capability was real and its edge has since closed (PE-10) — a lifecycle
 event, not a bug. `Mailbox capability required` means anything else, including a capability that
