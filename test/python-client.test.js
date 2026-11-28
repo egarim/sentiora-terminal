@@ -29,6 +29,13 @@ async function findPython() {
 test('PY-01 the Python client drives a real session end to end', { timeout: 120000 }, async t => {
   const python = await findPython();
   if (!python) {
+    // A skipped gate must not be indistinguishable from a passed one. CI runners ship Python 3, so a
+    // missing interpreter there means the environment changed under us and this client is silently
+    // unverified — a failure, not a skip. A developer machine without Python still skips visibly,
+    // because there the absence is expected rather than a regression (issue #65).
+    if (process.env.CI) {
+      assert.fail('no Python 3 on a CI runner: the Python client would go unverified (see issue #65)');
+    }
     t.skip('no Python 3 on this machine');
     return;
   }

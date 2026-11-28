@@ -512,3 +512,32 @@ jobs:
           name: playwright-artifacts
           path: apps/desktop/test-results
           retention-days: 7
+
+  # The .NET client's contract check had no CI coverage at all (issue #65): the 17/17 in
+  # docs/release/readiness.md was a single local observation, and nothing stopped a protocol change
+  # from breaking the client the Creatura integration depends on. Windows and Linux because that
+  # client is the integration point, and both are the platforms people actually run it on.
+  contract-dotnet:
+    name: .NET contract check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # The check spawns src/server.js over a real subprocess and a real PTY, so the runtime's own
+      # dependencies have to be present -- the same reason the e2e job needs them.
+      - name: Install runtime dependencies
+        run: npm ci
+
+      - name: Contract check
+        run: dotnet run --project clients/dotnet/Sentiora.ContractCheck -- .

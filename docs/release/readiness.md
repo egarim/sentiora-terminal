@@ -6,14 +6,16 @@ things that are genuinely not done. Measured on `e0d2b6d` (2026-11-28), win32/ar
 
 ## What is verified
 
-| gate | command | result |
-| --- | --- | --- |
-| Node test suites | `npm test` | **263 passing, 0 failing**, 227 s — unit 64, native 23, server 80, fault 10, desktop 86 |
-| .NET contract | `dotnet run --project clients/dotnet/Sentiora.ContractCheck -- .` | **17/17 passed** |
-| Python client | `python clients/python/selfcheck.py .` | **12/12 passed** |
-| CI matrix | GitHub Actions | 5 OS families (incl. `windows-11-arm`), Node 22 and 24, a non-root arm64 container, desktop and desktop-ui jobs |
-| Stress | `node test/bench/lifecycle-stress.mjs 1 --assert` | 172 sessions, 0 breaches, shutdown 1096 ms |
-| Full-suite record | `docs/validation/runs/main-full-2026-11-28.md` | the same suites at `adefc01`, kept as a historical artifact |
+| gate | command | result | enforced by |
+| --- | --- | --- | --- |
+| Node test suites | `npm test` | **272 passing, 0 failing** — unit 64, native 24, server 80, fault 10, agent 6, desktop 88 | **CI** — `test` job, 5 OS families × Node 22/24 |
+| .NET contract | `dotnet run --project clients/dotnet/Sentiora.ContractCheck -- .` | **17/17 passed** | **CI** — `contract-dotnet` job (Ubuntu + Windows); the 17/17 figure itself was first observed locally on win32/arm64, .NET 10.0.400 |
+| Python client | `python clients/python/selfcheck.py .` | **12/12 passed** | **CI** — inside `test:server`; PY-01 fails on a CI runner without Python rather than skipping |
+| JS agent client | `npm run test:agent` | **6/6 passed** | **CI** — part of `npm test` since #65 |
+| Desktop UI | `npm run test:ui`, `test:e2e` | 8 structural + 7 browser tests | **CI** — `desktop-ui` and `desktop-e2e` jobs |
+| CI matrix | GitHub Actions | 5 OS families (incl. `windows-11-arm`), Node 22 and 24, a non-root arm64 container | CI itself |
+| Stress | `node test/bench/lifecycle-stress.mjs 1 --assert` | 172 sessions, 0 breaches, shutdown 1096 ms | **local only** — not run in CI |
+| Full-suite record | `docs/validation/runs/main-full-2026-11-28.md` | the same suites at `adefc01`, kept as a historical artifact | local only |
 
 The protocol surface is documented and tested: `protocolVersion: 1` with feature detection, 16-session
 cap, revision-guarded input, exclusive ownership and cooperative handover, streaming and recording,
@@ -73,7 +75,7 @@ orphan callout) is covered structurally.
 
 ```bash
 npm ci && npm --prefix apps/desktop ci
-npm test                                              # 263
+npm test                                              # 272 (includes the agent client)
 dotnet run --project clients/dotnet/Sentiora.ContractCheck -- .   # 17
 python clients/python/selfcheck.py .                  # 12
 node test/bench/lifecycle-stress.mjs 1 --assert       # stress gate
