@@ -292,6 +292,25 @@ then open `http://localhost:5173/#token=<token>`.
 
 ---
 
+### The viewer is mounted
+
+The workspace now renders the session viewer beside the terminal: `aside.viewer` holds
+`SessionTree`, fed by `useSessionTree`, which polls `GET /api/sessions` and the selected session's
+mailbox on **one timer** so a node cannot appear in the list with a log from the previous selection.
+Selecting a row switches the log and resets its cursor — a mailbox cursor belongs to one session and
+carrying it across would silently drop the first messages of the next.
+
+Two things the mounting forced out:
+
+- **The hook must be called above `App`'s early returns.** Placing it where the workspace renders
+  meant the hook count changed between the gate/onboarding renders and the final one, and React
+  threw as soon as the app reached the workspace — which failed *every* browser test, not just the
+  viewer's.
+- **The tree is read-only.** Input still goes to the focused pane; the viewer renders state and
+  relays messages, and never holds a capability (`docs/security/trust-boundaries.md`).
+
+`E2E-08` covers the tree, selection and a message arriving from the bridge into the log; `E2E-09`
+covers a parent with two children, asserting the parent is drawn first and both children at depth 1.
 ### The tree and messages over HTTP
 
 The viewer's two data needs are served by the loopback API, and the capability never crosses into

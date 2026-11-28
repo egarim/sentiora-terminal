@@ -69,6 +69,17 @@ export const api = {
    */
   createSession: (body: { shellId?: string; customPath?: string; cols?: number; rows?: number; label?: string }) =>
     request<{ session: SessionDescriptor }>('/sessions', { method: 'POST', body: JSON.stringify(body) }).then(r => r.session),
+  /** Enqueues a message through the bridge; the UI never holds the mailbox capability itself. */
+  postMessage: (sessionId: string, payload: unknown) =>
+    request<{ posted: { sequence: number; dropped: number } }>(
+      `/sessions/${encodeURIComponent(sessionId)}/messages`,
+      { method: 'POST', body: JSON.stringify({ payload }) },
+    ).then(r => r.posted),
+  /** Drains messages after a cursor. `timeoutMs: 0` returns immediately, for a polling loop. */
+  mailbox: (sessionId: string, afterSequence = 0, timeoutMs = 0) =>
+    request<{ messages: Array<{ sequence: number; payload: unknown }>; nextSequence: number; dropped: number }>(
+      `/sessions/${encodeURIComponent(sessionId)}/messages?after=${afterSequence}&timeoutMs=${timeoutMs}`,
+    ),
   closeSession: (sessionId: string) =>
     request<{ closed: boolean }>(`/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
   observe: (sessionId: string) =>
