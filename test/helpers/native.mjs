@@ -9,6 +9,13 @@ import { Session } from '../../src/session.js';
 const execFileAsync = promisify(execFile);
 const { Terminal } = xterm;
 
+// Portable existence probe: delivers no signal, throws ESRCH once the process is gone, EPERM when
+// it exists but is not ours.
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+}
+
 export const FIXTURE = fileURLToPath(new URL('../fixtures/interactive.mjs', import.meta.url));
 export const SIGINT_FIXTURE = fileURLToPath(new URL('../fixtures/sigint.mjs', import.meta.url));
 
@@ -50,11 +57,21 @@ export const COLD_START_MS = 120000;
 // an external process to start must pass COLD_START_MS explicitly, because the
 // default is a statement about our code and external startup time is not ours.
 export async function until(session, predicate, { timeout = 15000, label = 'condition' } = {}) {
-  const deadline = Date.now() + timeout;
+  const started = Date.now();
+  const deadline = started + timeout;
   let snapshot = await session.observe();
   while (!predicate(snapshot)) {
     if (Date.now() > deadline) {
-      throw new Error(`timed out after ${timeout}ms waiting for ${label}; last observation:\n${snapshot.screen}`);
+      // A blank screen is the symptom WIN-10 reports, and on its own it cannot be classified:
+      // "the child never wrote anything", "the child died first" and "the emulator lost the
+      // bytes" all render as an empty screen. Say which one this is, so the next failure is a
+      // diagnosis instead of a 15 s timeout with nothing attached.
+      const childAlive = alive(snapshot.pid);
+      throw new Error(
+        `timed out after ${timeout}ms (${Date.now() - started}ms elapsed) waiting for ${label}; ` +
+        `state=${snapshot.state} pid=${snapshot.pid} childAlive=${childAlive} revision=${snapshot.revision} ` +
+        `writeErrors=${snapshot.writeErrors} exit=${snapshot.exit ? JSON.stringify(snapshot.exit) : 'none'} ` +
+        `idleMs=${snapshot.idleMilliseconds}\nlast observation:\n${snapshot.screen}`);
     }
     snapshot = await session.wait(snapshot.revision, Math.min(250, deadline - Date.now()));
   }
