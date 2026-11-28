@@ -53,7 +53,7 @@ async function abandon(session){
   mailboxes.delete(session.id);
   // An edge dies with either end: a capability left behind would let the surviving end post
   // into a mailbox that will never be drained again.
-  for(const [capability,edge] of edges)if(edge.parent===session.id||edge.child===session.id)edges.delete(capability);
+  for(const [capability,edge] of edges)if(edge.parent===session.id||edge.child===session.id){edges.delete(capability);retireEdge(capability,edge);}
   if(session.closeError)process.stderr.write(`sentiora: cleanup failed for session ${session.id}: ${String(session.closeError).replace(/[\r\n]+/g,' ')}\n`);
   sessions.delete(session.id);
 }
@@ -93,6 +93,17 @@ const mailboxes=new Map();
 // nowhere else -- which is what makes "no sibling-to-sibling, no broadcast" structural
 // rather than a policy someone could forget: a sibling never holds the edge's capability.
 const edges=new Map();
+// Edges that have been closed, kept briefly so the answer can say so. A caller whose message
+// bounces off a dead edge needs to tell a lifecycle event from a bad token -- "Mailbox capability
+// required" for both would send them debugging the wrong thing. Bounded: this is a diagnostic
+// memory, not a registry, so the oldest entries fall out and are then indistinguishable again
+// (which is correct: the edge is long gone).
+const retiredEdges=new Map();
+const RETIRED_EDGES_MAX=512;
+function retireEdge(capability,edge){
+  retiredEdges.set(capability,edge);
+  while(retiredEdges.size>RETIRED_EDGES_MAX){retiredEdges.delete(retiredEdges.keys().next().value);}
+}
 // Children asked to die with their parent (issue #35): parent id -> child ids. Absent means the
 // default, which is to detach -- a cascade has to be asked for, because killing processes a
 // caller did not name is the more surprising behaviour.
@@ -109,7 +120,13 @@ function acceptsCapability(sessionId,capability){
 function mailboxFor(p){
   const mailbox=mailboxes.get(p?.sessionId);
   if(!mailbox)throw Error('Unknown session');
-  if(!acceptsCapability(p.sessionId,p.capability))throw Error('Mailbox capability required');
+  if(!acceptsCapability(p.sessionId,p.capability)){
+    // A capability that was real until its edge closed is a different answer from one that never
+    // was: the first is a lifecycle event, the second is a bug in the caller.
+    const retired=retiredEdges.get(p.capability);
+    if(retired&&(retired.parent===p.sessionId||retired.child===p.sessionId))throw Error('Edge closed');
+    throw Error('Mailbox capability required');
+  }
   return mailbox;
 }
 function mailboxDrain(mailbox,after){

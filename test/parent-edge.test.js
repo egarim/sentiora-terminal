@@ -147,7 +147,7 @@ test('PE-06 closing either end drops the edge and its capability', opts, async t
 
   // The edge is gone with the child, so the capability no longer answers for the parent.
   const afterClose = await runtime.request('terminal.post', { sessionId: parent.sessionId, capability, payload: 'late' });
-  assert.match(afterClose.error.message, /Mailbox capability required/);
+  assert.match(afterClose.error.message, /Edge closed/);
 
   // The parent's own capability is unaffected.
   const own = await runtime.call('terminal.post', { sessionId: parent.sessionId, capability: parent.mailbox, payload: 'still here' });
@@ -215,4 +215,44 @@ test('PE-09 closeChildren is validated rather than guessed', opts, async t => {
   assert.match(withoutParent.error.message, /closeChildren requires a parent/);
 
   assert.equal((await runtime.call('terminal.list', {})).length, 1, 'neither refusal may leave a session behind');
+});
+
+test('PE-10 a message to a closed edge says so instead of blaming the token', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+  const child = await runtime.createWith({ parent: parent.sessionId });
+  const capability = child.childMailbox;
+
+  await runtime.call('terminal.close', { sessionId: child.sessionId, owner: child.owner });
+
+  // The parent is still open, so this is not "Unknown session", and the capability was real until
+  // a moment ago, so it is not "Mailbox capability required" either. A caller can tell a
+  // lifecycle event from a bug in its own bookkeeping.
+  const closed = await runtime.request('terminal.post', { sessionId: parent.sessionId, capability, payload: 'late' });
+  assert.match(closed.error.message, /Edge closed/);
+
+  const never = await runtime.request('terminal.post', { sessionId: parent.sessionId, capability: 'never-was-a-capability', payload: 'x' });
+  assert.match(never.error.message, /Mailbox capability required/);
+});
+
+test('PE-11 an edge reaches its own two ends and nothing else', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+  const child = await runtime.createWith({ parent: parent.sessionId });
+  const grandchild = await runtime.createWith({ parent: child.sessionId });
+
+  // The parent holds the edge to its child; that capability must not reach the grandchild.
+  const up = await runtime.request('terminal.post', { sessionId: grandchild.sessionId, capability: child.childMailbox, payload: 'x' });
+  assert.match(up.error.message, /Mailbox capability required/);
+
+  // The child holds the edge to the grandchild; that capability must not reach the parent.
+  const down = await runtime.request('terminal.post', { sessionId: parent.sessionId, capability: grandchild.childMailbox, payload: 'x' });
+  assert.match(down.error.message, /Mailbox capability required/);
+
+  // Each edge still works at its own ends.
+  await runtime.call('terminal.post', { sessionId: child.sessionId, capability: child.childMailbox, payload: 'to child' });
+  const drained = await runtime.call('terminal.mailbox', { sessionId: child.sessionId, capability: child.childMailbox, afterSequence: 0 });
+  assert.deepEqual(drained.messages.map(m => m.payload), ['to child']);
 });
