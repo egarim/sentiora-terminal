@@ -26,6 +26,7 @@ Two implementations exist, both dependency-free, and both speak the same
 | `terminal.stream` | the child's raw bytes with sequence numbers | first attach returns a **snapshot**, not bytes; falling behind returns `resync` |
 | `terminal.close` | tear down and free the slot | once the create response is delivered, close must succeed or the slot leaks |
 | `terminal.list` | observations of all sessions | never returns owner tokens |
+| `$/cancelRequest` | abandon an in-flight request by id (LSP shape) | a **notification**, so it is never answered; the request it names answers with `-32800`, and the underlying wait is not interrupted — only its result is discarded |
 | `terminal.handover` | the current owner gives input rights away; a new owner token is returned | the old token is refused everywhere at once, and this is **cooperative**: a caller that does not hold the token cannot seize the session. Both clients return a **new handle**; the handle you passed in keeps a dead token, which is the contract, not an oversight |
 | `terminal.post` | enqueue a message for a session | uses the **mailbox capability**, never the owner token: it can message, it can never type |
 | `terminal.mailbox` | drain messages after a cursor, long-polling | the client's request timeout is the poll timeout **plus** its own, so a legitimate long poll is not reported as a dead host |

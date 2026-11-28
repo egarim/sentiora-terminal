@@ -339,12 +339,43 @@ export function respond(payload){
 }
 // One JSON-RPC request. respond is injectable so the delivery-failure path can be
 // provoked directly instead of being inferred from a broken pipe.
+// Request cancellation (issue #2). A client can abandon a request that is *waiting* — a long poll,
+// a blocking wait — with the `$/cancelRequest` notification, the same shape LSP uses. The underlying
+// wait is not interrupted (it is a session timer or promise), but its result is discarded and the
+// caller gets a definite answer instead of waiting out a timeout.
+//
+// -32800 is LSP's "Request cancelled"; keeping the number means a client that already understands
+// LSP cancellation understands this one.
+const CANCELLED=-32800;
+const pendingRequests=new Map(); // id -> cancel()
+/** Cancels an in-flight request, answering false when the id is not pending (a no-op, not an error). */
+export function cancelRequest(id){
+  const cancel=pendingRequests.get(id);
+  if(!cancel)return false;
+  cancel();
+  return true;
+}
 export async function handleRequest(line,respond_=respond){
   let req;const deferred=[];
   try{
     req=JSON.parse(line);
+    // A notification has no id and is never answered. Cancellation is the one this runtime
+    // understands; anything else is ignored rather than answered, which would corrupt ids.
+    if(req?.method==='$/cancelRequest'){cancelRequest(req.params?.id);return;}
     if(req.jsonrpc!=='2.0'||typeof req.method!=='string'||!Object.hasOwn(req,'id'))throw Error('Invalid request');
-    const result=await dispatch(req.method,req.params??{},deferred);
+    let cancel;
+    const cancelled=new Promise((_,reject)=>{cancel=()=>reject(Object.assign(new Error('Request cancelled'),{code:CANCELLED}));});
+    pendingRequests.set(req.id,cancel);
+    let result;
+    try{
+      const work=dispatch(req.method,req.params??{},deferred);
+      // A cancelled request's dispatch may still settle later; without this its rejection would be
+      // unhandled and take the host down with every session in it.
+      work.catch(()=>{});
+      result=await Promise.race([work,cancelled]);
+    }finally{
+      pendingRequests.delete(req.id);
+    }
     // The confirmed response is the acknowledgement. A create that could not be
     // acknowledged must not become visible in the registry.
     if(!await respond_({jsonrpc:'2.0',id:req.id,result})){await abandonAll(deferred);return;}
@@ -352,7 +383,9 @@ export async function handleRequest(line,respond_=respond){
   }catch(e){
     // Answer before tearing down: a rollback that stalls must not swallow the
     // client's error response.
-    try{await respond_({jsonrpc:'2.0',id:req?.id??null,error:{code:-32000,message:e.message}});}catch{}
+    const code=e?.code===CANCELLED?CANCELLED:-32000;
+    try{await respond_({jsonrpc:'2.0',id:req?.id??null,error:{code,message:e?.message??String(e)}});}catch{}
+    // A cancelled create must not leave a session nobody was told about.
     await abandonAll(deferred);
   }
 }
