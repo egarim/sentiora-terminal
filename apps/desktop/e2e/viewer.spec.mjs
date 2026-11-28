@@ -118,3 +118,33 @@ test('E2E-10 the viewer shows both directions of an exchange, and refuses a stra
     await app.stop();
   }
 });
+
+test('E2E-12 the message log survives a reload, replayed from the mailbox', async ({ page }) => {
+  const app = await startApp({ settingsPatch: ONBOARDED });
+  const auth = { authorization: `Bearer ${app.token}` };
+  try {
+    const session = await app.backend.bridge.create({ command: 'fake', cols: 60, rows: 16 });
+    await page.goto(app.launchUrl);
+    await expect(page.getByTestId('session-row')).toHaveCount(1, { timeout: 20000 });
+
+    for (const text of ['one', 'two', 'three']) {
+      const posted = await page.request.post(`${app.url}/api/sessions/${session.sessionId}/messages`, {
+        headers: auth, data: { payload: { text } },
+      });
+      expect(posted.ok()).toBe(true);
+    }
+    await expect(page.getByTestId('log-message')).toHaveCount(3, { timeout: 20000 });
+
+    // Reopening the app, not page.reload(): bootstrapFromLocation strips the token from the URL with
+    // history.replaceState, so a bare reload lands on the no-token gate on purpose. Re-entering with
+    // the launch URL is what a user does, and it loses every in-memory cursor -- so the log has to
+    // come back from the mailbox, not from whatever the page happened to keep.
+    await page.goto(app.launchUrl);
+    await expect(page.getByTestId('log-message')).toHaveCount(3, { timeout: 20000 });
+    await expect(page.getByTestId('log-message').last()).toContainText('three');
+    // Nothing was lost, so nothing may claim a gap.
+    await expect(page.getByTestId('log-gap')).toHaveCount(0);
+  } finally {
+    await app.stop();
+  }
+});
