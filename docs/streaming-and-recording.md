@@ -339,6 +339,15 @@ Guarantees, each held by `test/parent-edge.test.js`:
 | closing either end drops the edge and its capability | PE-06 |
 
 **Lifecycle, chosen explicitly:** closing either end drops the edge. Closing a parent **detaches**
-its children rather than killing them — a cascade has to be asked for, not implied, because killing
-processes a caller did not name is the more surprising default. A `closeChildren` option is the
-natural next slice; until then the rule is stated here rather than assumed.
+its children by default, because killing processes a caller did not name is the more surprising
+behaviour -- the cascade has to be asked for:
+
+```jsonc
+{"method":"terminal.create","params":{"command":"…","parent":"<id>","closeChildren":true}}
+```
+
+With `closeChildren: true` the child dies with its parent (PE-07); without it the child outlives the
+parent (PE-08). `closeChildren` is validated, not guessed: a non-boolean is `Invalid closeChildren`,
+and a value with no `parent` is `closeChildren requires a parent`, so a typo cannot silently mean
+"detach". The cascade recurses through each child's own edges, so a grandchild that asked to die
+with its parent does.
