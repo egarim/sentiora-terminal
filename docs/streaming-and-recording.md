@@ -299,3 +299,46 @@ Not delivered by this slice: parent/child or pair capabilities (#35), payload re
 off by default, and it follows the same opt-in rule as input recording if it is ever added), and
 server-push notifications — the poll matches the rest of the protocol, and a push variant still needs
 the framing decision in `docs/desktop/living-terminal.md` §9.
+
+## Parent and child edges — `terminal.create { parent }`
+
+Issue #35, the edge slice. A parented create mints **one capability for the edge**, and that
+capability is accepted at either end and nowhere else. This is the structural form of the policy
+the issue asks for: "no sibling-to-sibling, no broadcast" is not a check anyone can forget, because
+a sibling never holds the capability to begin with. PE-04 pins it.
+
+```jsonc
+// parent creates a child
+{"jsonrpc":"2.0","id":10,"method":"terminal.create",
+ "params":{"command":"…","parent":"<parent session id>"}}
+{"jsonrpc":"2.0","id":10,"result":{
+  "sessionId":"…","owner":"…","mailbox":"…",         // the child's own mailbox capability
+  "childMailbox":"…"}}                              // the edge capability, for the parent
+```
+
+The child receives the edge through its **env allowlist**, never through an inherited owner token:
+
+| variable | value |
+| --- | --- |
+| `SENTIORA_MAILBOX_CAPABILITY` | the edge capability |
+| `SENTIORA_PARENT_SESSION` | the parent's session id |
+
+Both ends then use the same capability with `terminal.post` / `terminal.mailbox`: the parent targets
+the child's session, the child targets the parent's. Neither direction carries input rights — the
+capability is still refused for `terminal.type` and `terminal.close`.
+
+Guarantees, each held by `test/parent-edge.test.js`:
+
+| guarantee | test |
+| --- | --- |
+| the child is created with the edge capability and its parent's id in its env | PE-01 |
+| the parent can post to the child through the edge | PE-02 |
+| the child can answer its parent through the same edge | PE-03 |
+| the capability cannot open a session that is not one of its ends | PE-04 |
+| an unknown or malformed `parent` is refused before anything spawns | PE-05 |
+| closing either end drops the edge and its capability | PE-06 |
+
+**Lifecycle, chosen explicitly:** closing either end drops the edge. Closing a parent **detaches**
+its children rather than killing them — a cascade has to be asked for, not implied, because killing
+processes a caller did not name is the more surprising default. A `closeChildren` option is the
+natural next slice; until then the rule is stated here rather than assumed.
