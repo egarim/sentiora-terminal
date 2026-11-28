@@ -11,3 +11,8 @@ artifacts/
 # reproducible from source with `npm --prefix apps/desktop run build`.
 dist/
 *.tsbuildinfo
+
+# Python bytecode: the client ships source, and a .pyc is a build artifact of the machine that
+# happened to run it (issue #4).
+__pycache__/
+*.pyc
