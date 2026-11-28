@@ -134,6 +134,13 @@ if (OperatingSystem.IsWindows() && Environment.GetEnvironmentVariable("SENTIORA_
 var disposeClock = Stopwatch.StartNew();
 await client.DisposeAsync();
 Console.WriteLine($"host shutdown: {disposeClock.ElapsedMilliseconds}ms forced={client.ForcedShutdown} (stderr {client.Stderr.Length} bytes)");
+// The measurement above used to be printed and never judged, so this check reported PASSED while
+// the host had to be SIGKILLed. A host that needs forcing is a host that cannot exit, which is the
+// whole contract: it must go when its stdin closes.
+if (client.ForcedShutdown)
+    Fail("the host shuts down on its own", new Exception($"the host had to be killed after {disposeClock.ElapsedMilliseconds}ms"));
+else
+    Pass("the host shuts down on its own");
 Console.WriteLine(failures == 0
     ? $"CONTRACT CHECK PASSED in {clock.ElapsedMilliseconds}ms"
     : $"CONTRACT CHECK FAILED: {failures} check(s)");

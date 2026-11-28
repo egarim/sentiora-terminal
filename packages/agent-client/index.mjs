@@ -24,7 +24,10 @@ export class AgentSession {
   constructor(client, observation) {
     this.client = client;
     this.sessionId = observation.sessionId;
-    this.owner = observation.owner;
+    // Not an enumerable field: the owner token is the capability that authorises writes, so it
+    // must not travel into JSON.stringify(session) or any log built from the handle. It stays
+    // reachable as `session.owner` for the methods that need it.
+    Object.defineProperty(this, 'owner', { value: observation.owner, enumerable: false });
     this.pid = observation.pid ?? null;
     this.cols = observation.cols;
     this.rows = observation.rows;
