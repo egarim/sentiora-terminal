@@ -54,13 +54,38 @@ export function startRegistry() {
   });
 
   let nextId = 1;
+  // A request that times out used to report only how long it waited, which cannot tell
+  // apart the two causes that matter: an operation whose promise never settles (a JS-level
+  // stall) and a harness whose event loop is blocked (a synchronous or native call that
+  // never returns). They need different fixes, so the failure should say which one it was.
+  // The line handler dispatches each op independently, so a cheap op after the timeout is a
+  // fair liveness probe.
+  async function diagnoseStall(op, id) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return `the harness process had exited (code ${child.exitCode}, signal ${child.signalCode})`;
+    }
+    const probeId = `probe-for-${id}`;
+    const answered = await new Promise(resolve => {
+      const timer = setTimeout(() => { replies.delete(probeId); resolve(null); }, 3000);
+      replies.set(probeId, message => { clearTimeout(timer); resolve(message); });
+      child.stdin.write(`${JSON.stringify({ op: 'state', id: probeId })}\n`);
+    });
+    if (!answered) {
+      return 'the harness stopped answering even a trivial op, so its event loop is blocked ' +
+        '(a synchronous or native call is not returning) -- not the host being busy';
+    }
+    return `the harness still answers (${answered.error ? 'with an error' : 'with state'}), so ` +
+      `'${op}' is stuck in its own promise while the loop keeps running`;
+  }
+
   function send(op, args, { timeout = 60000 } = {}) {
     const id = nextId++;
     child.stdin.write(`${JSON.stringify({ op, id, ...args })}\n`);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         replies.delete(id);
-        reject(new Error(`harness op ${op} (id ${id}) did not answer within ${timeout}ms; stderr:\n${stderr}`));
+        void diagnoseStall(op, id).then(verdict => reject(
+          new Error(`harness op ${op} (id ${id}) did not answer within ${timeout}ms; ${verdict}; stderr:\n${stderr}`)));
       }, timeout);
       replies.set(id, message => { clearTimeout(timer); resolve(message); });
     });
