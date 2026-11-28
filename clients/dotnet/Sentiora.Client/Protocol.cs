@@ -1,4 +1,6 @@
 
+using System.Text.Json;
+
 namespace Sentiora.Client;
 
 /// <summary>One JSON-RPC error returned by the runtime, with the method that produced it.</summary>
@@ -47,6 +49,10 @@ public sealed record Observation
 {
     public string SessionId { get; init; } = "";
     public string? Owner { get; init; }
+    /// <summary>The capability for messages only; never the owner token.</summary>
+    public string? Mailbox { get; init; }
+    /// <summary>Present on a parented create: the capability for the parent/child edge.</summary>
+    public string? ChildMailbox { get; init; }
     public int? Pid { get; init; }
     public string State { get; init; } = "";
     public long Revision { get; init; }
@@ -102,6 +108,10 @@ public sealed record CreateSessionRequest
     public bool? ConptyDll { get; init; }
     public bool? RecordInput { get; init; }
     public long? RecordBytes { get; init; }
+    /// <summary>Parent session id: mints a parent/child edge (issue #35).</summary>
+    public string? Parent { get; init; }
+    /// <summary>With <see cref="Parent"/>: true makes the child die with its parent; absent detaches.</summary>
+    public bool? CloseChildren { get; init; }
 }
 
 /// <summary>A live session. Owner is the capability for type/resize/close; never log it.</summary>
@@ -112,5 +122,28 @@ public sealed record SessionHandle
     public int? Pid { get; init; }
     public int Cols { get; init; }
     public int Rows { get; init; }
+    /// <summary>The capability for messages only: it can post, and it can never type.</summary>
+    public string? Mailbox { get; init; }
+    /// <summary>Present on a parented create: the capability for the parent/child edge.</summary>
+    public string? ChildMailbox { get; init; }
+}
+
+public sealed record MailboxPostResult
+{
+    public long Sequence { get; init; }
+    public long Dropped { get; init; }
+}
+
+public sealed record MailboxMessage
+{
+    public long Sequence { get; init; }
+    public JsonElement Payload { get; init; }
+}
+
+public sealed record MailboxFrame
+{
+    public IReadOnlyList<MailboxMessage> Messages { get; init; } = Array.Empty<MailboxMessage>();
+    public long NextSequence { get; init; }
+    public long Dropped { get; init; }
 }
 

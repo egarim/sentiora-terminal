@@ -78,3 +78,45 @@ test('AGENT-03 a child exit is visible through the stream', opts, async t => {
   const code = frame.exit?.exitCode ?? frame.exit;
   assert.equal(code, 7, `expected exit code 7, got ${JSON.stringify(frame.exit)}`);
 });
+
+test('AGENT-04 the mailbox capability carries messages and not input rights', opts, async t => {
+  const client = await AgentClient.connect();
+  t.after(async () => { await client.dispose(); });
+
+  const session = await client.create({ command: process.execPath, args: [FIXTURE], cols: 60, rows: 16 });
+  assert.equal(typeof session.mailbox, 'string', 'create must return a mailbox capability');
+  assert.notEqual(session.mailbox, session.owner, 'the mailbox capability must not be the owner token');
+  // The owner token must still not be enumerable, now that the handle carries a second capability.
+  assert.ok(!JSON.stringify(session).includes(session.owner), 'the owner token must not be enumerable');
+
+  const first = await session.post({ kind: 'task', text: 'run it' });
+  const second = await session.post({ kind: 'task', text: 'and again' });
+  assert.deepEqual([first.sequence, second.sequence], [1, 2]);
+
+  const drained = await session.readMailbox({ afterSequence: 0 });
+  assert.deepEqual(drained.messages.map(message => message.payload.text), ['run it', 'and again']);
+  assert.equal(drained.nextSequence, 2);
+
+  // The cursor means what it says: nothing new after the last sequence.
+  const after = await session.readMailbox({ afterSequence: 2, timeoutMs: 200 });
+  assert.deepEqual(after.messages, []);
+
+  assert.equal(await client.close(session), true);
+});
+
+test('AGENT-05 a parented create hands the child an edge capability', opts, async t => {
+  const client = await AgentClient.connect();
+  t.after(async () => { await client.dispose(); });
+
+  const parent = await client.create({ command: process.execPath, args: [FIXTURE], cols: 60, rows: 16 });
+  const child = await client.create({ command: process.execPath, args: [FIXTURE], cols: 60, rows: 16, parent: parent.sessionId });
+  assert.equal(typeof child.childMailbox, 'string', 'a parented create must return the edge capability');
+
+  // The parent posts through the client; the same capability is what the child reads in its env.
+  await client.post(child, { kind: 'task', text: 'from the parent' });
+  const drained = await client.mailbox(child, { afterSequence: 0 });
+  assert.deepEqual(drained.messages.map(message => message.payload.text), ['from the parent']);
+
+  await client.close(child);
+  await client.close(parent);
+});

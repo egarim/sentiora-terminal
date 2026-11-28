@@ -28,6 +28,12 @@ export class AgentSession {
     // must not travel into JSON.stringify(session) or any log built from the handle. It stays
     // reachable as `session.owner` for the methods that need it.
     Object.defineProperty(this, 'owner', { value: observation.owner, enumerable: false });
+    // The mailbox capability is a different capability from the owner token: it authorises
+    // messages only, so it is safe to keep enumerable and to pass around.
+    this.mailbox = observation.mailbox;
+    // Present only on a session created with `parent`: the capability for the parent/child edge,
+    // which both ends use to post to each other.
+    if (observation.childMailbox) this.childMailbox = observation.childMailbox;
     this.pid = observation.pid ?? null;
     this.cols = observation.cols;
     this.rows = observation.rows;
@@ -37,6 +43,10 @@ export class AgentSession {
   sendText(text) { return this.client.sendText(this, text); }
   sendLine(line) { return this.client.sendLine(this, line); }
   read(options) { return this.client.read(this, options); }
+  post(payload) { return this.client.post(this, payload); }
+  // Named readMailbox, not mailbox: `mailbox` on the handle is the capability string, and a
+  // method of the same name would shadow it.
+  readMailbox(options) { return this.client.mailbox(this, options); }
   close() { return this.client.close(this); }
 }
 
@@ -133,12 +143,14 @@ export class AgentClient {
     return this.info;
   }
 
-  async create({ command, args = [], cols = 120, rows = 40, cwd, env, conptyDll, recordInput, recordBytes } = {}) {
+  async create({ command, args = [], cols = 120, rows = 40, cwd, env, conptyDll, recordInput, recordBytes, parent, closeChildren } = {}) {
     const observation = await this.request('terminal.create', {
       command, args, cols, rows, ...(cwd ? { cwd } : {}), ...(env ? { env } : {}),
       ...(conptyDll !== undefined ? { conptyDll } : {}),
       ...(recordInput !== undefined ? { recordInput } : {}),
       ...(recordBytes !== undefined ? { recordBytes } : {}),
+      ...(parent ? { parent } : {}),
+      ...(closeChildren !== undefined ? { closeChildren } : {}),
     });
     return new AgentSession(this, observation);
   }
@@ -231,6 +243,26 @@ export class AgentClient {
         throw new Error(`text ${JSON.stringify(needle)} not seen within ${timeoutMs}ms; last text:\n${text}`);
       }
     }
+  }
+
+  /**
+   * Enqueues a message for a session (issue #34). Uses the mailbox capability, never the owner
+   * token: a caller that can message a session still cannot type into it.
+   */
+  post(session, payload) {
+    return this.request('terminal.post', { sessionId: session.sessionId, capability: session.mailbox, payload });
+  }
+
+  /**
+   * Drains messages after a cursor, long-polling like wait(). The request timeout is the poll
+   * timeout plus the client's own, so a legitimate long poll is not reported as a dead host.
+   */
+  async mailbox(session, { afterSequence = 0, timeoutMs = 1000 } = {}) {
+    return this.request(
+      'terminal.mailbox',
+      { sessionId: session.sessionId, capability: session.mailbox, afterSequence, timeoutMs },
+      { timeoutMs: timeoutMs + this.requestTimeoutMs },
+    );
   }
 
   async close(session) {
