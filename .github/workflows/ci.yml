@@ -456,6 +456,12 @@ jobs:
         working-directory: apps/desktop
         run: npm run typecheck
 
+      # Structural tests for the viewer component (issue #35). They import React out of
+      # apps/desktop/node_modules, which only this job installs -- the main test job does not,
+      # so test:ui stays out of `npm test` by design.
+      - name: UI structural tests
+        run: npm run test:ui
+
       - name: Build
         working-directory: apps/desktop
         run: npx vite build
