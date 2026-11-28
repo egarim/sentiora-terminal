@@ -44,18 +44,17 @@ async function abandonAll(deferred){for(const d of deferred??[])await d.rollback
 // still holding a slot. Only teardown could reclaim it. Bounded for the same
 // reason close() is -- a failure must not permanently consume capacity.
 const CREATE_OBSERVE_GRACE_MS=10000;
-// CreateProcess resolves an image by extension -- .exe, .com, .bat, .cmd -- and never by
-// file association. A path whose file exists but carries another extension is therefore a
-// spawn that must fail, and on Windows a failed spawn leaks the ConPTY worker. Only the
-// absolute case is judged: a bare command is resolved from PATH by CreateProcess itself,
-// which is the normal way to launch a shell, and statSync cannot judge it.
-const WIN32_IMAGE_EXTENSIONS=new Set(['.exe','.com','.bat','.cmd']);
+// What CreateProcess can run is CreateProcess's decision, not this runtime's. An absolute
+// path is allowed through when it names an existing file; a real non-image then fails
+// inside connect() with ERROR_BAD_EXE_FORMAT, which scripts/patch-node-pty.mjs now cleans
+// up, so refusing it here buys nothing and costs capability.
+//
+// An allowlist of .exe/.com/.bat/.cmd was tried and was wrong: measured, CreateProcess runs
+// a valid PE named tool.bin or tool.scr, so the allowlist refused spawns that worked before
+// it existed. The `.exe` fallback stays because CreateProcess appends that extension itself
+// when the path has none of its own.
 function win32Executable(command){
-  try{if(!statSync(command).isFile())return false;}catch{return false;}
-  const dot=command.lastIndexOf('.');
-  const separator=Math.max(command.lastIndexOf('\\'),command.lastIndexOf('/'));
-  if(dot>separator&&WIN32_IMAGE_EXTENSIONS.has(command.slice(dot).toLowerCase()))return true;
-  // An extensionless path is still spawnable, because CreateProcess appends .exe.
+  try{if(statSync(command).isFile())return true;}catch{}
   try{return statSync(`${command}.exe`).isFile();}catch{return false;}
 }
 // terminal.create is the only method that registers state, so it is the only one

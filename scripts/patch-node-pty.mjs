@@ -42,6 +42,16 @@ function die(message) {
   process.exit(1);
 }
 
+// The file this rewrites is Windows-only, but node-pty's package.json publishes all of
+// lib/, so `npm ci` on Linux or macOS runs this script against a file those platforms never
+// load. A future node-pty release that reshapes the Windows agent would then fail installs
+// on platforms that could not be affected -- so on anything but win32 this is a no-op that
+// says so, and exits 0.
+if (process.platform !== 'win32') {
+  console.log(`sentiora: node-pty patch skipped on ${process.platform}: lib/windowsPtyAgent.js is never loaded here.`);
+  process.exit(0);
+}
+
 const require = createRequire(import.meta.url);
 let agentPath;
 try {

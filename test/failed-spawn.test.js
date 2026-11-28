@@ -6,17 +6,21 @@
 // ever disposes that worker. The host then cannot exit: measured at 20 s (the client's
 // dispose cap) with the process tree killed, versus a ~5 s normal ConPTY shutdown tail.
 //
-// Two inputs reach that path and neither is exotic: a cwd that does not exist (WIN-21)
-// and a command that exists but that CreateProcess cannot execute (WIN-22). Both are
-// decided before anything is spawned, so both are answered as errors and the host
-// still exits.
+// Two inputs reach that path and neither is exotic: a cwd that does not exist (WIN-21) and
+// a command that exists but that CreateProcess cannot execute (WIN-22). A bad cwd is
+// decidable before anything is spawned; a bad command is not, because CreateProcess -- not
+// this runtime -- decides what it can run. Both are answered as errors and the host exits:
+// for the second, that is exactly what scripts/patch-node-pty.mjs guarantees.
+//
+// WIN-25 guards the other direction, which an earlier allowlist got wrong: a valid image
+// under an extension this runtime used to refuse must still spawn.
 //
 // These drive the real runtime over its real stdio transport and assert both halves:
 // the create is an error, and the host still exits promptly afterwards.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -121,6 +125,11 @@ test('WIN-22 a command that exists but cannot be executed does not strand the ho
     cwd: REPO,
   });
   assert.ok(failed.error, 'a create whose command cannot be executed must be answered with an error');
+  // 193 is ERROR_BAD_EXE_FORMAT from CreateProcess. With the extension allowlist gone this
+  // reaches node-pty's connect(), which is the path the constructor patch makes safe -- so
+  // this asserts the test still exercises cleanup, not a pre-spawn refusal.
+  assert.match(failed.error.message, /error code: 193/u,
+    `expected the CreateProcess failure from connect(), got: ${failed.error.message}`);
 
   await assertHostStillExits(t, runtime, 'unexecutable command');
 });
@@ -152,4 +161,31 @@ test('WIN-23 a spawn that fails inside connect() releases its ConPTY worker', wi
     `expected the CreateProcess failure from connect(), got: ${failed.error.message}`);
 
   await assertHostStillExits(t, runtime, 'truncated image');
+});
+
+// The regression an extension allowlist introduced, guarded so it cannot come back: a real
+// image under another extension is a spawn CreateProcess accepts. Measured: a copy of
+// cmd.exe named tool.bin runs. Refusing it broke a caller that worked before the allowlist.
+test('WIN-25 a valid image under another extension still spawns', windowsOnly, async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'sentiora-win25-'));
+  t.after(() => { try { rmSync(directory, { recursive: true, force: true }); } catch { /* gone */ } });
+  const renamed = join(directory, 'tool.bin');
+  cpSync(process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe', renamed);
+
+  const runtime = startRuntime();
+  t.after(() => { try { runtime.child.kill('SIGKILL'); } catch { /* gone */ } });
+
+  const created = await runtime.request('terminal.create', {
+    command: renamed,
+    args: ['/c', 'echo BIN-OK'],
+    cols: 40,
+    rows: 10,
+    cwd: REPO,
+  });
+  assert.equal(created.error, undefined,
+    `a valid PE named tool.bin must spawn; got error: ${JSON.stringify(created.error)}`);
+  assert.ok(created.result?.sessionId, 'the create must return a session');
+
+  const listed = await runtime.request('terminal.list', {});
+  assert.equal(listed.result.length, 1, 'the spawned session must be registered');
 });
