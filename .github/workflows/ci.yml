@@ -472,3 +472,36 @@ jobs:
           path: apps/desktop/dist
           retention-days: 7
           if-no-files-found: error
+
+  # Interaction tests (issue #19): a real browser driving the built UI against the real loopback
+  # server, with the scriptable fake runtime standing in for a shell. Ubuntu only -- what is under
+  # test is the UI's behaviour, and the native PTY path is covered by the Windows cells.
+  desktop-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install UI dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: apps/desktop
+        run: npx playwright install --with-deps chromium
+
+      - name: Interaction tests
+        working-directory: apps/desktop
+        run: npm run test:e2e
+
+      # Traces and screenshots only exist for a failed run; keeping them is the difference between
+      # "it failed on CI" and a fix.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-artifacts
+          path: apps/desktop/test-results
+          retention-days: 7

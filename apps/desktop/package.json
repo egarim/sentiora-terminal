@@ -12,6 +12,7 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit --pretty false",
     "preview": "vite preview",
+    "test:e2e": "npm run build && playwright test",
     "terminal": "node bin/living-terminal.mjs"
   },
   "dependencies": {
@@ -21,6 +22,7 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "@types/node": "^22.0.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",

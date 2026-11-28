@@ -16,3 +16,7 @@ dist/
 # happened to run it (issue #4).
 __pycache__/
 *.pyc
+
+# Playwright: traces and screenshots from a failed run, never a build input.
+test-results/
+playwright-report/
