@@ -9,7 +9,7 @@
 // the layer above, which is also the layer Playwright would drive.
 import { createElement, type ReactElement } from 'react';
 import {
-  buildSessionTree, flattenSessionTree, type MailboxLog, type SessionEntry,
+  buildSessionTree, flattenSessionTree, type MailboxLog, type MailboxMessage, type SessionEntry,
 } from '../lib/tree.ts';
 
 export type SessionTreeProps = {
@@ -18,6 +18,10 @@ export type SessionTreeProps = {
   selectedId?: string | null;
   /** The selected session's mailbox log, already merged by appendMailbox. */
   log?: MailboxLog;
+  /** Messages the selected session sent to its children (see useSessionTree). */
+  sent?: MailboxMessage[];
+  /** session id -> label, for showing a rom id as a name. */
+  labels?: Record<string, string>;
   onSelect?: (sessionId: string) => void;
 };
 
@@ -50,14 +54,27 @@ export function SessionTree(props: SessionTreeProps): ReactElement {
   ));
 
   const log = props.log;
+  const labels = props.labels ?? {};
   const messages = (log?.messages ?? []).map(message => createElement(
     'li',
     {
       key: message.sequence,
       'data-testid': 'log-message',
       'data-sequence': String(message.sequence),
+      // Who sent it, when the runtime could attribute it. Absent means the host spoke.
+      'data-from': message.from ?? undefined,
         // No gap check per message: appendMailbox already guarantees ordering and dedupe.
     },
+    message.from ? createElement('span', { key: 'from', 'data-testid': 'from-label' }, `${labels[message.from] ?? message.from}: `) : null,
+    describePayload(message.payload),
+  ));
+
+  // Outbound is a separate list, not merged into one timeline: sequence numbers belong to a
+  // mailbox, so a merged order across two inboxes would be an invention. Received and sent, each in
+  // its own order, is what can be stated truthfully.
+  const sent = (props.sent ?? []).map((message, index) => createElement(
+    'li',
+    { key: `${message.sequence}-${index}`, 'data-testid': 'sent-message', 'data-to': message.to ?? undefined },
     describePayload(message.payload),
   ));
 
@@ -73,6 +90,14 @@ export function SessionTree(props: SessionTreeProps): ReactElement {
         : null,
       createElement('ol', { key: 'messages', 'data-testid': 'log-messages' }, messages),
     ),
+    sent.length
+      ? createElement(
+        'section',
+        { key: 'sent', 'data-testid': 'session-sent' },
+        createElement('p', { key: 'sent-title' }, 'Sent to children'),
+        createElement('ol', { key: 'sent-messages', 'data-testid': 'sent-messages' }, sent),
+      )
+      : null,
   ];
 
   // An orphan means the runtime reported a parent that is not in the list; showing it as a root is

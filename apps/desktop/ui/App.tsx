@@ -531,6 +531,8 @@ export function App() {
             sessions={viewer.sessions}
             selectedId={viewer.selectedId}
             log={viewer.log}
+            sent={viewer.sent}
+            labels={viewer.labels}
             onSelect={viewer.select}
           />
         </aside>

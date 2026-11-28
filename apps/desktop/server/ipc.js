@@ -502,7 +502,11 @@ export class IpcServer {
         return sendJson(response, 429, { error: 'message rate limit exceeded', kind: 'rate-limited' });
       }
       // `body.payload ?? body` so a caller may post either a wrapped payload or the message itself.
-      return sendJson(response, 200, { posted: await this.#bridge.post(sessionId, body.payload ?? body) });
+      // `from` names the sending session, so the bridge can use the pair's edge capability and the
+      // runtime can attribute a direction. Without it the post is the host speaking, which is the
+      // anonymous case and stays anonymous rather than being guessed at.
+      const from = typeof body.from === 'string' && body.from ? body.from : null;
+      return sendJson(response, 200, { posted: await this.#bridge.post(sessionId, body.payload ?? body, { from }) });
     }
     if (action === 'messages' && method === 'GET') {
       const url = new URL(request.url, 'http://127.0.0.1');

@@ -139,7 +139,18 @@ function mailboxFor(p){
 function mailboxDrain(mailbox,after){
   return {messages:mailbox.queue.filter(m=>m.sequence>after),nextSequence:mailbox.next-1,dropped:mailbox.dropped};
 }
-function mailboxPost(mailbox,payload){
+// Who sent it, when the runtime can know. A post made with an edge capability comes from the
+// other end of that edge by construction -- only that pair holds the capability -- so direction is
+// attributable without trusting the caller. A post made with a session's own mailbox capability is
+// the host speaking and has no sender.
+function senderFor(sessionId,capability){
+  const edge=edges.get(capability);
+  if(!edge)return null;
+  if(edge.child===sessionId)return edge.parent;
+  if(edge.parent===sessionId)return edge.child;
+  return null;
+}
+function mailboxPost(mailbox,payload,from=null){
   let encoded;
   try{encoded=JSON.stringify(payload);}catch{throw Error('Invalid message');}
   if(typeof encoded!=='string')throw Error('Invalid message');
@@ -149,7 +160,7 @@ function mailboxPost(mailbox,payload){
   if(mailbox.recent.length>=MAILBOX_POSTS_PER_SECOND)throw Error('Too many messages');
   mailbox.recent.push(now);
   const sequence=mailbox.next++;
-  mailbox.queue.push({sequence,payload});
+  mailbox.queue.push({sequence,payload,from});
   // Dropped, never reordered: the gap is reported through `dropped`, the same way a
   // stream reports resync rather than silently losing bytes.
   if(mailbox.queue.length>MAILBOX_DEPTH){mailbox.queue.shift();mailbox.dropped+=1;}
@@ -287,7 +298,7 @@ export async function dispatch(method,p,deferred){
     case 'terminal.stream':return s.stream(p.afterSequence,p.timeoutMs);
     // Messaging, not input: mailboxFor() checks a capability minted for messages alone, so
     // neither case can reach s.input() and neither returns the owner token.
-    case 'terminal.post':return mailboxPost(mailboxFor(p),p.payload);
+    case 'terminal.post':return mailboxPost(mailboxFor(p),p.payload,senderFor(p.sessionId,p.capability));
     case 'terminal.mailbox':return mailboxWait(mailboxFor(p),p.afterSequence,p.timeoutMs);
     // Gated, unlike the stream: a recording can contain what was typed, which is
     // precisely what may hold a secret.

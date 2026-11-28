@@ -77,7 +77,7 @@ export const api = {
     ).then(r => r.posted),
   /** Drains messages after a cursor. `timeoutMs: 0` returns immediately, for a polling loop. */
   mailbox: (sessionId: string, afterSequence = 0, timeoutMs = 0) =>
-    request<{ messages: Array<{ sequence: number; payload: unknown }>; nextSequence: number; dropped: number }>(
+    request<{ messages: Array<{ sequence: number; payload: unknown; from?: string | null }>; nextSequence: number; dropped: number }>(
       `/sessions/${encodeURIComponent(sessionId)}/messages?after=${afterSequence}&timeoutMs=${timeoutMs}`,
     ),
   closeSession: (sessionId: string) =>
