@@ -689,3 +689,58 @@ test('writes to an exited session are refused', opts, async () => {
     await backend.shutdown();
   }
 });
+
+test('a parented session carries its parent link into the listing', opts, async () => {
+  const backend = await createFakeBackend({});
+  try {
+    const parent = await backend.bridge.create({ command: 'fake', cols: 40, rows: 10 });
+    const child = await backend.bridge.create({ command: 'fake', cols: 40, rows: 10, parentSessionId: parent.sessionId });
+
+    assert.equal(child.parent, parent.sessionId, 'the child names its parent by bridge id, not a runtime id');
+
+    const listed = await backend.bridge.list();
+    const byId = new Map(listed.map(entry => [entry.sessionId, entry]));
+    assert.equal(byId.get(parent.sessionId).parent, null, 'a root has no parent');
+    assert.equal(byId.get(child.sessionId).parent, parent.sessionId);
+
+    // The UI-facing listing must never carry a capability. (assertNoOwner is not used here: the
+    // bridge does not expose runtimeSessionId, so there is no non-empty token to search for --
+    // passing an empty needle would always "leak".)
+    assert.doesNotMatch(JSON.stringify(listed), /"owner"|"mailbox"/);
+  } finally {
+    await backend.shutdown();
+  }
+});
+
+test('an unknown parentSessionId is refused before anything is spawned', opts, async () => {
+  const backend = await createFakeBackend({});
+  try {
+    await assert.rejects(
+      backend.bridge.create({ command: 'fake', cols: 40, rows: 10, parentSessionId: 'no-such-session' }),
+      error => error.kind === 'unknown-session',
+    );
+    assert.deepEqual(await backend.bridge.list(), [], 'a refused create must leave no session behind');
+  } finally {
+    await backend.shutdown();
+  }
+});
+
+test('the bridge posts and drains messages on behalf of the UI', opts, async () => {
+  const backend = await createFakeBackend({});
+  try {
+    const session = await backend.bridge.create({ command: 'fake', cols: 40, rows: 10 });
+
+    const posted = await backend.bridge.post(session.sessionId, { kind: 'task', text: 'run it' });
+    assert.equal(posted.sequence, 1);
+
+    const frame = await backend.bridge.mailbox(session.sessionId, { afterSequence: 0, timeoutMs: 200 });
+    assert.deepEqual(frame.messages.map(message => message.payload.text), ['run it']);
+    assert.equal(frame.nextSequence, 1);
+
+    // Nothing UI-facing carries an owner or mailbox token.
+    assertNoOwner(assert, posted, 'owner-');
+    assert.doesNotMatch(JSON.stringify({ posted, frame }), /"owner"|"capability"/);
+  } finally {
+    await backend.shutdown();
+  }
+});

@@ -494,6 +494,28 @@ export class IpcServer {
       const body = await readBody(request);
       return sendJson(response, 200, await this.#bridge.resize(sessionId, body.cols, body.rows));
     }
+    // Message relay for the viewer (#35): the UI posts into an edge and polls the log, and the
+    // capability stays in the bridge. Rate-limited like input, since a message is a write.
+    if (action === 'messages' && method === 'POST') {
+      const body = await readBody(request);
+      if (!this.#rate.allow(`post:${sessionId}`, this.#inputRateLimit, this.#inputRateWindowMs)) {
+        return sendJson(response, 429, { error: 'message rate limit exceeded', kind: 'rate-limited' });
+      }
+      // `body.payload ?? body` so a caller may post either a wrapped payload or the message itself.
+      return sendJson(response, 200, { posted: await this.#bridge.post(sessionId, body.payload ?? body) });
+    }
+    if (action === 'messages' && method === 'GET') {
+      const url = new URL(request.url, 'http://127.0.0.1');
+      const afterSequence = Number(url.searchParams.get('after') ?? 0);
+      if (!Number.isFinite(afterSequence) || afterSequence < 0) {
+        return sendJson(response, 400, { error: 'after must be a non-negative number', kind: 'invalid-request' });
+      }
+      const requested = Number(url.searchParams.get('timeoutMs') ?? 1000);
+      return sendJson(response, 200, await this.#bridge.mailbox(sessionId, {
+        afterSequence,
+        timeoutMs: Number.isFinite(requested) ? Math.min(Math.max(requested, 0), 30000) : 1000,
+      }));
+    }
     return sendJson(response, 404, { error: `no such session action: ${action}` });
   }
 

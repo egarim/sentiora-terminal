@@ -49,7 +49,7 @@ function publicView(record, observation) {
 }
 
 class Record {
-  constructor({ sessionId, runtimeSessionId, hostId, owner, host, label, command, shell }) {
+  constructor({ sessionId, runtimeSessionId, hostId, owner, host, label, command, shell, parent = null, mailbox = null }) {
     // The id the UI uses. The runtime's own id is only unique within one host
     // process, and the bridge pools several hosts, so it cannot be handed out
     // directly: two hosts would collide. The runtime id stays internal and is used
@@ -59,6 +59,8 @@ class Record {
     this.hostId = hostId;
     this.owner = owner;         // bearer credential; never leaves SessionBridge
     this.host = host;           // {id, client} from the pool
+    this.parent = parent;       // bridge session id of the parent, or null: the viewer's tree
+    this.mailbox = mailbox;     // capability for messages only; the owner token stays separate
     this.label = label;
     this.command = command;     // remembered locally; the runtime does not echo it
     this.shell = shell ?? null; // catalog entry, so the UI can gate Ctrl+C on its prompt
@@ -111,6 +113,7 @@ export class SessionBridge extends EventEmitter {
       // A heuristic prompt regex, exposed so the UI can gate Ctrl+C on an
       // observed readiness condition. Never a guarantee: see shell-catalog.js.
       promptPattern: record.shell?.promptPattern ?? null,
+      parent: record.parent,
       state: record.state,
       revision: record.lastRevision,
       cols: record.cols,
@@ -148,7 +151,7 @@ export class SessionBridge extends EventEmitter {
     return record;
   }
 
-  async create({ command, args = [], cwd, cols, rows, label, conptyDll, shell = null, env } = {}) {
+  async create({ command, args = [], cwd, cols, rows, label, conptyDll, shell = null, env, parentSessionId = null } = {}) {
     if (typeof command !== 'string' || command === '') throw new SentioraError('invalid-command', 'command must be a non-empty string');
     if (!Array.isArray(args) || args.some(a => typeof a !== 'string')) throw new SentioraError('invalid-command', 'args must be an array of strings');
     const size = clampDimensions(cols, rows);
@@ -159,6 +162,13 @@ export class SessionBridge extends EventEmitter {
     // caller asked for nothing" distinguishable all the way down to the runtime,
     // where the difference is the allowlist versus an empty environment.
     if (env !== undefined) params.env = env;
+    // The UI names a bridge session; the runtime needs that session's own id on its host. The
+    // translation stays here because runtime ids are internal by design (two hosts would collide).
+    let parent = null;
+    if (parentSessionId !== null) {
+      parent = this.#get(parentSessionId);
+      params.parent = parent.runtimeSessionId;
+    }
     // The pool picks the host and moves on if the runtime reports 'Session limit',
     // so this never has to reason about capacity itself.
     const { host, result: created } = await this.#pool.runCreate(client => client.createSession(params));
@@ -167,7 +177,7 @@ export class SessionBridge extends EventEmitter {
       sessionId: randomUUID(),
       runtimeSessionId: created.sessionId,
       hostId: host.id,
-      owner: created.owner, host,
+      owner: created.owner, host, parent: parent?.sessionId ?? null, mailbox: created.mailbox ?? null,
       label: label ?? command, command: { command, args }, shell,
     });
     this.#records.set(record.sessionId, record);
@@ -323,6 +333,7 @@ export class SessionBridge extends EventEmitter {
       kind: lost ? 'lost' : 'frame',
       sessionId: record.sessionId,
       revision: record.lastRevision,
+      parent: record.parent,
       state: record.state,
       exit: record.exit,
       cols: record.cols,
@@ -390,6 +401,7 @@ export class SessionBridge extends EventEmitter {
       kind: 'snapshot',
       sessionId,
       revision: record.lastRevision,
+      parent: record.parent,
       state: record.state,
       exit: record.exit,
       cols: record.cols,
@@ -580,6 +592,36 @@ export class SessionBridge extends EventEmitter {
     throw new SentioraError('readiness-timeout', `session ${sessionId} never satisfied ${label} within ${timeoutMs}ms`);
   }
 
+  /** Every session the bridge holds, in creation order, each with its parent link (the viewer's tree). */
+  list() {
+    return [...this.#records.values()].map(record => this.describe(record));
+  }
+
+  /**
+   * Enqueues a message for a session (issue #34). Uses the mailbox capability, which authorises
+   * messages only: neither this method nor `mailbox` below can reach terminal.type.
+   */
+  async post(sessionId, payload) {
+    const record = this.#get(sessionId);
+    if (!record.mailbox) throw new SentioraError('no-mailbox', 'this session has no mailbox capability');
+    return record.host.client.call('terminal.post', {
+      sessionId: record.runtimeSessionId,
+      capability: record.mailbox,
+      payload,
+    });
+  }
+
+  /** Drains messages after a cursor; the request timeout is the poll plus the client's own. */
+  async mailbox(sessionId, { afterSequence = 0, timeoutMs = 1000 } = {}) {
+    const record = this.#get(sessionId);
+    if (!record.mailbox) throw new SentioraError('no-mailbox', 'this session has no mailbox capability');
+    return record.host.client.call('terminal.mailbox', {
+      sessionId: record.runtimeSessionId,
+      capability: record.mailbox,
+      afterSequence,
+      timeoutMs,
+    }, { timeoutMs: timeoutMs + 30000 });
+  }
   async close(sessionId) {
     const record = this.#records.get(sessionId);
     if (!record) return false;

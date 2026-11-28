@@ -41,9 +41,13 @@ let nextSession = 1;
 const sessions = new Map();
 
 class FakeSession {
-  constructor({ id, owner, cols, rows, command, args, pid }) {
+  constructor({ id, owner, cols, rows, command, args, pid, parent = null, mailbox = null }) {
     this.id = id;
     this.owner = owner;
+    this.parent = parent;
+    this.mailbox = mailbox;
+    this.messages = [];
+    this.mailboxSequence = 0;
     this.pid = pid;
     this.command = command;
     this.args = args;
@@ -78,9 +82,26 @@ class FakeSession {
     this.changed();
   }
 
+  post(payload) {
+    const sequence = ++this.mailboxSequence;
+    this.messages.push({ sequence, payload });
+    return { sequence, dropped: 0 };
+  }
+
+  // Named drain, not mailbox: the instance property `mailbox` holds the capability string, and a
+  // method of the same name would be shadowed by it.
+  drain(afterSequence = 0) {
+    return {
+      messages: this.messages.filter(message => message.sequence > afterSequence),
+      nextSequence: this.mailboxSequence,
+      dropped: 0,
+    };
+  }
+
   observe() {
     return {
       sessionId: this.id,
+      parent: this.parent,
       pid: this.pid,
       state: this.state,
       revision: this.revision,
@@ -166,7 +187,7 @@ async function dispatch(method, params = {}) {
   if (method === 'terminal.create') {
     if (created >= FAIL_AFTER) throw Error('Invalid pty handle');
     if (sessions.size >= SESSION_LIMIT) throw Error('Session limit');
-    const { command, args = [], cols = DEFAULT_COLS, rows = DEFAULT_ROWS } = params;
+    const { command, args = [], cols = DEFAULT_COLS, rows = DEFAULT_ROWS, parent = null } = params;
     dimensions(cols, rows);
     if (typeof command !== 'string' || !command || !Array.isArray(args)) throw Error('Invalid command');
     created += 1;
@@ -177,6 +198,7 @@ async function dispatch(method, params = {}) {
     // collides to prove the bridge namespaces ids itself instead of trusting it.
     const session = new FakeSession({
       id: `fake-${n}`, owner: `owner-${n}`, pid: 40000 + n, cols, rows, command, args,
+      parent, mailbox: `mailbox-${n}`,
     });
     sessions.set(session.id, session);
     // The owner token is announced on stderr only. It must never appear on stdout
@@ -198,9 +220,18 @@ async function dispatch(method, params = {}) {
     // autoboot:false leaves the session in 'spawned', which is how the tests
     // assert that 'spawned' is not treated as readiness.
     if (!NO_AUTOBOOT && params.autoboot !== false) session.print('FAKE READY');
-    return { ...session.observe(), owner: session.owner };
+    return { ...session.observe(), owner: session.owner, mailbox: session.mailbox };
   }
   if (method === 'terminal.list') return [...sessions.values()].map(s => s.observe());
+  if (method === 'terminal.post' || method === 'terminal.mailbox') {
+    const target = sessions.get(params.sessionId);
+    if (!target) throw Error('Unknown session');
+    // Same capability rule as the runtime: the mailbox token, never the owner token.
+    if (params.capability !== target.mailbox) throw Error('Mailbox capability required');
+    return method === 'terminal.post'
+      ? target.post(params.payload)
+      : target.drain(params.afterSequence ?? 0);
+  }
   const session = sessions.get(params.sessionId);
   if (!session) throw Error('Unknown session');
   switch (method) {
