@@ -209,10 +209,36 @@ export class Session {
   // by never returning, so the wait is bounded: an emulator that does not invoke
   // its write callback must not be able to hang terminal.close forever. The first
   // failure is recorded rather than thrown so the caller can report it.
+
+  /**
+   * Releases the conout worker when node-pty only *queued* the kill (#63).
+   *
+   * `WindowsTerminal.kill()` runs at once only if the terminal is ready; otherwise its callback waits
+   * in `_deferreds` for a readiness that a session being torn down never reaches. That callback is the
+   * only caller of `ConoutConnection.dispose()`, whose timer is the only caller of
+   * `worker.terminate()` — so for a child that dies before readiness nothing releases the worker, and
+   * its MessagePort keeps the event loop alive after shutdown.
+   *
+   * `unref()` rather than `terminate()`: it makes the loop able to drain without disturbing the exit
+   * path, which terminate() was measured to break (five teardown tests in ST14-* timed out and the
+   * native suite hung). The worker is then reaped with the process.
+   *
+   * Deliberately synchronous and fully guarded: a close must not wait on the very resource it is
+   * releasing, and these fields are private to node-pty.
+   */
+  releaseDeferredKill(){
+    if(process.platform!=='win32')return;
+    // Only the deferred case: a ready terminal's kill() already ran and released its own worker.
+    if(this.pty?._isReady!==false)return;
+    const worker=this.pty?._agent?._conoutSocketWorker?._worker;
+    if(!worker||typeof worker.unref!=='function')return;
+    try{worker.unref();}catch(error){this.noteCloseError(error);}
+  }
   async close(){
     if(this.closed)return;
     this.closed=true;
-    try{this.pty.kill();}catch(error){this.noteCloseError(error);}
+try{this.pty.kill();}catch(error){this.noteCloseError(error);}
+    this.releaseDeferredKill();
     this.state='released';this.changed();
     let timer;
     try{
