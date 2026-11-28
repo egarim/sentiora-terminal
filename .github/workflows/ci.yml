@@ -485,6 +485,13 @@ jobs:
         with:
           node-version: 24
 
+      # The real-PTY specs spawn src/server.js, which needs the runtime's own dependencies
+      # (node-pty) -- installing only the UI package made the host exit 1 on the first create,
+      # which the UI reports as a 503. The fake-runtime specs never noticed because the fixture
+      # imports no native module.
+      - name: Install runtime dependencies
+        run: npm ci
+
       - name: Install UI dependencies
         working-directory: apps/desktop
         run: npm ci
