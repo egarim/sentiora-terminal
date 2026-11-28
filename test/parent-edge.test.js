@@ -153,3 +153,66 @@ test('PE-06 closing either end drops the edge and its capability', opts, async t
   const own = await runtime.call('terminal.post', { sessionId: parent.sessionId, capability: parent.mailbox, payload: 'still here' });
   assert.equal(own.sequence, 1);
 });
+
+// process.kill(pid, 0) is the portable existence probe: no signal delivered, ESRCH once gone.
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+}
+
+async function untilGone(pid, timeout = 10000) {
+  const deadline = Date.now() + timeout;
+  while (alive(pid)) {
+    if (Date.now() > deadline) throw new Error(`child ${pid} was still alive ${timeout}ms after its parent closed`);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+}
+
+test('PE-07 closeChildren makes a child die with its parent', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+  const child = await runtime.createWith({ parent: parent.sessionId, closeChildren: true });
+  assert.equal((await runtime.call('terminal.list', {})).length, 2);
+
+  await runtime.call('terminal.close', { sessionId: parent.sessionId, owner: parent.owner });
+
+  const listed = await runtime.call('terminal.list', {});
+  assert.equal(listed.length, 0, 'the registry must hold neither parent nor child');
+  await untilGone(child.pid);
+});
+
+test('PE-08 by default a child outlives its parent', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+  const child = await runtime.createWith({ parent: parent.sessionId });
+
+  await runtime.call('terminal.close', { sessionId: parent.sessionId, owner: parent.owner });
+
+  // Detaching is the default on purpose: killing a process the caller did not name is the more
+  // surprising behaviour, so the cascade has to be asked for (PE-07).
+  const listed = await runtime.call('terminal.list', {});
+  assert.equal(listed.length, 1, 'the child must survive its parent by default');
+  assert.equal(listed[0].sessionId, child.sessionId);
+  assert.ok(alive(child.pid), 'the child process must still be running');
+  await runtime.call('terminal.close', { sessionId: child.sessionId, owner: child.owner });
+});
+
+test('PE-09 closeChildren is validated rather than guessed', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+
+  const notBoolean = await runtime.request('terminal.create', {
+    command: process.execPath, args: [FIXTURE], parent: parent.sessionId, closeChildren: 'yes',
+  });
+  assert.match(notBoolean.error.message, /Invalid closeChildren/);
+
+  const withoutParent = await runtime.request('terminal.create', {
+    command: process.execPath, args: [FIXTURE], closeChildren: true,
+  });
+  assert.match(withoutParent.error.message, /closeChildren requires a parent/);
+
+  assert.equal((await runtime.call('terminal.list', {})).length, 1, 'neither refusal may leave a session behind');
+});

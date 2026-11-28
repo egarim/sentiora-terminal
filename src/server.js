@@ -35,6 +35,20 @@ const conptyDllDefault=process.env.SENTIORA_CONPTY_DLL==='1';
 // close. stderr is diagnostics; it is never the JSON-RPC channel. Newlines are
 // flattened so one failure stays one line.
 async function abandon(session){
+  // Cascade first: a child asked to die with its parent must not outlive the call that
+  // closed the parent, and the recursion is the child's own edges' business.
+  const doomed=childCascade.get(session.id);
+  childCascade.delete(session.id);
+  if(doomed){
+    for(const childId of doomed){
+      const child=sessions.get(childId);
+      if(child)await abandon(child);
+    }
+  }
+  // A child that closed on its own leaves no stale entry behind in its parent's set.
+  for(const [parentId,children] of childCascade){
+    if(children.delete(session.id)&&children.size===0)childCascade.delete(parentId);
+  }
   await session.close();
   mailboxes.delete(session.id);
   // An edge dies with either end: a capability left behind would let the surviving end post
@@ -79,6 +93,10 @@ const mailboxes=new Map();
 // nowhere else -- which is what makes "no sibling-to-sibling, no broadcast" structural
 // rather than a policy someone could forget: a sibling never holds the edge's capability.
 const edges=new Map();
+// Children asked to die with their parent (issue #35): parent id -> child ids. Absent means the
+// default, which is to detach -- a cascade has to be asked for, because killing processes a
+// caller did not name is the more surprising behaviour.
+const childCascade=new Map();
 function edgeCapability(){return randomBytes(24).toString('hex');}
 function newMailbox(){return {capability:randomBytes(24).toString('hex'),queue:[],next:1,dropped:0,waiters:new Set(),recent:[]};}
 function acceptsCapability(sessionId,capability){
@@ -135,7 +153,7 @@ function mailboxWait(mailbox,afterSequence,timeoutMs){
 // anything else.
 async function createSession(p){
   if(sessions.size+inflight.size>=SESSION_LIMIT)throw Error('Session limit');
-  const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll,env,recordInput,recordBytes,parent}=p;dimensions(cols,rows);
+  const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll,env,recordInput,recordBytes,parent,closeChildren}=p;dimensions(cols,rows);
   if(typeof command!=='string'||!command||!Array.isArray(args)||args.some(a=>typeof a!=='string'))throw Error('Invalid command');
   if(conptyDll!==undefined&&typeof conptyDll!=='boolean')throw Error('Invalid conptyDll');
   // Keystrokes can carry secrets, so recording them is opt-in and the default is
@@ -173,6 +191,8 @@ async function createSession(p){
   // command: an unknown parent must not leave a child process behind. The capability travels
   // to the child through its env allowlist, never through an inherited owner token.
   let edge=null;
+  if(closeChildren!==undefined&&typeof closeChildren!=='boolean')throw Error('Invalid closeChildren');
+  if(closeChildren!==undefined&&parent===undefined)throw Error('closeChildren requires a parent');
   if(parent!==undefined){
     if(typeof parent!=='string'||!sessions.has(parent))throw Error('Unknown parent');
     edge={parent,child:null,capability:edgeCapability()};
@@ -195,6 +215,10 @@ async function createSession(p){
       // delivery guarantee yields to the shutdown guarantee.
       if(closing){void abandon(s);return null;}
       if(edge){edge.child=s.id;edges.set(edge.capability,edge);}
+      if(edge&&closeChildren===true){
+        const children=childCascade.get(edge.parent)??new Set();
+        children.add(s.id);childCascade.set(edge.parent,children);
+      }
       sessions.set(s.id,s);mailboxes.set(s.id,mailbox);return s;
     },
     rollback(){if(this.settled)return;this.settled=true;inflight.delete(this);return abandon(s);},
