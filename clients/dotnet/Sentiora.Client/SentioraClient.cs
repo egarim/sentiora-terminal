@@ -246,6 +246,28 @@ public sealed class SentioraClient : IAsyncDisposable
             ?? throw new SentioraException("terminal.post returned no result", "terminal.post");
     }
 
+    /// <summary>
+    /// Cooperative handover (issue #4): the current owner gives input rights away and the returned
+    /// handle carries the new token. The handle passed in keeps a token that is now dead, which is
+    /// the contract rather than an oversight — a caller must switch to the returned handle.
+    /// </summary>
+    public async Task<SessionHandle> HandoverAsync(SessionHandle session, CancellationToken cancellationToken = default)
+    {
+        var parameters = new Dictionary<string, object?>
+        {
+            ["sessionId"] = session.SessionId,
+            ["owner"] = session.Owner,
+        };
+        var result = await RequestAsync("terminal.handover", parameters, cancellationToken).ConfigureAwait(false);
+        var owner = result.ValueKind == JsonValueKind.Object
+            ? result.GetProperty("owner").GetString()
+            : null;
+        return session with
+        {
+            Owner = owner ?? throw new SentioraException("terminal.handover returned no owner token", "terminal.handover"),
+        };
+    }
+
     /// <summary>Drains messages after a cursor, long-polling like <see cref="WaitAsync"/>.</summary>
     public async Task<MailboxFrame> MailboxAsync(
         SessionHandle session, long afterSequence = 0, int timeoutMs = 1000, CancellationToken cancellationToken = default)

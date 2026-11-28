@@ -120,3 +120,24 @@ test('AGENT-05 a parented create hands the child an edge capability', opts, asyn
   await client.close(child);
   await client.close(parent);
 });
+
+test('AGENT-06 handover moves input rights to a new handle', opts, async t => {
+  const client = await AgentClient.connect();
+  t.after(async () => { await client.dispose(); });
+
+  const session = await client.create({ command: process.execPath, args: [FIXTURE], cols: 60, rows: 16 });
+  const handed = await client.handover(session);
+
+  assert.equal(handed.sessionId, session.sessionId, 'the handover must be the same session');
+  assert.notEqual(handed.owner, session.owner, 'the handover must issue a new owner token');
+  assert.equal(handed.mailbox, session.mailbox, 'the mailbox capability is not part of the input handover');
+
+  // The old token is dead: closing with it is refused, so the two handles are not equivalent.
+  await assert.rejects(client.close(session), /Ownership required/);
+
+  // The new handle is the live one, and it can still be typed into and closed.
+  await client.sendLine(handed, 'echo HANDOVER-CLIENT-OK');
+  const { text } = await client.waitForText(handed, 'ECHO:HANDOVER-CLIENT-OK', { afterSequence: 0 });
+  assert.match(text, /ECHO:HANDOVER-CLIENT-OK/);
+  assert.equal(await client.close(handed), true);
+});
