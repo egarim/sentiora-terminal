@@ -40,6 +40,7 @@ export function TerminalView(props: Props) {
     lineHeight: settings.appearance.lineHeight,
     cursorBlink: settings.appearance.cursorBlink,
     scrollbackLines: settings.appearance.scrollbackLines,
+    screenReaderMode: settings.accessibility.screenReaderMode,
     onStatus: report,
   });
 

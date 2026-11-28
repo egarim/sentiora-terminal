@@ -415,3 +415,26 @@ test('the settings directory is created on first save', opts, async () => {
     await removeDirectory(dir);
   }
 });
+
+test('accessibility.screenReaderMode validates like every other boolean', () => {
+  const { settings } = validateSettings({});
+  assert.equal(settings.accessibility.screenReaderMode, false, 'off by default: it costs a DOM row per line');
+
+  const on = validateSettings({ accessibility: { screenReaderMode: true } });
+  assert.equal(on.settings.accessibility.screenReaderMode, true);
+  assert.deepEqual(on.warnings, [], 'a valid value must not warn');
+
+  const wrongType = validateSettings({ accessibility: { screenReaderMode: 'yes' } });
+  assert.equal(wrongType.settings.accessibility.screenReaderMode, false, 'a non-boolean falls back to the default');
+  assert.ok(wrongType.warnings.length > 0, 'and says so, rather than dropping it silently');
+  assert.match(JSON.stringify(wrongType.warnings), /accessibility\.screenReaderMode|screenReaderMode/);
+});
+
+test('a settings file written before the accessibility section existed still loads', () => {
+  // Forward compatibility matters here: every existing install has a settings.json without this
+  // section, and a missing section must fill in from defaults rather than reading as undefined.
+  const legacy = { schemaVersion: SCHEMA_VERSION, appearance: { fontSize: 15 } };
+  const { settings } = validateSettings(legacy);
+  assert.equal(settings.appearance.fontSize, 15, 'the stored value survives');
+  assert.equal(settings.accessibility.screenReaderMode, false, 'the new section fills in');
+});

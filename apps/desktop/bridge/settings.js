@@ -56,6 +56,12 @@ export const DEFAULT_SETTINGS = Object.freeze({
     restoreTabs: true,
     tabs: [],
   },
+  accessibility: {
+    // xterm's screen-reader mode renders the viewport as an accessible tree instead of canvas-only
+    // pixels. Off by default because it costs a DOM row per line; a screen-reader user turns it on.
+    // The interaction tests drive this same switch rather than a test-only hook.
+    screenReaderMode: false,
+  },
   onboarding: { completed: false },
 });
 
@@ -117,6 +123,10 @@ const SCHEMA = {
       restoreTabs: { type: 'boolean' },
       tabs: { type: 'array', items: TAB_ITEM, maxItems: 64 },
     },
+  },
+  accessibility: {
+    type: 'object',
+    shape: { screenReaderMode: { type: 'boolean' } },
   },
   onboarding: { type: 'object', shape: { completed: { type: 'boolean' } } },
 };

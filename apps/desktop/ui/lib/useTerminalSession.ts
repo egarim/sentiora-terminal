@@ -32,6 +32,8 @@ export interface TerminalSessionOptions {
   lineHeight: number;
   cursorBlink: boolean;
   scrollbackLines: number;
+  /** xterm's accessible tree; off unless the user asks, because it costs a DOM row per line. */
+  screenReaderMode: boolean;
   onStatus?: (status: PaneStatus) => void;
 }
 
@@ -66,7 +68,7 @@ function initialStatus(sessionId: string): PaneStatus {
  * best-effort reconstruction of what scrolled past.
  */
 export function useTerminalSession(options: TerminalSessionOptions) {
-  const { sessionId, promptPattern, themeId, fontSize, fontFamily, lineHeight, cursorBlink, scrollbackLines, onStatus } = options;
+  const { sessionId, promptPattern, themeId, fontSize, fontFamily, lineHeight, cursorBlink, scrollbackLines, screenReaderMode, onStatus } = options;
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -174,9 +176,10 @@ export function useTerminalSession(options: TerminalSessionOptions) {
       fontFamily,
       lineHeight,
       allowProposedApi: true,
-      // Screen-reader users get the rendered viewport announced; the visual
-      // rendering stays authoritative.
-      screenReaderMode: false,
+      // Screen-reader users get the rendered viewport announced; the visual rendering stays
+      // authoritative. Read once at construction: a new value applies to panes opened afterwards
+      // rather than rebuilding a live terminal mid-session.
+      screenReaderMode,
       convertEol: false,
       theme: xtermTheme(themeId),
     });

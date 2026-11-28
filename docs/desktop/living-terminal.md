@@ -615,7 +615,7 @@ Eight consecutive runs on Windows 11 ARM64 build 26200, Node v24.18.1, after the
 109 = the 37 pre-existing runtime tests plus 72 desktop tests, 0 skipped. The two new CI jobs have
 **never run on GitHub Actions** — this table is local evidence only and does not imply CI validation.
 
-### Interaction tests in a real browser (E2E-01..04)
+### Interaction tests in a real browser (E2E-01..07)
 
 `npm --prefix apps/desktop run test:e2e` builds the UI, boots the real loopback IPC server with a
 **scriptable fake runtime** standing in for a shell, and drives the built page in Chromium. The fake is
@@ -635,6 +635,21 @@ failed on CI" without an artifact is not a bug report.
 
 The token is delivered in the URL **fragment**, exactly as the real launcher does, so the tests walk
 the bootstrap path a user walks rather than a test-only shortcut.
+Two runtimes, on purpose. `E2E-01..04` drive the **scriptable fake** runtime: they are about the UI's own
+behaviour (token gate, shell picker, tabs, status bar), and a failure there must not be caused by ConPTY.
+`E2E-05..07` drive **`src/server.js` with actual shells**, which is what issue #19 asks for:
+
+| test | what it proves |
+| --- | --- |
+| E2E-05 | typed characters reach a real child process and its output comes back — `echo SENTIORA_E2E_OK` is only visible if both halves worked |
+| E2E-06 | a viewport change travels fit → bridge → runtime → the child's PTY size, and the status bar reports the new geometry |
+| E2E-07 | `Alt+T` opens a second tab with its own session, and the new tab takes focus |
+
+**Reading terminal text in a browser.** xterm paints into a canvas, so there is no DOM text to select.
+The tests enable xterm's `screenReaderMode`, which the app now exposes as a **setting**
+(`accessibility.screenReaderMode`, off by default because it costs a DOM row per line). That is a real
+accessibility feature rather than a test-only hook: a screen-reader user turns it on for the same
+reason the test does. Toggling it applies to panes opened afterwards, not to a live one.
 ### Scrollback recovery on a real console is partial, and that is expected
 
 After those fixes the invariant that always holds is: **nothing is invented, nothing is recovered

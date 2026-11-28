@@ -136,6 +136,7 @@ export interface Settings {
     tabs: Array<{ id: string; title: string; shellId: string; splitDirection: 'horizontal' | 'vertical' }>;
   };
   onboarding: { completed: boolean };
+  accessibility: { screenReaderMode: boolean };
 }
 
 export interface ResolvedAnimation {
