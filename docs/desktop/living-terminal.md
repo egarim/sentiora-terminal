@@ -292,6 +292,17 @@ then open `http://localhost:5173/#token=<token>`.
 
 ---
 
+### The viewer's models are testable without a browser
+
+`apps/desktop/ui/lib/tree.ts` holds the two shapes the session viewer needs — the tree built from the
+`parent` links `terminal.list` reports, and the per-edge mailbox log — as pure functions. They are
+tested in `test/desktop-tree.test.js` (`TREE-01..06`), which runs as part of `test:desktop` on every
+CI cell: Node strips the types natively from v24, and `test:desktop` passes
+`--experimental-strip-types` for the node-22 cells.
+
+That is deliberate: the part of the viewer that can be *wrong* is covered while the interaction-test
+tooling (#19) is still undecided, and the components that remain are the parts a screenshot cannot
+verify anyway.
 ## 8. BLOCKED: Tauri 2 packaging
 
 Issue #7 asks to "validate platform webview latency and packaging, document fallback if unsuitable".

@@ -17,7 +17,7 @@
     "test:server": "node --test --test-timeout=180000 --test-concurrency=1 test/server.test.js test/session-env.test.js test/stream-server.test.js test/windows-server.test.js test/failed-spawn.test.js test/node-pty-patch.test.js test/mailbox.test.js test/parent-edge.test.js test/handover.test.js test/cancellation.test.js test/mcp-server.test.js test/python-client.test.js test/identity.test.js",
     "test:fault": "node --test --test-timeout=180000 --test-concurrency=1 test/fault-injection.test.js",
     "test:agent": "node --test --test-timeout=180000 test/agent-client.test.js",
-    "test:desktop": "node --test --test-timeout=180000 test/desktop-bridge.test.js test/desktop-settings.test.js test/desktop-ipc.test.js test/desktop-native.test.js",
+    "test:desktop": "node --experimental-strip-types --test --test-timeout=180000 test/desktop-tree.test.js test/desktop-bridge.test.js test/desktop-settings.test.js test/desktop-ipc.test.js test/desktop-native.test.js",
     "desktop": "node apps/desktop/bin/living-terminal.mjs",
     "desktop:install": "npm --prefix apps/desktop ci",
     "desktop:typecheck": "npm --prefix apps/desktop run typecheck",
