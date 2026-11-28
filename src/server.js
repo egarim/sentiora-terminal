@@ -37,6 +37,9 @@ const conptyDllDefault=process.env.SENTIORA_CONPTY_DLL==='1';
 async function abandon(session){
   await session.close();
   mailboxes.delete(session.id);
+  // An edge dies with either end: a capability left behind would let the surviving end post
+  // into a mailbox that will never be drained again.
+  for(const [capability,edge] of edges)if(edge.parent===session.id||edge.child===session.id)edges.delete(capability);
   if(session.closeError)process.stderr.write(`sentiora: cleanup failed for session ${session.id}: ${String(session.closeError).replace(/[\r\n]+/g,' ')}\n`);
   sessions.delete(session.id);
 }
@@ -72,11 +75,23 @@ const MAILBOX_DEPTH=256;              // queued per session; the oldest is dropp
 const MAILBOX_POSTS_PER_SECOND=100;   // one sender cannot exhaust another's memory
 const MAILBOX_MAX_WAIT_MS=30000;
 const mailboxes=new Map();
+// Parent/child edges (issue #35). One capability per edge, accepted at either end and
+// nowhere else -- which is what makes "no sibling-to-sibling, no broadcast" structural
+// rather than a policy someone could forget: a sibling never holds the edge's capability.
+const edges=new Map();
+function edgeCapability(){return randomBytes(24).toString('hex');}
 function newMailbox(){return {capability:randomBytes(24).toString('hex'),queue:[],next:1,dropped:0,waiters:new Set(),recent:[]};}
+function acceptsCapability(sessionId,capability){
+  if(typeof capability!=='string')return false;
+  const own=mailboxes.get(sessionId);
+  if(own&&capability===own.capability)return true;
+  const edge=edges.get(capability);
+  return Boolean(edge)&&(edge.parent===sessionId||edge.child===sessionId);
+}
 function mailboxFor(p){
   const mailbox=mailboxes.get(p?.sessionId);
   if(!mailbox)throw Error('Unknown session');
-  if(typeof p.capability!=='string'||p.capability!==mailbox.capability)throw Error('Mailbox capability required');
+  if(!acceptsCapability(p.sessionId,p.capability))throw Error('Mailbox capability required');
   return mailbox;
 }
 function mailboxDrain(mailbox,after){
@@ -120,7 +135,7 @@ function mailboxWait(mailbox,afterSequence,timeoutMs){
 // anything else.
 async function createSession(p){
   if(sessions.size+inflight.size>=SESSION_LIMIT)throw Error('Session limit');
-  const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll,env,recordInput,recordBytes}=p;dimensions(cols,rows);
+  const {command,args=[],cwd=process.cwd(),cols=120,rows=40,conptyDll,env,recordInput,recordBytes,parent}=p;dimensions(cols,rows);
   if(typeof command!=='string'||!command||!Array.isArray(args)||args.some(a=>typeof a!=='string'))throw Error('Invalid command');
   if(conptyDll!==undefined&&typeof conptyDll!=='boolean')throw Error('Invalid conptyDll');
   // Keystrokes can carry secrets, so recording them is opt-in and the default is
@@ -154,9 +169,18 @@ async function createSession(p){
     if(!usableCwd)throw Error('Invalid cwd');
     if(isAbsolute(command)&&!win32Executable(command))throw Error('Invalid command');
   }
+  // A parent edge (issue #35) is decided before anything is spawned, like the cwd and the
+  // command: an unknown parent must not leave a child process behind. The capability travels
+  // to the child through its env allowlist, never through an inherited owner token.
+  let edge=null;
+  if(parent!==undefined){
+    if(typeof parent!=='string'||!sessions.has(parent))throw Error('Unknown parent');
+    edge={parent,child:null,capability:edgeCapability()};
+  }
   const terminal=new Terminal({cols,rows,scrollback:SESSION_SCROLLBACK,allowProposedApi:true});
   let child;
-  try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:sessionEnv(env),useConptyDll:conptyDll??conptyDllDefault});}
+  const childEnv=edge?sessionEnv({...env,SENTIORA_MAILBOX_CAPABILITY:edge.capability,SENTIORA_PARENT_SESSION:edge.parent}):sessionEnv(env);
+  try{child=pty.spawn(command,args,{name:'xterm-256color',cols,rows,cwd,env:childEnv,useConptyDll:conptyDll??conptyDllDefault});}
   catch(e){terminal.dispose();throw e;}
   let s;
   try{s=new Session(child,terminal,{recordInput:recordInput===true,recordBytes});}catch(e){try{child.kill();}catch{}try{terminal.dispose();}catch{}throw e;}
@@ -170,13 +194,14 @@ async function createSession(p){
       // would put the session somewhere nothing will ever drain it, so the
       // delivery guarantee yields to the shutdown guarantee.
       if(closing){void abandon(s);return null;}
+      if(edge){edge.child=s.id;edges.set(edge.capability,edge);}
       sessions.set(s.id,s);mailboxes.set(s.id,mailbox);return s;
     },
     rollback(){if(this.settled)return;this.settled=true;inflight.delete(this);return abandon(s);},
   };
   inflight.add(record);
   let result;
-  const observation=(async()=>({...await s.observe(),owner:s.owner,mailbox:mailbox.capability}))();
+  const observation=(async()=>({...await s.observe(),owner:s.owner,mailbox:mailbox.capability,...(edge?{childMailbox:edge.capability}:{})}))();
   // If the race below times out, the observation is still pending; swallow its
   // eventual rejection so it cannot surface as an unhandled one.
   observation.catch(()=>{});
