@@ -13,6 +13,8 @@ export type SessionEntry = {
   parent?: string | null;
   state?: string;
   pid?: number | null;
+  /** Human label from the bridge, if it has one. */
+  label?: string;
 };
 
 export type SessionTree = {
