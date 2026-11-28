@@ -25,6 +25,7 @@ export function SettingsPanel({ settings, warnings, path, shells, animation, onC
 
   const patchAppearance = (patch: Partial<Settings['appearance']>) => onChange({ appearance: { ...settings.appearance, ...patch } });
   const patchAnimation = (patch: Partial<Settings['animation']>) => onChange({ animation: { ...settings.animation, ...patch } });
+  const patchAccessibility = (patch: Partial<Settings['accessibility']>) => onChange({ accessibility: { ...settings.accessibility, ...patch } });
   const patchLayers = (patch: Partial<Settings['animation']['layers']>) =>
     onChange({ animation: { ...settings.animation, layers: { ...settings.animation.layers, ...patch } } });
 
@@ -94,6 +95,14 @@ export function SettingsPanel({ settings, warnings, path, shells, animation, onC
             onChange={event => patchAppearance({ cursorBlink: event.target.checked })}
           />
           <span>Blinking cursor</span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={settings.accessibility.screenReaderMode}
+            onChange={event => patchAccessibility({ screenReaderMode: event.target.checked })}
+          />
+          <span>Screen-reader mode (announce the terminal viewport)</span>
         </label>
       </fieldset>
 
