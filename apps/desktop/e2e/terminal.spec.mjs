@@ -11,19 +11,35 @@ import { startApp } from './harness.mjs';
 const WITH_A11Y = { accessibility: { screenReaderMode: true } };
 
 /** Launches the default shell from onboarding and waits for the pane. */
-async function launchShell(page, app) {
+async function launchShell(page, app, testInfo) {
+  // Browser-side failures are invisible in a CI log unless they are collected; a launch that fails
+  // must say WHY it failed, not just that no tab appeared.
+  const consoleLines = [];
+  page.on('console', message => consoleLines.push(`${message.type()}: ${message.text()}`));
+  page.on('pageerror', error => consoleLines.push(`pageerror: ${error.message}`));
+  testInfo?.attach?.('console', { body: consoleLines.join('\n'), contentType: 'text/plain' }).catch?.(() => {});
+
   await page.goto(app.launchUrl);
   await page.getByRole('button', { name: 'Launch terminal' }).click();
-  await expect(page.getByRole('tablist', { name: 'Terminal tabs' }).getByRole('tab')).toHaveCount(1);
+
+  const tabs = page.getByRole('tablist', { name: 'Terminal tabs' }).getByRole('tab');
+  const alert = page.getByRole('alert');
+  await expect.poll(async () => {
+    if (await alert.count()) {
+      throw new Error(`launch failed: ${(await alert.first().innerText()).slice(0, 400)}\nconsole:\n${consoleLines.slice(-10).join('\n')}`);
+    }
+    return tabs.count();
+  }, { timeout: 20000, message: 'one tab after launching' }).toBe(1);
+
   const panel = page.getByRole('tabpanel');
   await expect(panel).toBeVisible();
   return panel;
 }
 
-test('E2E-05 a real PTY session shows what the user types', async ({ page }) => {
+test('E2E-05 a real PTY session shows what the user types', async ({ page }, testInfo) => {
   const app = await startApp({ real: true, settingsPatch: WITH_A11Y });
   try {
-    const panel = await launchShell(page, app);
+    const panel = await launchShell(page, app, testInfo);
 
     // The pane must be focused for keystrokes to reach the child; clicking it is what a user does.
     await panel.click();
@@ -37,10 +53,10 @@ test('E2E-05 a real PTY session shows what the user types', async ({ page }) => 
   }
 });
 
-test('E2E-06 resizing the window changes the reported terminal geometry', async ({ page }) => {
+test('E2E-06 resizing the window changes the reported terminal geometry', async ({ page }, testInfo) => {
   const app = await startApp({ real: true, settingsPatch: WITH_A11Y });
   try {
-    const panel = await launchShell(page, app);
+    const panel = await launchShell(page, app, testInfo);
     const status = page.getByRole('status');
     // The status bar reports cols×rows, so the geometry is observable without reaching into xterm.
     const before = await status.locator('.chip', { hasText: /^\d+×\d+$/ }).first().textContent();
@@ -59,10 +75,10 @@ test('E2E-06 resizing the window changes the reported terminal geometry', async 
   }
 });
 
-test('E2E-07 a keyboard shortcut opens a second tab with its own session', async ({ page }) => {
+test('E2E-07 a keyboard shortcut opens a second tab with its own session', async ({ page }, testInfo) => {
   const app = await startApp({ real: true, settingsPatch: WITH_A11Y });
   try {
-    await launchShell(page, app);
+    await launchShell(page, app, testInfo);
     const tabs = page.getByRole('tablist', { name: 'Terminal tabs' }).getByRole('tab');
     await expect(tabs).toHaveCount(1);
 
