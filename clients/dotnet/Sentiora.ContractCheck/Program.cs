@@ -8,6 +8,7 @@
 // Exit code 0 = every check passed. It intentionally has no test-framework dependency so it
 // restores and runs offline; a later xUnit wrapper can call the same client.
 using System.Diagnostics;
+using System.Text.Json;
 using Sentiora.Client;
 
 var repoRoot = args.Length > 0 ? Path.GetFullPath(args[0]) : Directory.GetCurrentDirectory();
@@ -128,6 +129,48 @@ if (OperatingSystem.IsWindows() && Environment.GetEnvironmentVariable("SENTIORA_
     catch (Exception error)
     {
         Fail("a failed spawn is an error", error);
+    }
+}
+
+// The mailbox (issue #34): a message channel that is deliberately not the PTY, authorised by a
+// capability that is deliberately not the owner token.
+{
+    var mailboxSession = await client.CreateAsync(new CreateSessionRequest
+    {
+        Command = nodeExecutable,
+        Args = new[] { fixture },
+        Cols = 60,
+        Rows = 16,
+    }, cancellation.Token);
+    try
+    {
+        if (string.IsNullOrEmpty(mailboxSession.Mailbox))
+            Fail("create returns a mailbox capability", new Exception("no mailbox capability on the handle"));
+        else
+            Pass("create returns a mailbox capability");
+
+        if (mailboxSession.Mailbox == mailboxSession.Owner)
+            Fail("the mailbox capability is not the owner token", new Exception("the two tokens are equal"));
+        else
+            Pass("the mailbox capability is not the owner token");
+
+        var posted = await client.PostAsync(mailboxSession, new { kind = "task", text = "run" }, cancellation.Token);
+        if (posted.Sequence == 1)
+            Pass("a message is posted and sequenced");
+        else
+            Fail("a message is posted and sequenced", new Exception($"sequence was {posted.Sequence}"));
+
+        var frame = await client.MailboxAsync(mailboxSession, 0, 1000, cancellation.Token);
+        var text = frame.Messages.Count == 1 ? frame.Messages[0].Payload.GetProperty("text").GetString() : null;
+        if (text == "run")
+            Pass("the mailbox returns the posted message");
+        else
+            Fail("the mailbox returns the posted message",
+                new Exception($"{frame.Messages.Count} message(s); frame={JsonSerializer.Serialize(frame)}"));
+    }
+    finally
+    {
+        await client.CloseAsync(mailboxSession, cancellation.Token);
     }
 }
 

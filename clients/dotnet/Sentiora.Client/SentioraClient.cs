@@ -99,6 +99,8 @@ public sealed class SentioraClient : IAsyncDisposable
         if (request.ConptyDll is not null) parameters["conptyDll"] = request.ConptyDll;
         if (request.RecordInput is not null) parameters["recordInput"] = request.RecordInput;
         if (request.RecordBytes is not null) parameters["recordBytes"] = request.RecordBytes;
+        if (request.Parent is not null) parameters["parent"] = request.Parent;
+        if (request.CloseChildren is not null) parameters["closeChildren"] = request.CloseChildren;
 
         var result = await RequestAsync("terminal.create", parameters, cancellationToken).ConfigureAwait(false);
         var observation = result.Deserialize<Observation>(Json) ?? throw new SentioraException("terminal.create returned no observation", "terminal.create");
@@ -109,6 +111,8 @@ public sealed class SentioraClient : IAsyncDisposable
             Pid = observation.Pid,
             Cols = observation.Cols,
             Rows = observation.Rows,
+            Mailbox = observation.Mailbox,
+            ChildMailbox = observation.ChildMailbox,
         };
     }
 
@@ -223,6 +227,41 @@ public sealed class SentioraClient : IAsyncDisposable
     {
         var result = await RequestAsync("terminal.close", Session(session), cancellationToken).ConfigureAwait(false);
         return result.ValueKind == JsonValueKind.True;
+    }
+
+    /// <summary>
+    /// Enqueues a message for a session (issue #34). Uses the mailbox capability, never the owner
+    /// token: a caller that can message a session still cannot type into it.
+    /// </summary>
+    public async Task<MailboxPostResult> PostAsync(SessionHandle session, object? payload, CancellationToken cancellationToken = default)
+    {
+        var parameters = new Dictionary<string, object?>
+        {
+            ["sessionId"] = session.SessionId,
+            ["capability"] = session.Mailbox ?? throw new SentioraException("this session has no mailbox capability", "terminal.post"),
+            ["payload"] = payload,
+        };
+        var result = await RequestAsync("terminal.post", parameters, cancellationToken).ConfigureAwait(false);
+        return result.Deserialize<MailboxPostResult>(Json)
+            ?? throw new SentioraException("terminal.post returned no result", "terminal.post");
+    }
+
+    /// <summary>Drains messages after a cursor, long-polling like <see cref="WaitAsync"/>.</summary>
+    public async Task<MailboxFrame> MailboxAsync(
+        SessionHandle session, long afterSequence = 0, int timeoutMs = 1000, CancellationToken cancellationToken = default)
+    {
+        var parameters = new Dictionary<string, object?>
+        {
+            ["sessionId"] = session.SessionId,
+            ["capability"] = session.Mailbox ?? throw new SentioraException("this session has no mailbox capability", "terminal.mailbox"),
+            ["afterSequence"] = afterSequence,
+            ["timeoutMs"] = timeoutMs,
+        };
+        // The request timeout is the poll plus the client's own, so a legitimate long poll is not
+        // reported as a dead host.
+        var result = await RequestAsync("terminal.mailbox", parameters, cancellationToken, timeoutMs + DefaultTimeoutMs).ConfigureAwait(false);
+        return result.Deserialize<MailboxFrame>(Json)
+            ?? throw new SentioraException("terminal.mailbox returned no frame", "terminal.mailbox");
     }
 
     private static Dictionary<string, object?> Session(SessionHandle session) => new()

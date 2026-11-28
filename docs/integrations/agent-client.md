@@ -25,6 +25,8 @@ Two implementations exist, both dependency-free, and both speak the same
 | `terminal.stream` | the child's raw bytes with sequence numbers | first attach returns a **snapshot**, not bytes; falling behind returns `resync` |
 | `terminal.close` | tear down and free the slot | once the create response is delivered, close must succeed or the slot leaks |
 | `terminal.list` | observations of all sessions | never returns owner tokens |
+| `terminal.post` | enqueue a message for a session | uses the **mailbox capability**, never the owner token: it can message, it can never type |
+| `terminal.mailbox` | drain messages after a cursor, long-polling | the client's request timeout is the poll timeout **plus** its own, so a legitimate long poll is not reported as a dead host |
 
 Facts the client derives for its caller: the exit code (from the stream's `exit` event, not
 from polling the screen), and the next stream cursor.
