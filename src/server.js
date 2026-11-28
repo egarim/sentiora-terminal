@@ -54,6 +54,10 @@ async function abandon(session){
   // An edge dies with either end: a capability left behind would let the surviving end post
   // into a mailbox that will never be drained again.
   for(const [capability,edge] of edges)if(edge.parent===session.id||edge.child===session.id){edges.delete(capability);retireEdge(capability,edge);}
+  // The tree loses this node and every link that named it: a detached child has no parent, and a
+  // closed child is gone. Neither is a state a viewer should be told is still true.
+  sessionParent.delete(session.id);
+  for(const [childId,parentId] of sessionParent)if(parentId===session.id)sessionParent.delete(childId);
   if(session.closeError)process.stderr.write(`sentiora: cleanup failed for session ${session.id}: ${String(session.closeError).replace(/[\r\n]+/g,' ')}\n`);
   sessions.delete(session.id);
 }
@@ -108,6 +112,9 @@ function retireEdge(capability,edge){
 // default, which is to detach -- a cascade has to be asked for, because killing processes a
 // caller did not name is the more surprising behaviour.
 const childCascade=new Map();
+// child id -> parent id, for the session tree a viewer renders. The edge capability is the
+// authority; this is only the shape, and it is cleared wherever the edge is retired.
+const sessionParent=new Map();
 function edgeCapability(){return randomBytes(24).toString('hex');}
 function newMailbox(){return {capability:randomBytes(24).toString('hex'),queue:[],next:1,dropped:0,waiters:new Set(),recent:[]};}
 function acceptsCapability(sessionId,capability){
@@ -231,7 +238,7 @@ async function createSession(p){
       // would put the session somewhere nothing will ever drain it, so the
       // delivery guarantee yields to the shutdown guarantee.
       if(closing){void abandon(s);return null;}
-      if(edge){edge.child=s.id;edges.set(edge.capability,edge);}
+      if(edge){edge.child=s.id;edges.set(edge.capability,edge);sessionParent.set(s.id,edge.parent);}
       if(edge&&closeChildren===true){
         const children=childCascade.get(edge.parent)??new Set();
         children.add(s.id);childCascade.set(edge.parent,children);
@@ -242,7 +249,7 @@ async function createSession(p){
   };
   inflight.add(record);
   let result;
-  const observation=(async()=>({...await s.observe(),owner:s.owner,mailbox:mailbox.capability,...(edge?{childMailbox:edge.capability}:{})}))();
+  const observation=(async()=>({...await s.observe(),owner:s.owner,mailbox:mailbox.capability,...(edge?{childMailbox:edge.capability,parent:edge.parent}:{})}))();
   // If the race below times out, the observation is still pending; swallow its
   // eventual rejection so it cannot surface as an unhandled one.
   observation.catch(()=>{});
@@ -267,7 +274,7 @@ export async function dispatch(method,p,deferred){
   // changed shape.
   if(method==='initialize')return {protocolVersion:1,platform:process.platform,arch:process.arch,conptyDll:conptyDllDefault,stream:1,recording:1,mailbox:1};
   if(method==='terminal.create'){const created=await createSession(p);deferred.push(created);return created.result;}
-  if(method==='terminal.list')return Promise.all([...sessions.values()].map(s=>s.observe()));
+  if(method==='terminal.list')return Promise.all([...sessions.values()].map(async s=>({...await s.observe(),parent:sessionParent.get(s.id)??null})));
   const s=sessions.get(p.sessionId);if(!s)throw Error('Unknown session');
   switch(method){
     case 'terminal.observe':return s.observe();

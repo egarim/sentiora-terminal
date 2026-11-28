@@ -256,3 +256,51 @@ test('PE-11 an edge reaches its own two ends and nothing else', opts, async t =>
   const drained = await runtime.call('terminal.mailbox', { sessionId: child.sessionId, capability: child.childMailbox, afterSequence: 0 });
   assert.deepEqual(drained.messages.map(m => m.payload), ['to child']);
 });
+
+test('PE-12 the session list carries the parent link, and roots have none', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+  const child = await runtime.createWith({ parent: parent.sessionId });
+
+  assert.equal(child.parent, parent.sessionId, 'a parented create must name its parent');
+
+  const listed = await runtime.call('terminal.list', {});
+  const byId = new Map(listed.map(entry => [entry.sessionId, entry]));
+  assert.equal(byId.get(parent.sessionId).parent, null, 'a root session has no parent');
+  assert.equal(byId.get(child.sessionId).parent, parent.sessionId, 'the child names its parent');
+  // A viewer must never be handed a capability, only the shape.
+  for (const entry of listed) {
+    assert.doesNotMatch(JSON.stringify(entry), /"owner"|"mailbox"|"childMailbox"/);
+  }
+});
+
+test('PE-13 a detached child loses its parent link with the edge', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+  const child = await runtime.createWith({ parent: parent.sessionId });
+
+  await runtime.call('terminal.close', { sessionId: parent.sessionId, owner: parent.owner });
+
+  const listed = await runtime.call('terminal.list', {});
+  assert.equal(listed.length, 1, 'the child outlives the parent by default');
+  assert.equal(listed[0].sessionId, child.sessionId);
+  // The edge died with the parent, so the tree must not still claim a link that no longer exists
+  // -- a viewer would draw a node pointing at a session that cannot be addressed.
+  assert.equal(listed[0].parent, null, 'a detached child has no parent');
+});
+
+test('PE-14 closing a child leaves the parent listed as a root', opts, async t => {
+  const runtime = startRuntime();
+  t.after(() => runtime.stop());
+  const parent = await runtime.createWith();
+  const child = await runtime.createWith({ parent: parent.sessionId });
+
+  await runtime.call('terminal.close', { sessionId: child.sessionId, owner: child.owner });
+
+  const listed = await runtime.call('terminal.list', {});
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].sessionId, parent.sessionId);
+  assert.equal(listed[0].parent, null, 'the parent was a root before and is one after');
+});
