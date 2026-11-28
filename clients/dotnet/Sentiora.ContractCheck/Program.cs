@@ -174,6 +174,40 @@ if (OperatingSystem.IsWindows() && Environment.GetEnvironmentVariable("SENTIORA_
     }
 }
 
+// Cooperative handover (issue #4): the old token must die at the same moment the new one is issued,
+// and a refused handover must rotate nothing.
+{
+    var original = await client.CreateAsync(new CreateSessionRequest
+    {
+        Command = nodeExecutable,
+        Args = new[] { fixture },
+        Cols = 60,
+        Rows = 16,
+    }, cancellation.Token);
+    var handed = await client.HandoverAsync(original, cancellation.Token);
+
+    if (handed.SessionId == original.SessionId && handed.Owner != original.Owner)
+        Pass("handover issues a new owner token for the same session");
+    else
+        Fail("handover issues a new owner token for the same session",
+            new Exception($"sameSession={handed.SessionId == original.SessionId} sameOwner={handed.Owner == original.Owner}"));
+
+    try
+    {
+        await client.CloseAsync(original, cancellation.Token);
+        Fail("the old token is refused after a handover", new Exception("close succeeded with the stale token"));
+    }
+    catch (SentioraException)
+    {
+        Pass("the old token is refused after a handover");
+    }
+
+    if (await client.CloseAsync(handed, cancellation.Token))
+        Pass("the new owner can close the session");
+    else
+        Fail("the new owner can close the session", new Exception("close returned false"));
+}
+
 var disposeClock = Stopwatch.StartNew();
 await client.DisposeAsync();
 Console.WriteLine($"host shutdown: {disposeClock.ElapsedMilliseconds}ms forced={client.ForcedShutdown} (stderr {client.Stderr.Length} bytes)");

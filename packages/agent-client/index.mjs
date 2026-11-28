@@ -265,6 +265,24 @@ export class AgentClient {
     );
   }
 
+  /**
+   * Cooperative handover (issue #4): gives input rights away and returns a handle holding the new
+   * owner token. The handle passed in keeps a token that is now dead — that is the contract, not
+   * an oversight — so the caller must switch to the returned handle for type/resize/close.
+   */
+  async handover(session) {
+    const result = await this.request('terminal.handover', { sessionId: session.sessionId, owner: session.owner });
+    return new AgentSession(this, {
+      sessionId: session.sessionId,
+      owner: result.owner,
+      mailbox: session.mailbox,
+      childMailbox: session.childMailbox,
+      pid: session.pid,
+      cols: session.cols,
+      rows: session.rows,
+    });
+  }
+
   async close(session) {
     return this.request('terminal.close', { sessionId: session.sessionId, owner: session.owner });
   }
