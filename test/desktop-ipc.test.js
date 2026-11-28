@@ -649,3 +649,46 @@ test('a malformed env is refused with 400 invalid-env, not a runtime 500', opts,
     await context.stop();
   }
 });
+
+// ------------------------------------------------------- session tree and messages
+
+test('the UI gets the session tree and messages over HTTP, never a capability', opts, async () => {
+  const context = await startServer();
+  try {
+    // Created through the bridge directly: this test is about what the HTTP surface exposes,
+    // not about create validation, which has its own tests above.
+    const parent = await context.backend.bridge.create({ command: 'fake', cols: 40, rows: 10 });
+    const child = await context.backend.bridge.create({ command: 'fake', cols: 40, rows: 10, parentSessionId: parent.sessionId });
+
+    const listing = await context.call('GET', '/api/sessions');
+    assert.equal(listing.status, 200);
+    const byId = new Map(listing.json.sessions.map(session => [session.sessionId, session]));
+    assert.equal(byId.get(parent.sessionId).parent, null);
+    assert.equal(byId.get(child.sessionId).parent, parent.sessionId, 'the tree reaches the UI');
+
+    const posted = await context.call('POST', `/api/sessions/${child.sessionId}/messages`, { payload: { text: 'hello' } });
+    assert.equal(posted.status, 200);
+    assert.equal(posted.json.posted.sequence, 1);
+
+    const frame = await context.call('GET', `/api/sessions/${child.sessionId}/messages?after=0&timeoutMs=100`);
+    assert.equal(frame.status, 200);
+    assert.deepEqual(frame.json.messages.map(message => message.payload.text), ['hello']);
+
+    // The webview must never receive a credential, on any route this test touched.
+    for (const body of context.bodies) assert.doesNotMatch(body, /"owner"|"capability"|"mailbox"/);
+  } finally {
+    await context.stop();
+  }
+});
+
+test('a message cursor that is not a non-negative number is refused', opts, async () => {
+  const context = await startServer();
+  try {
+    const session = await context.backend.bridge.create({ command: 'fake', cols: 40, rows: 10 });
+    const bad = await context.call('GET', `/api/sessions/${session.sessionId}/messages?after=-1`);
+    assert.equal(bad.status, 400);
+    assert.equal(bad.json.kind, 'invalid-request');
+  } finally {
+    await context.stop();
+  }
+});

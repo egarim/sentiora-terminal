@@ -292,6 +292,21 @@ then open `http://localhost:5173/#token=<token>`.
 
 ---
 
+### The tree and messages over HTTP
+
+The viewer's two data needs are served by the loopback API, and the capability never crosses into
+the webview:
+
+- `GET /api/sessions` — every session with its **`parent`** (or `null`), which is what `buildSessionTree`
+  consumes. `parent` also rides in every stream frame, so a viewer does not need a second call to keep
+  its tree current.
+- `POST /api/sessions/:id/messages` — body `{payload}` (or the message itself); answers `{posted}`.
+  Rate-limited like input, because a message is a write.
+- `GET /api/sessions/:id/messages?after=N&timeoutMs=…` — the mailbox frame; `after` must be a
+  non-negative number and a bad cursor is a `400 invalid-request`, not a silent `after=0`.
+
+`SessionBridge.post`/`mailbox` hold the mailbox capability internally, exactly as `type` holds the
+owner token: the UI asks the bridge to relay, and cannot address the runtime directly.
 ### The viewer's models are testable without a browser
 
 `apps/desktop/ui/lib/tree.ts` holds the two shapes the session viewer needs — the tree built from the
