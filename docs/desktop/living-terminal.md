@@ -292,6 +292,20 @@ then open `http://localhost:5173/#token=<token>`.
 
 ---
 
+### The log after a reload
+
+Reopening the app replays the log from the mailbox, because the viewer starts at cursor 0 on every
+load and the ring still holds the messages. There is no page-level cache to go stale, and nothing to
+migrate.
+
+A **reload** is not the same thing: `bootstrapFromLocation` strips the token from the URL with
+`history.replaceState`, deliberately, so a bare reload lands on the no-token gate. The test therefore
+re-enters with the launch URL, which is what a user does, rather than calling `page.reload()` and
+asserting on a page that has no credential by design.
+
+`E2E-12` proves both halves of the ordinary case: three messages posted before the reopen are all
+present afterwards, in order, and **no gap marker appears** — claiming a gap that did not happen would
+be its own kind of wrong.
 ### The exchange view, and who sent what
 
 A mailbox belongs to its **recipient**, so "what the parent said to the child" only exists in the
