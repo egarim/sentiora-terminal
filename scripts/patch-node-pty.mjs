@@ -69,7 +69,13 @@ try {
   die(`cannot read ${agentPath}: ${error.message}`);
 }
 
-if (source.includes(MARKER)) {
+// Two independent patches live in this file, so each is applied only when its own marker is
+// absent: a machine that already ran an older version of this script has the first and needs
+// the second.
+const CONSOLE_MARKER = '_consoleListExitGuard';
+const hasRelease = source.includes(MARKER);
+const hasExitGuard = source.includes(CONSOLE_MARKER);
+if (hasRelease && hasExitGuard) {
   console.log(`sentiora: ${agentPath} already patched`);
   process.exit(0);
 }
@@ -129,6 +135,30 @@ const RELEASE_METHOD = [
   '',
 ].join('\n');
 
+const CONSOLE_LIST_BEFORE = [
+  '            var timeout = setTimeout(function () {',
+  '                // Something went wrong, just send back the shell PID',
+  '                agent.kill();',
+  '                resolve([_this._innerPid]);',
+  '            }, 5000);',
+].join('\n');
+
+const CONSOLE_LIST_AFTER = [
+  '            var timeout = setTimeout(function () {',
+  '                // Something went wrong, just send back the shell PID',
+  '                agent.kill();',
+  '                resolve([_this._innerPid]);',
+  '            }, 5000);',
+  '            // sentiora: _consoleListExitGuard -- the agent exits without a message when',
+  '            // AttachConsole fails, which is every time the child is already gone. Waiting out',
+  '            // the 5 s timeout for a console list that cannot arrive made ~12 sequential closes',
+  '            // take 60 s on x64 Windows runners.',
+  '            agent.on(\'exit\', function () {',
+  '                clearTimeout(timeout);',
+  '                resolve([_this._innerPid]);',
+  '            });',
+].join('\n');
+
 function replaceOnce(haystack, needle, replacement, what) {
   const first = haystack.indexOf(needle);
   if (first === -1) die(`cannot find ${what} in ${agentPath}; the file no longer matches node-pty 1.1.0`);
@@ -136,8 +166,14 @@ function replaceOnce(haystack, needle, replacement, what) {
   return haystack.slice(0, first) + replacement + haystack.slice(first + needle.length);
 }
 
-let patched = replaceOnce(lf, CONNECT_BEFORE, CONNECT_AFTER, 'the ConPTY connect() call');
-patched = replaceOnce(patched, RESIZE_ANCHOR, RELEASE_METHOD + RESIZE_ANCHOR, 'the resize method anchor');
+let patched = lf;
+if (!hasRelease) {
+  patched = replaceOnce(patched, CONNECT_BEFORE, CONNECT_AFTER, 'the ConPTY connect() call');
+  patched = replaceOnce(patched, RESIZE_ANCHOR, RELEASE_METHOD + RESIZE_ANCHOR, 'the resize method anchor');
+}
+if (!hasExitGuard) {
+  patched = replaceOnce(patched, CONSOLE_LIST_BEFORE, CONSOLE_LIST_AFTER, 'the console-process-list timeout');
+}
 
 await writeFile(agentPath, CRLF ? patched.replace(/\n/g, '\r\n') : patched);
-console.log(`sentiora: patched ${resolve(agentPath)} (release the ConPTY worker when connect() fails)`);
+console.log(`sentiora: patched ${resolve(agentPath)} (failed-connect cleanup, console-list exit guard)`);
