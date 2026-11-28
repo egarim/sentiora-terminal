@@ -45,11 +45,16 @@ node-pty `1.2.0-beta.18` was measured to remove the crash (3/3 clean external-ki
 
 **Decision taken: wait for a stable 1.2.** The upgrade checklist is recorded on #21.
 
-### The desktop viewer is one component away
+### The desktop viewer ships; its interaction tests do not
 
-`#35` is built up to the component: tree data on the wire, models (`tree.ts`) tested in `test:desktop`,
-bridge and IPC relay (`GET /api/sessions`, `POST`/`GET /api/sessions/:id/messages`). What remains is a
-React component plus an interaction test, which needs a browser test runner (#19).
+`#35` is built: tree data on the wire, models (`tree.ts`), bridge and IPC relay
+(`GET /api/sessions`, `POST`/`GET /api/sessions/:id/messages`), and the component itself
+(`SessionTree.ts`) with **structural tests, VIEW-01..08**, run in the `desktop-ui` job where React is
+installed.
+
+What remains is the half that needs a browser — **clicking, focus and layout** — i.e. an interaction
+suite (#19). The component's logic (order, depth, selection, log, the permanent drop marker, the
+orphan callout) is covered structurally.
 
 ### Packaging is blocked outside this repository
 
@@ -87,8 +92,9 @@ A release is defensible when **all** of these hold:
 - [x] three clients passing a shared contract check, plus an MCP adapter;
 - [x] a verified verification record in `docs/validation/runs/`;
 - [x] documented trust boundaries with tests pinning every claim;
-- [ ] the desktop viewer shipped with interaction tests.
+- [ ] the desktop viewer shipped with interaction tests (the component and its structural tests are
+      in; the browser interaction suite is #19).
 
-**Four of seven are done.** One is a component away (the viewer). Two — no crash or hang, and green CI
-without a retry — depend on node-pty, which means they depend on the upgrade decision rather than on
-more work in this repository.
+**Four of seven are done.** One is half done — the viewer renders and its logic is tested, but the
+interaction suite needs #19. Two — no crash or hang, and green CI without a retry — depend on
+node-pty, which means they depend on the upgrade decision rather than on more work in this repository.
