@@ -287,6 +287,16 @@ export async function dispatch(method,p,deferred){
     case 'terminal.recording':if(p.owner!==s.owner)throw Error('Ownership required');return s.recordingPayload();
     case 'terminal.resize':return s.resize(p.owner,p.cols,p.rows);
     case 'terminal.close':if(p.owner!==s.owner)throw Error('Ownership required');await abandon(s);return true;
+    // Cooperative handover (issue #4): the current owner gives input rights away, and the token
+    // it held stops working at once. Deliberately not a preemptive takeover -- that needs an
+    // authority the runtime does not have (the desktop bridge holds it), and pretending a
+    // caller can seize a session by asking twice would be the wrong security model.
+    case 'terminal.handover':{
+      if(p.owner!==s.owner)throw Error('Ownership required');
+      const next=randomBytes(24).toString('hex');
+      s.owner=next;
+      return {owner:next};
+    }
     default:throw Error('Unknown method');
   }
 }
