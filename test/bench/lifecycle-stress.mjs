@@ -19,6 +19,7 @@ import { promisify } from 'node:util';
 import * as pty from 'node-pty';
 import xterm from '@xterm/headless';
 import { Session } from '../../src/session.js';
+import { processIdentities, identityIsOurs } from './lib/identity.mjs';
 
 const run = promisify(execFile);
 const here = import.meta.url;
@@ -105,9 +106,20 @@ async function alivePids(pids) {
   // childrenSurviving checks reported every child as surviving -- seven false
   // breaches on an otherwise clean run, which is worse than not measuring.
   // EPERM means the process exists but is not ours, so it counts as alive.
-  return wanted.filter(pid => {
+  const live = wanted.filter(pid => {
     try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
   });
+  if (!live.length) return [];
+  // Liveness is not identity. Windows recycles process ids, and a recycled id answers
+  // process.kill(pid, 0) while belonging to something else entirely -- measured: nine "survivors"
+  // out of 200 externally-killed children were all conhost.exe created AFTER the child they
+  // replaced. Counting those as leaked shells made #24's rate and #16's zero-survivor threshold
+  // measure the pid space rather than this runtime. Compare the process's creation time with when we
+  // spawned the pid: a process created after that moment cannot be our child.
+  const identities = await processIdentities(live);
+  // The predicate lives in ./lib/identity.mjs so it can be tested without a pty: this is the check
+  // that decides whether a "survivor" is a leaked child or a recycled pid.
+  return live.filter(pid => identityIsOurs(identities.get(pid), spawnTimes.get(pid)));
 }
 
 const stats = values => {
@@ -126,6 +138,8 @@ const stats = values => {
 // do. Phase G is deliberately excluded: its sessions belong to the server child
 // process and leak nothing in this one.
 let inProcessSessions = 0;
+// pid -> when we spawned it, so a recycled pid can be told apart from a leaked child.
+const spawnTimes = new Map();
 
 function openSession({ args = [FIXTURE], cols = 80, rows = 24 } = {}) {
   const terminal = new xterm.Terminal({ cols, rows, scrollback: 2000, allowProposedApi: true });
@@ -133,6 +147,7 @@ function openSession({ args = [FIXTURE], cols = 80, rows = 24 } = {}) {
     name: 'xterm-256color', cols, rows, cwd: process.cwd(), env: process.env,
   });
   inProcessSessions += 1;
+  if (Number.isInteger(child.pid) && child.pid > 0) spawnTimes.set(child.pid, Date.now());
   return { session: new Session(child, terminal), child, terminal };
 }
 
