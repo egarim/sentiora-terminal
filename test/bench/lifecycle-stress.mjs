@@ -366,7 +366,20 @@ async function phaseUnexpectedExit(count) {
   }
   await new Promise(resolve => setTimeout(resolve, 8000));
   const survivors = await alivePids(pids);
-  return { attempts: count, exitDetected: detected, inputRejected, recoveredWithNewSession: recoveryOk, childrenSurviving: survivors.length };
+  // Issue #24 asks the question this answers: does the survivor exit if given longer than the
+  // settle window? One that is gone at +30 s was slow teardown (a timing leak); one still alive is
+  // an orphan. Phase A has had this check since the first leak; phase D did not, which is why every
+  // D breach recorded a count and nothing that could classify it.
+  let lateSurvivors = [];
+  if (survivors.length) {
+    await new Promise(resolve => setTimeout(resolve, 30000));
+    lateSurvivors = await alivePids(survivors);
+  }
+  return {
+    attempts: count, exitDetected: detected, inputRejected, recoveredWithNewSession: recoveryOk,
+    childrenSurviving: survivors.length, survivorPids: survivors.slice(0, 10),
+    childrenSurvivingLate: lateSurvivors.length, survivorPidsLate: lateSurvivors.slice(0, 10),
+  };
 }
 
 // ---------------------------------------------------------------- phase E
