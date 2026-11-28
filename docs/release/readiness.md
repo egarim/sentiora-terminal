@@ -64,12 +64,17 @@ orphan callout) is covered structurally.
 
 ## Decisions still open
 
+Two remain genuinely open. The rest were taken and are recorded in `AGENTS.md` — this table had been
+asking for approvals that had already been given, which is its own kind of defect in a status page.
+
 | # | decision | what it unblocks |
 | --- | --- | --- |
-| 1 | crash/hang policy: tolerate the two upstream defects, or freeze merges until stable 1.2 | CI red cells; the retry rule on #21 is provisional without it |
-| 2 | approve a Playwright dependency and CI browser step | #19, the #35 viewer component, #7's acceptance |
-| 3 | close #1, #2, #3, #34 (each has a committed evidence table) | the milestone slate; `#2`'s remaining gap is closed by #53/#54 |
-| 4 | design for #4's preemptive takeover and authenticated remote transport | the last two slices of the integration story |
+| 1 | **Adopt node-pty 1.2** (stable) to remove the `3221225477` crash, or accept it as a known risk on 1.1.0 | the last open defect; CI noise is already governed by `docs/decisions/0001…`, the version policy is `docs/decisions/0002…` |
+| 2 | Design #4's preemptive takeover and authenticated remote transport | the last two slices of the integration story; needs threat modelling and independent security review |
+
+Settled, for the record: Playwright is approved (`AGENTS.md` §1); issues may be closed when their
+acceptance is independently satisfied (§4); merging over known intermittent failures follows
+`docs/decisions/0001`; the node-pty stable/beta split is `docs/decisions/0002`.
 
 ## How to reproduce every number above
 
